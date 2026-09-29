@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+// pi-orch CLI shim. Node >=22.18 runs TypeScript directly (type stripping).
+import '../src/cli.ts';

@@ -1,0 +1,368 @@
+/**
+ * PiOrchClient — the importable module surface. Every call sends
+ * X-Parent-Session when the caller's session identity is known (flag >
+ * PI_ORCH_PARENT_SESSION > PI_WEB_UI_SESSION_ID > PI_SESSION_ID), so parent
+ * linkage and `?parent=` lineage work without extra effort (C5), and bare-CLI
+ * parents pass --parent-session explicitly.
+ */
+
+import { Transport, type TransportConfig } from './transport.ts';
+import {
+  buildCreateBody,
+  buildPromptBody,
+  buildWatchBody,
+  deadlineCondition,
+  agentEnd,
+  goalEnd,
+  goalPaused,
+  questionSentinel,
+  type CreateInput,
+  type PromptInput,
+} from './builders.ts';
+import { parseReceipt, type Receipt, type WatchConditionSpec } from './parsers.ts';
+import { waitOnChild, type WaitOutcome, type WaitDeps } from './wait.ts';
+
+export interface ClientConfig {
+  transport: TransportConfig;
+  parentSessionId?: string;
+  /** Default idempotency-key factory; injectable for tests. */
+  randomId?: () => string;
+  waitDeadlineMs?: number;
+  waitSliceMs?: number;
+}
+
+export class PiOrchClient {
+  readonly transport: Transport;
+  readonly parentSessionId?: string;
+  private readonly randomId: () => string;
+  private readonly waitDeadlineMs: number;
+  private readonly waitSliceMs: number;
+
+  constructor(config: ClientConfig) {
+    this.transport = new Transport(config.transport);
+    this.parentSessionId = config.parentSessionId;
+    this.randomId = config.randomId ?? defaultRandomId;
+    this.waitDeadlineMs = config.waitDeadlineMs ?? 30 * 60_000;
+    this.waitSliceMs = config.waitSliceMs ?? 45_000;
+  }
+
+  private headers(): Record<string, string> {
+    return this.parentSessionId ? { 'X-Parent-Session': this.parentSessionId } : {};
+  }
+
+  async capabilities(): Promise<Record<string, unknown>> {
+    const response = await this.transport.request('GET', '/api/v1/capabilities', { headers: this.headers() });
+    return response.body as Record<string, unknown>;
+  }
+
+  async capacity(): Promise<Record<string, unknown>> {
+    const response = await this.transport.request('GET', '/api/v1/capacity', { headers: this.headers() });
+    return response.body as Record<string, unknown>;
+  }
+
+  async models(runtime?: string): Promise<Array<Record<string, unknown>>> {
+    const query = runtime ? `?runtime=${encodeURIComponent(runtime)}` : '';
+    const response = await this.transport.request('GET', `/api/v1/models${query}`, { headers: this.headers() });
+    const body = response.body as { models?: Record<string, Array<Record<string, unknown>>> };
+    const all: Array<Record<string, unknown>> = [];
+    for (const list of Object.values(body.models ?? {})) all.push(...(list ?? []));
+    return all;
+  }
+
+  /** Resolve a model selector from the live catalogue by substring — exactly one match required. */
+  async resolveModel(runtime: string, match: string): Promise<string> {
+    const entries = (await this.models(runtime)).filter((entry) =>
+      typeof entry.selector === 'string' && (entry.selector as string).includes(match),
+    );
+    if (entries.length !== 1) {
+      throw new Error(
+        `pi-orch: --model-match '${match}' resolved ${entries.length} live selectors (need exactly one); inspect 'pi-orch models --runtime ${runtime}'`,
+      );
+    }
+    return entries[0]?.selector as string;
+  }
+
+  async spawn(input: CreateInput & { modelMatch?: string }): Promise<{
+    sessionId: string;
+    leaseId?: string;
+    parentId?: string;
+    resolvedModel?: string;
+    raw: unknown;
+  }> {
+    const modelSelector = input.modelSelector ?? (input.modelMatch ? await this.resolveModel(input.runtime, input.modelMatch) : undefined);
+    const body = buildCreateBody({ ...input, modelSelector });
+    const response = await this.transport.request('POST', '/api/v1/sessions', { body, headers: this.headers() });
+    const raw = response.body as Record<string, unknown>;
+    const retention = raw.retention as { leaseId?: string } | undefined;
+    return {
+      sessionId: String(raw.sessionId),
+      leaseId: retention?.leaseId,
+      parentId: typeof raw.parentSessionId === 'string' ? raw.parentSessionId : undefined,
+      resolvedModel: typeof raw.resolvedModel === 'string' ? raw.resolvedModel : undefined,
+      raw,
+    };
+  }
+
+  async prompt(sessionId: string, input: PromptInput): Promise<{
+    runId: string;
+    sessionId: string;
+    detached: boolean;
+    duplicate: boolean;
+    dispatchMode?: string;
+    raw: unknown;
+  }> {
+    const body = buildPromptBody(input, this.randomId);
+    const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompt`, {
+      body,
+      headers: this.headers(),
+    });
+    const raw = response.body as Record<string, unknown>;
+    const duplicate = raw.duplicate === true;
+    const runId = String(raw.runId ?? (raw.receipt as Record<string, unknown> | undefined)?.runId ?? '');
+    if (!runId) throw new Error('pi-orch: prompt response without runId');
+    return {
+      runId,
+      sessionId: String(raw.sessionId ?? sessionId),
+      detached: raw.detached === true,
+      duplicate,
+      dispatchMode: typeof raw.dispatchMode === 'string' ? raw.dispatchMode : undefined,
+      raw,
+    };
+  }
+
+  async registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; raw: unknown }> {
+    const body = buildWatchBody(input);
+    const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, {
+      body,
+      headers: this.headers(),
+    });
+    const raw = response.body as Record<string, unknown>;
+    return { watchId: String(raw.watchId), status: typeof raw.status === 'string' ? raw.status : undefined, raw };
+  }
+
+  async getWatch(sessionId: string): Promise<{ watchId: string; status?: string } | null> {
+    try {
+      const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, {
+        headers: this.headers(),
+      });
+      const raw = response.body as Record<string, unknown>;
+      return { watchId: String(raw.watchId), status: typeof raw.status === 'string' ? raw.status : undefined };
+    } catch (error) {
+      if ((error as { status?: number }).status === 404) return null;
+      throw error;
+    }
+  }
+
+  async deleteWatch(sessionId: string): Promise<void> {
+    await this.transport.request('DELETE', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, { headers: this.headers() });
+  }
+
+  /** Watch-based wait: registers the watch, long-polls, reconciles the receipt. Never polls. */
+  async wait(options: {
+    sessionId: string;
+    runId?: string;
+    conditions?: WatchConditionSpec[];
+    objective?: string;
+    deadlineMs?: number;
+    label?: string;
+  }): Promise<WaitOutcome> {
+    const conditions = options.conditions ?? defaultConditions(options.objective, options.deadlineMs ?? this.waitDeadlineMs);
+    const deps: WaitDeps = {
+      longPoll: async ({ ids, cursor, timeoutMs }) => {
+        const params = new URLSearchParams({ ids: ids.join(','), timeout: String(timeoutMs) });
+        if (cursor !== undefined) params.set('cursor', cursor);
+        try {
+          const response = await this.transport.request('GET', `/api/v1/watches/wait?${params.toString()}`, {
+            headers: this.headers(),
+            timeoutMs: timeoutMs + 15_000,
+          });
+          if (response.status === 204 || response.body === undefined) return { kind: 'timeout' };
+          return { kind: 'fired', body: response.body };
+        } catch (error) {
+          if ((error as { status?: number }).status === 404) throw error; // watch loss → recovery path
+          throw error;
+        }
+      },
+      getReceipt: async (runId) => {
+        const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(runId)}`, { headers: this.headers() });
+        return parseReceipt(response.body);
+      },
+      getSessionEvidence: async (sessionId) => {
+        const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/evidence`, {
+          headers: this.headers(),
+        });
+        const body = response.body as { runChronology?: Array<{ runId?: string; status?: string; errorCode?: string }> };
+        return { runs: body.runChronology ?? [] };
+      },
+      registerWatch: async (sessionId_, body) => {
+        const registered = await this.registerWatch(sessionId_, body as { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean });
+        return { watchId: registered.watchId, status: registered.status };
+      },
+      getWatch: async (sessionId_) => this.getWatch(sessionId_),
+      sleep: (ms) => new Promise<void>((resolvePromise) => setTimeout(resolvePromise, ms)),
+      now: Date.now,
+    };
+    return waitOnChild({
+      sessionId: options.sessionId,
+      runId: options.runId,
+      conditions,
+      objective: options.objective,
+      deadlineMs: options.deadlineMs ?? this.waitDeadlineMs,
+      sliceMs: this.waitSliceMs,
+      label: options.label,
+      deps,
+    });
+  }
+
+  async result(runId: string, options: { includeTranscript?: boolean } = {}): Promise<{
+    runId: string;
+    sessionId: string;
+    status: string;
+    finalText?: string;
+    finalTextTruncated?: boolean;
+    servedModel?: string;
+    outputDisposition?: string;
+    evidence: { receipt: string; transcript: string; sessionPath?: string };
+    transcript?: Array<{ kind: string; text: string }>;
+  }> {
+    const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(runId)}`, { headers: this.headers() });
+    const receipt = parseReceipt(response.body);
+    const sessionId = receipt.sessionId;
+    const evidence: { receipt: string; transcript: string; sessionPath?: string } = {
+      receipt: `/api/v1/runs/${encodeURIComponent(runId)}`,
+      transcript: `/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript?scope=visible_full`,
+    };
+    let transcript: Array<{ kind: string; text: string }> | undefined;
+    if (options.includeTranscript) {
+      const transcriptResponse = await this.transport.request(
+        'GET',
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript?scope=visible_full`,
+        { headers: this.headers(), timeoutMs: 60_000 },
+      );
+      const body = transcriptResponse.body as { items?: Array<{ kind: string; text: string }> };
+      transcript = body.items ?? [];
+    }
+    return {
+      runId: receipt.runId,
+      sessionId,
+      status: receipt.status,
+      finalText: receipt.finalText,
+      finalTextTruncated: receipt.finalTextTruncated,
+      servedModel: receipt.servedModel,
+      outputDisposition: receipt.outputEvidence?.disposition,
+      evidence,
+      ...(transcript !== undefined ? { transcript } : {}),
+    };
+  }
+
+  /** Stub interface — plan step C3 fills it (completion-block verification). */
+  async verify(_input: { sessionId: string; runId?: string }): Promise<{ implemented: false; plannedBy: 'C3' }> {
+    return { implemented: false, plannedBy: 'C3' };
+  }
+
+  async cleanup(sessionId: string, options: { leaseId?: string; ownerId?: string; watchId?: string } = {}): Promise<{
+    released: boolean;
+    deleted: boolean;
+    notes: string[];
+  }> {
+    const notes: string[] = [];
+    let released = false;
+    if (options.watchId !== undefined) {
+      try {
+        await this.deleteWatch(sessionId);
+        notes.push(`watch ${options.watchId} deleted`);
+      } catch (error) {
+        notes.push(`watch delete failed: ${(error as Error).message}`);
+      }
+    }
+    if (options.leaseId) {
+      try {
+        await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/control`, {
+          body: { action: 'release_retention', retentionLeaseId: options.leaseId, ...(options.ownerId ? { ownerId: options.ownerId } : {}) },
+          headers: this.headers(),
+        });
+        released = true;
+      } catch (error) {
+        notes.push(`lease release failed: ${(error as Error).message}`);
+      }
+    }
+    await this.transport.request('DELETE', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() });
+    return { released, deleted: true, notes };
+  }
+
+  async status(target: { parent?: string; sessionId?: string }): Promise<{
+    parent?: string;
+    children: Array<{
+      sessionId: string;
+      runtime?: string;
+      busy?: boolean;
+      status?: string;
+      goalStatus?: string;
+      goalObjective?: string;
+      lastRun?: { runId?: string; status?: string; errorCode?: string };
+    }>;
+  }> {
+    if (target.sessionId) {
+      return { children: [await this.childStatus(target.sessionId)] };
+    }
+    if (!target.parent) throw new Error('pi-orch: status needs --parent <id> or a sessionId');
+    const query = new URLSearchParams({ parent: target.parent });
+    const response = await this.transport.request('GET', `/api/v1/sessions?${query.toString()}`, { headers: this.headers() });
+    const body = response.body as { sessions?: Array<{ sessionId: string; runtime?: string; busy?: boolean; status?: string }> };
+    const children: Awaited<ReturnType<typeof this.childStatus>>[] = [];
+    for (const session of body.sessions ?? []) {
+      children.push({
+        sessionId: session.sessionId,
+        runtime: session.runtime,
+        busy: session.busy,
+        status: session.status,
+      });
+    }
+    return { parent: target.parent, children };
+  }
+
+  private async childStatus(sessionId: string): Promise<{
+    sessionId: string;
+    runtime?: string;
+    busy?: boolean;
+    status?: string;
+    goalStatus?: string;
+    goalObjective?: string;
+    lastRun?: { runId?: string; status?: string; errorCode?: string };
+  }> {
+    const goal = await this.transport
+      .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() })
+      .then((response) => response.body as { status?: string; objective?: string })
+      .catch(() => ({ status: 'unknown' as string | undefined, objective: undefined as string | undefined }));
+    const evidence = await this.transport
+      .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/evidence`, { headers: this.headers() })
+      .then((response) => response.body as { runChronology?: Array<{ runId?: string; status?: string; errorCode?: string }>; status?: string })
+      .catch(() => ({ runChronology: [] as Array<{ runId?: string; status?: string; errorCode?: string }>, status: undefined as string | undefined }));
+    const last = evidence.runChronology?.[0];
+    return {
+      sessionId,
+      busy: undefined,
+      status: evidence.status,
+      goalStatus: goal?.status,
+      goalObjective: goal?.objective,
+      lastRun: last ? { runId: last.runId, status: last.status, errorCode: last.errorCode } : undefined,
+    };
+  }
+}
+
+/** Default conditions: agent_end + a server-side deadline backstop (whole deadline). */
+export function defaultConditions(objective: string | undefined, deadlineMs: number): WatchConditionSpec[] {
+  const conditions: WatchConditionSpec[] = [agentEnd()];
+  if (objective) {
+    conditions.push(goalEnd(objective), goalPaused(objective));
+  }
+  const deadlineSeconds = Math.floor(deadlineMs / 1000);
+  if (deadlineSeconds >= 1 && deadlineSeconds <= 86_400) {
+    conditions.push(deadlineCondition(deadlineSeconds));
+  }
+  return conditions;
+}
+
+function defaultRandomId(): string {
+  return `piorch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}

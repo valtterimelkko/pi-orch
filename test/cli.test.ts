@@ -1,0 +1,232 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { runCli, type CliDeps } from '../src/cli.ts';
+
+/**
+ * CLI contract: short verb commands, `--json` for machine output, human output
+ * otherwise, meaningful exit codes, and an injectable client factory so tests
+ * never need a server. runCli is pure: it returns the stdout/stderr it would
+ * print and the exit code; main() does the printing.
+ */
+
+function fakeDeps(overrides: Partial<CliDeps> = {}): CliDeps {
+  return {
+    env: {},
+    stdout: () => undefined,
+    stderr: () => undefined,
+    randomId: () => 'test-key-123',
+    client: () => {
+      throw new Error('no client expected in this test');
+    },
+    ...overrides,
+  };
+}
+
+test('usage: no arguments exits 2 with help on stderr', async () => {
+  const result = await runCli([], fakeDeps());
+  assert.equal(result.exitCode, 2);
+  assert.ok((result.stderr ?? '').includes('usage:'));
+});
+
+test('usage: unknown verb exits 2', async () => {
+  const result = await runCli(['frobnicate'], fakeDeps());
+  assert.equal(result.exitCode, 2);
+  assert.ok((result.stderr ?? '').includes('unknown verb'));
+});
+
+test('help exits 0', async () => {
+  const result = await runCli(['help'], fakeDeps());
+  assert.equal(result.exitCode, 0);
+});
+
+test('verify is a documented stub exiting 13', async () => {
+  const result = await runCli(['verify', 'sess-1'], fakeDeps());
+  assert.equal(result.exitCode, 13);
+  assert.ok((result.stdout ?? '').includes('"implemented": false'));
+  assert.ok((result.stderr ?? '').includes('stub'));
+});
+
+test('spawn prints the session id and lease as json', async () => {
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w1', '--model-selector', 'zai/glm-5.3-flash', '--thinking', 'low', '--owner', 'p1', '--ttl', '3600', '--json'],
+    fakeDeps({
+      client: () => ({
+        async spawn() {
+          return { sessionId: 'sess-9', leaseId: 'lease-1', parentId: 'p1', resolvedModel: 'zai/glm-5.3-flash' };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(result.exitCode, 0);
+  const parsed = JSON.parse(result.stdout ?? '{}') as Record<string, unknown>;
+  assert.equal(parsed.sessionId, 'sess-9');
+  assert.equal(parsed.leaseId, 'lease-1');
+});
+
+test('human spawn output names the session', async () => {
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w1'],
+    fakeDeps({
+      client: () => ({
+        async spawn() {
+          return { sessionId: 'sess-9' };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(result.exitCode, 0);
+  assert.ok((result.stdout ?? '').includes('session sess-9'));
+});
+
+test('prompt prints the runId; wait passes deadline; result prints final text', async () => {
+  const prompt = await runCli(
+    ['prompt', 'sess-9', '--message', 'do the thing', '--json'],
+    fakeDeps({
+      client: () => ({
+        async prompt() {
+          return { runId: 'run-77', sessionId: 'sess-9', detached: true, duplicate: false };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(prompt.exitCode, 0);
+  assert.equal((JSON.parse(prompt.stdout ?? '{}') as Record<string, unknown>).runId, 'run-77');
+
+  const wait = await runCli(
+    ['wait', 'sess-9', '--run-id', 'run-77', '--deadline', '60', '--json'],
+    fakeDeps({
+      client: () => ({
+        async wait() {
+          return { kind: 'completed', receipt: { status: 'completed' } };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(wait.exitCode, 0);
+  assert.equal((JSON.parse(wait.stdout ?? '{}') as Record<string, unknown>).kind, 'completed');
+
+  const result = await runCli(
+    ['result', 'run-77', '--json'],
+    fakeDeps({
+      client: () => ({
+        async result() {
+          return { runId: 'run-77', status: 'completed', finalText: 'all done', evidence: { transcript: '/api/v1/sessions/sess-9/transcript?scope=visible_full' } };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal((JSON.parse(result.stdout ?? '{}') as Record<string, unknown>).finalText, 'all done');
+});
+
+test('wait outcomes map to their documented exit codes', async () => {
+  const wait = await runCli(
+    ['wait', 'sess-9', '--run-id', 'run-77', '--json'],
+    fakeDeps({
+      client: () => ({
+        async wait() {
+          return { kind: 'never_started', receipt: { status: 'failed', errorCode: 'NEVER_STARTED' } };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(wait.exitCode, 6);
+});
+
+test('deadline outcome exits 3 (re-wait, never re-dispatch)', async () => {
+  const wait = await runCli(
+    ['wait', 'sess-9', '--json'],
+    fakeDeps({
+      client: () => ({
+        async wait() {
+          return { kind: 'deadline', note: 'waited 60000ms' };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(wait.exitCode, 3);
+});
+
+test('cleanup and status round-trip', async () => {
+  const cleanup = await runCli(
+    ['cleanup', 'sess-9', '--lease', 'lease-1', '--owner', 'p1', '--json'],
+    fakeDeps({
+      client: () => ({
+        async cleanup() {
+          return { released: true, deleted: true, notes: [] };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(cleanup.exitCode, 0);
+  assert.equal((JSON.parse(cleanup.stdout ?? '{}') as Record<string, unknown>).deleted, true);
+
+  const status = await runCli(
+    ['status', '--parent', 'p1', '--json'],
+    fakeDeps({
+      client: () => ({
+        async status() {
+          return {
+            parent: 'p1',
+            children: [{ sessionId: 'c1', busy: false, goalStatus: 'achieved', lastRun: { status: 'completed' } }],
+          };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(status.exitCode, 0);
+  const parsed = JSON.parse(status.stdout ?? '{}') as { children: unknown[] };
+  assert.equal(parsed.children.length, 1);
+});
+
+test('http error mapping: preflight refusal exits 11 with the failures list', async () => {
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/nope'],
+    fakeDeps({
+      client: () => {
+        throw Object.assign(new Error('preflight failed'), { httpCode: 'PREFLIGHT_FAILED', failures: [{ kind: 'cwd_missing' }] });
+      },
+    }),
+  );
+  assert.equal(result.exitCode, 11);
+  assert.ok((result.stderr ?? '').includes('PREFLIGHT_FAILED'));
+  assert.ok((result.stderr ?? '').includes('cwd_missing'));
+});
+
+test('admission refusal with retry-after exits 10 and echoes the header', async () => {
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/x'],
+    fakeDeps({
+      client: () => {
+        throw Object.assign(new Error('admission refused'), { status: 503, retryAfterSeconds: 30 });
+      },
+    }),
+  );
+  assert.equal(result.exitCode, 10);
+  assert.ok((result.stderr ?? '').includes('retry-after: 30s'));
+});
+
+test('--parent-session overrides the environment identity', async () => {
+  const seen: Array<Record<string, string | undefined>> = [];
+  await runCli(
+    ['status', '--parent', 'p1', '--parent-session', 'explicit-parent'],
+    fakeDeps({
+      env: { PI_WEB_UI_SESSION_ID: 'env-parent' },
+      client: (config) => {
+        seen.push({ parentSession: config.parentSessionId });
+        return {
+          async status() {
+            return { parent: 'p1', children: [] };
+          },
+        } as never;
+      },
+    }),
+  );
+  assert.equal(seen[0]?.parentSession, 'explicit-parent');
+});
+
+test('missing required flags are usage errors', async () => {
+  const result = await runCli(['spawn', '--runtime', 'pi'], fakeDeps());
+  assert.equal(result.exitCode, 2);
+  assert.ok((result.stderr ?? '').includes('--cwd'));
+});

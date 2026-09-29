@@ -1,0 +1,164 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { loadSnapshot } from '../src/snapshot.ts';
+import {
+  buildCreateBody,
+  buildPromptBody,
+  buildWatchBody,
+  agentEnd,
+  goalEnd,
+  goalPaused,
+  questionSentinel,
+  deadlineCondition,
+} from '../src/builders.ts';
+import { ZodSpec } from '../src/zod-spec.ts';
+
+/**
+ * Request builders must be conformant with the server-derived snapshot's zod
+ * descriptions: right keys, right enums, right bounds, no unknown keys (the
+ * server schemas are `.strict()` — an extra key is a 400, never a passthrough).
+ * The conformance walker itself is exercised here against the real snapshot.
+ */
+
+const { snapshot } = loadSnapshot({ env: {} });
+
+const spec = new ZodSpec(snapshot.zodSchemas.createSessionBody!);
+
+test('create body: happy path conforms to the snapshot zod description', () => {
+  const body = buildCreateBody({
+    runtime: 'pi',
+    cwd: '/tmp/work/child-1',
+    modelSelector: 'zai/glm-5.3-flash',
+    thinkingLevel: 'low',
+    retention: { mode: 'durable', ttlSeconds: 3600, ownerId: 'parent-x' },
+    goal: { objective: 'Do the bounded thing', maxTurns: 10 },
+    preflight: { paths: ['/tmp/work/child-1/brief.md'], tools: ['node'] },
+  });
+  const problems = spec.check(body);
+  assert.deepEqual(problems, [], `conformance problems: ${JSON.stringify(problems)}`);
+});
+
+test('create body: every emitted key exists in the schema (strict server schema)', () => {
+  const body = buildCreateBody({ runtime: 'pi', cwd: '/tmp/x' }) as Record<string, unknown>;
+  const schemaKeys = Object.keys(snapshot.zodSchemas.createSessionBody!.fields ?? {});
+  for (const key of Object.keys(body)) {
+    assert.ok(
+      schemaKeys.includes(key),
+      `builder emitted '${key}' which the server schema does not accept`,
+    );
+  }
+});
+
+test('create body: rejects goals on runtimes that cannot take them', () => {
+  assert.throws(
+    () =>
+      buildCreateBody({
+        runtime: 'opencode',
+        cwd: '/tmp/x',
+        goal: { objective: 'nope' },
+      }),
+    /opencode/,
+  );
+  assert.throws(
+    () =>
+      buildCreateBody({
+        runtime: 'antigravity',
+        cwd: '/tmp/x',
+        goal: { objective: 'nope' },
+      }),
+    /antigravity/,
+  );
+});
+
+test('create body: bounds come from the snapshot, not from memory', () => {
+  // objective > 4000 chars must throw (goalSpec max 4000)
+  assert.throws(
+    () => buildCreateBody({ runtime: 'pi', cwd: '/tmp/x', goal: { objective: 'x'.repeat(4001) } }),
+    /objective/,
+  );
+  // ttlSeconds out of 1..604800 must throw
+  assert.throws(
+    () =>
+      buildCreateBody({
+        runtime: 'pi',
+        cwd: '/tmp/x',
+        retention: { mode: 'durable', ttlSeconds: 0, ownerId: 'o' },
+      }),
+    /ttlSeconds/,
+  );
+  assert.throws(
+    () =>
+      buildCreateBody({
+        runtime: 'pi',
+        cwd: '/tmp/x',
+        retention: { mode: 'durable', ttlSeconds: 7 * 24 * 60 * 60 + 1, ownerId: 'o' },
+      }),
+    /ttlSeconds/,
+  );
+  // maxTurns out of 1..100 must throw
+  assert.throws(
+    () => buildCreateBody({ runtime: 'pi', cwd: '/tmp/x', goal: { objective: 'ok', maxTurns: 0 } }),
+    /maxTurns/,
+  );
+});
+
+test('prompt body: detach requires answers verbosity (server rule)', () => {
+  assert.throws(
+    () => buildPromptBody({ message: 'go', detach: true, verbosity: 'full' }),
+    /detach/,
+  );
+  const body = buildPromptBody({ message: 'go', detach: true });
+  assert.equal(body.verbosity, 'answers');
+  assert.equal(body.detach, true);
+});
+
+test('prompt body: idempotency key bounds (1..128) and required message', () => {
+  assert.throws(() => buildPromptBody({ message: 'x', idempotencyKey: '' }), /idempotencyKey/);
+  assert.throws(
+    () => buildPromptBody({ message: 'x', idempotencyKey: 'k'.repeat(129) }),
+    /idempotencyKey/,
+  );
+  assert.throws(() => buildPromptBody({ message: '' }), /message/);
+});
+
+test('prompt body: defaults are detached-dispatch shaped', () => {
+  const body = buildPromptBody({ message: 'hello child' });
+  assert.equal(body.message, 'hello child');
+  assert.equal(body.verbosity, 'answers');
+  assert.equal(body.mode, 'prompt');
+  assert.ok(typeof body.idempotencyKey === 'string' && body.idempotencyKey.length >= 1);
+});
+
+test('watch body: conditions non-empty; goal set uses goal_end + paused with the exact objective', () => {
+  assert.throws(() => buildWatchBody({ conditions: [] }), /conditions/);
+  const body = buildWatchBody({
+    conditions: [goalEnd('Fix the widget'), goalPaused('Fix the widget'), questionSentinel('BLOCKED-NEEDS-INPUT')],
+    fireIfSettled: true,
+    label: 'c1-wait',
+  });
+  const conditions = body.conditions as Array<Record<string, unknown>>;
+  assert.equal(conditions.length, 3);
+  assert.equal(body.fireIfSettled, true);
+  assert.equal(conditions[0]?.type, 'event_type');
+  assert.deepEqual(conditions[0]?.dataMatch, { objective: 'Fix the widget' });
+  assert.deepEqual(conditions[1]?.dataMatch, { objective: 'Fix the widget', status: 'paused' });
+  assert.equal(conditions[2]?.type, 'text');
+  assert.equal(conditions[2]?.contains, 'BLOCKED-NEEDS-INPUT');
+});
+
+test('watch body: deadline condition bounds (1..86400 int) and once:true default', () => {
+  assert.throws(() => deadlineCondition(0), /afterSeconds/);
+  assert.throws(() => deadlineCondition(86401), /afterSeconds/);
+  const condition = deadlineCondition(120);
+  assert.equal(condition.type, 'deadline');
+  assert.equal(condition.afterSeconds, 120);
+  assert.notEqual(condition.once, false);
+});
+
+test('watch body: plain agent_end is the default condition shape', () => {
+  const condition = agentEnd();
+  assert.deepEqual(condition, { id: condition.id, type: 'event_type', eventType: 'agent_end', once: true });
+  const goalCondition = goalEnd('obj');
+  assert.equal(goalCondition.eventType, 'goal_end');
+  assert.equal(goalPaused('obj').eventType, 'goal_state');
+});

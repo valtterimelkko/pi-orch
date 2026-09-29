@@ -1,0 +1,20 @@
+{
+  "name": "pi-orch",
+  "version": "0.1.0",
+  "description": "Thin parent client for the Pi Web UI Internal API (plan C1). Local only until the owner approves publishing.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "pi-orch": "bin/pi-orch"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
