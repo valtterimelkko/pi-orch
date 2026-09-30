@@ -26,6 +26,7 @@ function makeDeps(script: Array<(state: DepsState) => Promise<void>> = []): { de
     lastRegistrationBody: null as unknown,
     watches: new Map<string, { firings: Array<unknown>; firingCount: number }>(),
     receipts: new Map<string, Record<string, unknown>>(),
+    goals: new Map<string, Record<string, unknown>>(),
     evidenceBySession: new Map<string, { runs: Array<Record<string, unknown>> }>(),
   };
   const deps: WaitDeps = {
@@ -53,6 +54,11 @@ function makeDeps(script: Array<(state: DepsState) => Promise<void>> = []): { de
       const receipt = state.receipts.get(runId);
       if (!receipt) throw new Error(`no scripted receipt for ${runId}`);
       return receipt as Receipt;
+    },
+    async getGoal(sessionId) {
+      const goal = state.goals.get(sessionId);
+      if (!goal) throw new Error(`no scripted goal for ${sessionId}`);
+      return goal as never;
     },
     async getSessionEvidence(sessionId) {
       const evidence = state.evidenceBySession.get(sessionId);
@@ -100,6 +106,7 @@ interface DepsState {
   lastRegistrationBody: unknown;
   watches: Map<string, { firings: Array<unknown>; firingCount: number }>;
   receipts: Map<string, Record<string, unknown>>;
+  goals: Map<string, Record<string, unknown>>;
   evidenceBySession: Map<string, { runs: Array<Record<string, unknown>> }>;
   pendingFiring?: unknown;
   pendingLongPollError?: Error;
@@ -183,8 +190,9 @@ test('a transport reset mid-wait reconnects, preserves the cursor when the watch
     deps: {
       ...deps,
       async getWatch() {
-        // The watch survived the reset: recovery must NOT re-register it.
-        return { watchId: 'watch-child', status: 'active' };
+        // The watch survived the reset (same conditions): recovery must NOT
+        // re-register it.
+        return { watchId: 'watch-child', status: 'active', conditions: [{ id: 'done-1', spec: { type: 'event_type', eventType: 'agent_end', once: true } }] };
       },
       async longPoll(input) {
         call += 1;
@@ -242,6 +250,7 @@ test('goal children: goal_end with the exact objective ends the wait; paused sur
   const { deps, state } = makeDeps();
   // Non-terminal receipt: the goal events decide, not slice reconciliation.
   state.receipts.set('run-1', { runId: 'run-1', sessionId: 'child', runtime: 'pi', status: 'started', acceptedAt: 't' });
+  state.goals.set('child', { supported: true, status: 'achieved' });
   let call = 0;
   const paused = await waitOnChild({
     sessionId: 'child',
@@ -419,8 +428,8 @@ test('correction 01: wait on a session that does not exist fails fast', async ()
 
 test('waitOnChildren --all settles every child and reports per-child outcomes', async () => {
   const { deps, state } = makeDeps();
-  state.receipts.set('r1', receiptCompleted);
-  state.receipts.set('r2', { ...receiptCompleted, runId: 'r2', errorCode: 'RUN_BUDGET_EXCEEDED', status: 'failed' });
+  state.receipts.set('r1', { ...receiptCompleted, sessionId: 'c1' });
+  state.receipts.set('r2', { ...receiptCompleted, runId: 'r2', sessionId: 'c2', errorCode: 'RUN_BUDGET_EXCEEDED', status: 'failed' });
   // Both children already terminal: everything settles in preflight, no polls.
   const result = await waitOnChildren({
     mode: 'all',

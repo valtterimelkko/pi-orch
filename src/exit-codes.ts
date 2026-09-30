@@ -33,6 +33,9 @@ export const EXIT_CODES: readonly ExitCodeEntry[] = [
   { code: 14, name: 'PROMPT_NOT_EXECUTED', meaning: 'Pi accepted the prompt but no turn ever started (extension input-hook swallow)' },
   { code: 15, name: 'TURN_STALLED', meaning: 'The turn stalled past the watchdog window; check the session before re-prompting' },
   { code: 16, name: 'WAIT_TARGET_NOT_FOUND', meaning: 'wait fast-fail: the --run-id is unknown/malformed (no such receipt) or the sessionId is not in the registry — nothing to wait on (correction 01)' },
+  { code: 17, name: 'GOAL_CLEARED', meaning: 'The goal ended `cleared` (correction 04: goal_end is classified from the goal projection, not assumed success) — not achieved; go look' },
+  { code: 18, name: 'CREATE_UNKNOWN', meaning: 'A create (POST /sessions) lost its connection or response; the server may or may not have created the session — reconcile with status --parent (the client never blindly re-spawns)' },
+  { code: 19, name: 'WATCH_CONFLICT', meaning: 'An incompatible watch owned by someone else is active on the child; the client never replaces foreign watches — use a different label or remove the watch' },
 ];
 
 export const OUTCOME_EXIT_CODES: Record<string, number> = {
@@ -52,6 +55,9 @@ export const OUTCOME_EXIT_CODES: Record<string, number> = {
   turn_stalled: 15,
   run_not_found: 16,
   session_not_found: 16,
+  goal_cleared: 17,
+  create_unknown: 18,
+  watch_conflict: 19,
 };
 
 /** Server error codes that map to a specific exit (others fall back to 1/4/12). */

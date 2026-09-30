@@ -6,7 +6,7 @@
  * parents pass --parent-session explicitly.
  */
 
-import { Transport, type TransportConfig } from './transport.ts';
+import { Transport, TransportError, type TransportConfig } from './transport.ts';
 import {
   buildCreateBody,
   buildPromptBody,
@@ -98,7 +98,23 @@ export class PiOrchClient {
   }> {
     const modelSelector = input.modelSelector ?? (input.modelMatch ? await this.resolveModel(input.runtime, input.modelMatch) : undefined);
     const body = buildCreateBody({ ...input, modelSelector });
-    const response = await this.transport.request('POST', '/api/v1/sessions', { body, headers: this.headers() });
+    let response: Awaited<ReturnType<Transport['request']>>;
+    try {
+      response = await this.transport.request('POST', '/api/v1/sessions', { body, headers: this.headers() });
+    } catch (error) {
+      // Correction 04 item 3: POST /sessions has no server idempotency, so a
+      // lost connection/response is NEVER retried — the server may have created
+      // the session. Surface an explicit unknown outcome with a reconcile hint.
+      if (error instanceof TransportError) {
+        throw new ApiError(0, 'CREATE_UNKNOWN', `create outcome unknown: ${error.message}`, {
+          details: JSON.stringify({
+            outcome: 'unknown',
+            hint: `do NOT blindly re-spawn. Reconcile first: pi-orch status --parent <your sessionId> (children carry your ownerId${input.retention?.label ? ` / label '${input.retention.label}'` : ''}); delete an orphaned child if you find one, then re-spawn`,
+          }),
+        });
+      }
+      throw error;
+    }
     const raw = response.body as Record<string, unknown>;
     const retention = raw.retention as { leaseId?: string } | undefined;
     return {
@@ -122,7 +138,7 @@ export class PiOrchClient {
     const path = `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompt`;
     let response: Awaited<ReturnType<Transport['request']>>;
     try {
-      response = await this.transport.request('POST', path, { body, headers: this.headers() });
+      response = await this.transport.request('POST', path, { body, headers: this.headers(), _idempotent: true });
     } catch (error) {
       // Live-found race: a create-time goal arms a detached goal-start turn, so
       // the first prompt to a fresh goal-armed child can hit 409 SESSION_BUSY.
@@ -135,6 +151,7 @@ export class PiOrchClient {
       response = await this.transport.request('POST', path, {
         body: { ...body, mode: 'follow_up' },
         headers: this.headers(),
+        _idempotent: true,
       });
     }
     const raw = response.body as Record<string, unknown>;
@@ -161,13 +178,23 @@ export class PiOrchClient {
     return { watchId: String(raw.watchId), status: typeof raw.status === 'string' ? raw.status : undefined, raw };
   }
 
-  async getWatch(sessionId: string): Promise<{ watchId: string; status?: string } | null> {
+  async getWatch(sessionId: string): Promise<{ watchId: string; status?: string; conditions?: Array<{ id?: string; spec?: Record<string, unknown> }>; label?: string } | null> {
     try {
       const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, {
         headers: this.headers(),
       });
       const raw = response.body as Record<string, unknown>;
-      return { watchId: String(raw.watchId), status: typeof raw.status === 'string' ? raw.status : undefined };
+      return {
+        watchId: String(raw.watchId),
+        status: typeof raw.status === 'string' ? raw.status : undefined,
+        label: typeof raw.label === 'string' ? raw.label : undefined,
+        conditions: Array.isArray(raw.conditions)
+          ? (raw.conditions as Array<Record<string, unknown>>).map((condition) => ({
+              id: typeof condition.id === 'string' ? condition.id : undefined,
+              spec: (condition.spec ?? condition) as Record<string, unknown>,
+            }))
+          : undefined,
+      };
     } catch (error) {
       if ((error as { status?: number }).status === 404) return null;
       throw error;
@@ -261,6 +288,11 @@ export class PiOrchClient {
           if ((error as { status?: number }).status === 404) return null;
           throw error;
         }
+      },
+      getGoal: async (sessionId) => {
+        const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() });
+        const body = response.body as { status?: string; objective?: string; pausedReason?: string | null; lastReason?: string | null };
+        return { status: body.status, objective: body.objective, pausedReason: body.pausedReason, lastReason: body.lastReason };
       },
       registerWatch: async (sessionId_, body) => {
         const registered = await this.registerWatch(sessionId_, body as { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean });
@@ -367,19 +399,26 @@ export class PiOrchClient {
     const query = new URLSearchParams({ parent: target.parent });
     const response = await this.transport.request('GET', `/api/v1/sessions?${query.toString()}`, { headers: this.headers() });
     const body = response.body as { sessions?: Array<{ sessionId: string; runtime?: string; busy?: boolean; status?: string }> };
+    const sessions = body.sessions ?? [];
+    // Correction 04 item 6: every child is enriched with busy, goal state and
+    // its last receipt; bounded parallelism keeps large fan-outs polite.
     const children: Awaited<ReturnType<typeof this.childStatus>>[] = [];
-    for (const session of body.sessions ?? []) {
-      children.push({
-        sessionId: session.sessionId,
-        runtime: session.runtime,
-        busy: session.busy,
-        status: session.status,
-      });
-    }
+    const queue = [...sessions];
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const session = queue.shift();
+        if (!session) return;
+        children.push(await this.childStatus(session.sessionId, session));
+      }
+    };
+    await Promise.all([worker(), worker(), worker(), worker()]);
     return { parent: target.parent, children };
   }
 
-  private async childStatus(sessionId: string): Promise<{
+  private async childStatus(
+    sessionId: string,
+    known?: { runtime?: string; busy?: boolean; status?: string },
+  ): Promise<{
     sessionId: string;
     runtime?: string;
     busy?: boolean;
@@ -388,22 +427,30 @@ export class PiOrchClient {
     goalObjective?: string;
     lastRun?: { runId?: string; status?: string; errorCode?: string };
   }> {
-    const goal = await this.transport
-      .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() })
-      .then((response) => response.body as { status?: string; objective?: string })
-      .catch(() => ({ status: 'unknown' as string | undefined, objective: undefined as string | undefined }));
-    const evidence = await this.transport
-      .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/evidence`, { headers: this.headers() })
-      .then((response) => response.body as { runChronology?: Array<{ runId?: string; status?: string; errorCode?: string }>; status?: string })
-      .catch(() => ({ runChronology: [] as Array<{ runId?: string; status?: string; errorCode?: string }>, status: undefined as string | undefined }));
+    // Correction 04 item 6: direct reads derive busy from the session detail.
+    const detail = known ?? await this.transport
+      .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() })
+      .then((response) => response.body as { runtime?: string; busy?: boolean; status?: string })
+      .catch(() => ({}) as { runtime?: string; busy?: boolean; status?: string });
+    const [goal, evidence] = await Promise.all([
+      this.transport
+        .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() })
+        .then((response) => response.body as { status?: string; objective?: string })
+        .catch(() => ({ status: 'unknown' as string | undefined, objective: undefined as string | undefined })),
+      this.transport
+        .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/evidence`, { headers: this.headers() })
+        .then((response) => response.body as { runChronology?: Array<{ runId?: string; status?: string; errorCode?: string }>; status?: string })
+        .catch(() => ({ runChronology: [] as Array<{ runId?: string; status?: string; errorCode?: string }>, status: undefined as string | undefined })),
+    ]);
     const last = evidence.runChronology?.[0];
     return {
       sessionId,
-      busy: undefined,
-      status: evidence.status,
+      runtime: detail.runtime,
+      busy: detail.busy,
+      status: detail.status ?? evidence.status,
       goalStatus: goal?.status,
       goalObjective: goal?.objective,
-      lastRun: last ? { runId: last.runId, status: last.status, errorCode: last.errorCode } : undefined,
+      lastRun: last ? { runId: last.runId, status: last.status, errorCode: last.errorCode ?? undefined } : undefined,
     };
   }
 }

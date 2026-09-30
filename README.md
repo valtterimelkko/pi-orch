@@ -87,6 +87,9 @@ cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 | 14 | `PROMPT_NOT_EXECUTED` | Pi accepted the prompt but no turn ever started (extension input-hook swallow) |
 | 15 | `TURN_STALLED` | The turn stalled past the watchdog window; check the session before re-prompting |
 | 16 | `WAIT_TARGET_NOT_FOUND` | wait fast-fail: the --run-id is unknown/malformed (no such receipt) or the sessionId is not in the registry — nothing to wait on |
+| 17 | `GOAL_CLEARED` | The goal ended `cleared` (classified from the goal projection) — not achieved; go look |
+| 18 | `CREATE_UNKNOWN` | A create lost its connection/response; the session may exist — reconcile with `status --parent` (never blindly re-spawn) |
+| 19 | `WATCH_CONFLICT` | An incompatible foreign watch is active on the child; the client never replaces foreign watches |
 
 ## Development
 

@@ -22,8 +22,10 @@ export interface WaitDeps {
   getSessionEvidence(sessionId: string): Promise<{ runs: Array<{ runId?: string; status?: string; errorCode?: string }> }>;
   /** Existence preflight: null when the registry has no such session (404). */
   getSession(sessionId: string): Promise<{ sessionId: string; status?: string } | null>;
+  /** Goal projection for goal_end classification (correction 04 item 1). */
+  getGoal(sessionId: string): Promise<{ status?: string; objective?: string; pausedReason?: string | null; lastReason?: string | null }>;
   registerWatch(sessionId: string, body: Record<string, unknown>): Promise<{ watchId: string; status?: string }>;
-  getWatch(sessionId: string): Promise<{ watchId: string; status?: string } | null>;
+  getWatch(sessionId: string): Promise<{ watchId: string; status?: string; conditions?: Array<{ id?: string; spec?: Record<string, unknown> }>; label?: string } | null>;
   sleep(ms: number): Promise<void>;
   now(): number;
 }
@@ -44,7 +46,9 @@ export type WaitOutcome =
   | { kind: 'goal_failed'; evidence?: string; note?: string }
   | { kind: 'deadline'; note?: string }
   | { kind: 'run_not_found'; note?: string }
-  | { kind: 'session_not_found'; note?: string };
+  | { kind: 'session_not_found'; note?: string }
+  | { kind: 'goal_cleared'; evidence?: string; note?: string }
+  | { kind: 'watch_conflict'; note?: string };
 
 export interface WaitOptions {
   sessionId: string;
@@ -84,6 +88,14 @@ async function preflightWait(
   if (!child.runId) return null;
   try {
     const receipt = await deps.getReceipt(child.runId);
+    // Correction 04 item 4: a receipt that belongs to a DIFFERENT session is a
+    // caller mistake (typo, stale id) — fail fast on it, never wait on it.
+    if (receipt.sessionId !== child.sessionId) {
+      return {
+        kind: 'run_not_found',
+        note: `mismatch: run ${child.runId} belongs to session ${receipt.sessionId}, not ${child.sessionId}`,
+      };
+    }
     return fromClassification(classifyReceipt(receipt), receipt);
   } catch (error) {
     const status = (error as { status?: number }).status;
@@ -101,9 +113,11 @@ export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
   if (fast) return fast;
   const sliceMs = Math.min(options.sliceMs ?? 45_000, MAX_SLICE_MS);
   const start = deps.now();
+  const conditionsById = new Map(options.conditions.flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
 
   let watch = await registerOrReuse(options.sessionId, options.conditions, options.label, deps);
-  let watchId = watch.watchId;
+  if (watch.conflict) return { kind: 'watch_conflict', note: watch.conflict };
+  let watchId = watch.watchId as string;
   let cursor: string | undefined = undefined; // fresh ledger view on first registration
   let recoveryAttempts = 0;
   let receiptChecks = 0;
@@ -129,7 +143,8 @@ export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
       const existing = await deps.getWatch(options.sessionId).catch(() => null);
       if (!existing || existing.status === 'detached') {
         watch = await registerOrReuse(options.sessionId, options.conditions, options.label, deps, true);
-        watchId = watch.watchId;
+        if (watch.conflict) return { kind: 'watch_conflict', note: watch.conflict };
+        watchId = watch.watchId as string;
         cursor = undefined; // new ledger: start at 0 so a reconciled firing is seen
       }
       continue;
@@ -139,7 +154,7 @@ export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
     if (result.kind === 'fired') {
       const parsed = parseWatchesWait(result.body);
       cursor = parsed.nextCursor;
-      const outcome = await outcomeFromFirings(parsed.watches.flatMap((watch_) => watch_.firings), options, deps, () => {
+      const outcome = await outcomeFromFirings(parsed.watches.flatMap((watch_) => watch_.firings), options, deps, conditionsById, () => {
         receiptChecks += 1;
         return receiptChecks;
       });
@@ -154,18 +169,54 @@ export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
   }
 }
 
+/** Semantic condition shape for compatibility (ids are caller-chosen; ignored). */
+function conditionShape(condition: WatchConditionSpec): Record<string, unknown> {
+  return {
+    type: condition.type,
+    ...(condition.eventType !== undefined ? { eventType: condition.eventType } : {}),
+    ...(condition.dataMatch !== undefined ? { dataMatch: condition.dataMatch } : {}),
+    ...(condition.contains !== undefined ? { contains: condition.contains } : {}),
+    ...(condition.toolName !== undefined ? { toolName: condition.toolName } : {}),
+    ...(condition.phase !== undefined ? { phase: condition.phase } : {}),
+    ...(condition.argIncludes !== undefined ? { argIncludes: condition.argIncludes } : {}),
+    ...(condition.afterSeconds !== undefined ? { afterSeconds: condition.afterSeconds } : {}),
+  };
+}
+
+function sameConditions(a: Array<Record<string, unknown>>, b: Array<Record<string, unknown>>): boolean {
+  if (a.length !== b.length) return false;
+  const key = (shape: Record<string, unknown>): string => JSON.stringify(Object.keys(shape).sort().reduce((out, k) => ({ ...out, [k]: shape[k] }), {}));
+  const aKeys = a.map(key).sort();
+  const bKeys = b.map(key).sort();
+  return aKeys.every((value, index) => value === bKeys[index]);
+}
+
+/**
+ * Correction 04 item 5: an ACTIVE watch is reused only when its conditions are
+ * compatible (semantically equal). Otherwise: replace only a watch this client
+ * owns (same label); a foreign watch yields an explicit watch_conflict — never
+ * a silent run to the deadline, never a replaced foreign observer.
+ */
 async function registerOrReuse(
   sessionId: string,
   conditions: WatchConditionSpec[],
   label: string | undefined,
   deps: WaitDeps,
   recovery = false,
-): Promise<{ watchId: string }> {
+): Promise<{ watchId?: string; conflict?: string }> {
   if (!recovery) {
     const existing = await deps.getWatch(sessionId).catch(() => null);
     if (existing && existing.status === 'active') {
-      // One watch per session: never replace another observer's live watch.
-      return { watchId: existing.watchId };
+      const existingShapes = ((existing.conditions ?? []) as Array<{ spec?: Record<string, unknown> }>).map((state) => conditionShape((state.spec ?? state) as WatchConditionSpec));
+      const wantedShapes = conditions.map((condition) => conditionShape(condition));
+      if (sameConditions(existingShapes, wantedShapes)) {
+        return { watchId: existing.watchId };
+      }
+      if (label !== undefined && existing.label === label) {
+        // Our own watch from a previous attempt: replace it.
+      } else {
+        return { conflict: `session ${sessionId} has an active watch${existing.label ? ` labelled '${existing.label}'` : ''} with incompatible conditions; the client never replaces foreign watches` };
+      }
     }
   }
   const body: Record<string, unknown> = { conditions };
@@ -175,25 +226,53 @@ async function registerOrReuse(
   return { watchId: registered.watchId };
 }
 
+/** Correction 04 item 1: a goal_end is classified from the live projection — never assumed success. */
+async function goalEndOutcome(
+  sessionId: string,
+  evidence: string,
+  deps: WaitDeps,
+): Promise<WaitOutcome> {
+  try {
+    const goal = await deps.getGoal(sessionId);
+    switch (goal.status) {
+      case 'achieved':
+        return { kind: 'goal_achieved', evidence };
+      case 'failed':
+        return { kind: 'goal_failed', evidence, note: `goal failed (${goal.pausedReason ?? goal.lastReason ?? 'reason unknown'})` };
+      case 'cleared':
+        return { kind: 'goal_cleared', evidence, note: 'goal cleared — not achieved; read the session before re-arming' };
+      case 'paused':
+        return { kind: 'paused', evidence, note: `goal paused (${goal.pausedReason ?? 'reason unknown'})` };
+      default:
+        return { kind: 'goal_failed', evidence, note: `goal projection status '${String(goal.status)}' after goal_end` };
+    }
+  } catch {
+    // Projection unreadable: a goal_end that is not provably achieved is not
+    // reported as success (correction 04 item 1).
+    return { kind: 'goal_failed', evidence, note: 'goal_end fired but the projection was unreadable' };
+  }
+}
+
 async function outcomeFromFirings(
   firings: Array<{ conditionId: string; eventType: string; evidence?: string }>,
   options: WaitOptions,
   deps: WaitDeps,
+  conditionsById: Map<string, WatchConditionSpec>,
   countReceiptCheck: () => void,
 ): Promise<WaitOutcome | null> {
   for (const firing of firings) {
-    if (firing.eventType === 'goal_state') {
-      return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
-    }
-    if (firing.eventType === 'text') {
+    // Correction 04 item 2: classify by the condition ID we registered —
+    // normalized text firings carry the underlying event type (for example
+    // `message_update`), never the literal condition type.
+    const condition = conditionsById.get(firing.conditionId);
+    if (condition?.type === 'text') {
       return { kind: 'question', evidence: firing.evidence, note: 'question sentinel matched' };
     }
-    if (firing.eventType === 'goal_end') {
-      // Only conditions carrying the exact-objective dataMatch can fire here
-      // (the server filters), so this is the real outcome, not a stale clear.
-      const evidence = firing.evidence ?? '';
-      if (evidence.includes('failed')) return { kind: 'goal_failed', evidence };
-      return { kind: 'goal_achieved', evidence };
+    if (firing.eventType === 'goal_state' || condition?.eventType === 'goal_state') {
+      return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
+    }
+    if (firing.eventType === 'goal_end' || condition?.eventType === 'goal_end') {
+      return goalEndOutcome(options.sessionId, firing.evidence ?? '', deps);
     }
     if (firing.eventType === 'agent_end' || firing.eventType === 'deadline') {
       const outcome = await reconcileReceipt(options, deps, countReceiptCheck);
@@ -316,7 +395,12 @@ export async function waitOnChildren(options: {
   const unsettled = new Map<number, { watchId: string }>();
   for (const [index, child] of options.children.entries()) {
     if (results.has(index)) continue;
-    unsettled.set(index, { watchId: (await registerOrReuse(child.sessionId, childConditions(options, child), options.label, deps)).watchId });
+    const registered = await registerOrReuse(child.sessionId, childConditions(options, child), options.label, deps);
+    if (registered.conflict) {
+      results.set(index, { kind: 'watch_conflict', note: registered.conflict });
+      continue;
+    }
+    unsettled.set(index, { watchId: registered.watchId as string });
   }
 
   const start = deps.now();
@@ -345,7 +429,13 @@ export async function waitOnChildren(options: {
         if (!child) continue;
         const existing = await deps.getWatch(child.sessionId).catch(() => null);
         if (!existing || existing.status === 'detached') {
-          unsettled.set(index, { watchId: (await registerOrReuse(child.sessionId, childConditions(options, child), options.label, deps, true)).watchId });
+          const registered = await registerOrReuse(child.sessionId, childConditions(options, child), options.label, deps, true);
+          if (registered.conflict) {
+            results.set(index, { kind: 'watch_conflict', note: registered.conflict });
+            unsettled.delete(index);
+            continue;
+          }
+          unsettled.set(index, { watchId: registered.watchId as string });
           cursor = undefined; // new ledger: start at 0 so reconciled firings are seen
         }
       }
@@ -361,8 +451,9 @@ export async function waitOnChildren(options: {
         const index = byWatchId.get(watch.watchId);
         const child = index === undefined ? undefined : options.children[index];
         if (index === undefined || !child) continue;
+        const conditionsById = new Map(childConditions(options, child).flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
         for (const firing of watch.firings) {
-          const outcome = await firingOutcome(firing, child, deps);
+          const outcome = await firingOutcome(firing, child, deps, conditionsById);
           if (outcome) {
             results.set(index, outcome);
             unsettled.delete(index);
@@ -412,17 +503,17 @@ async function firingOutcome(
   firing: { conditionId: string; eventType: string; evidence?: string },
   child: WaitChild,
   deps: WaitDeps,
+  conditionsById: Map<string, WatchConditionSpec> = new Map(),
 ): Promise<WaitOutcome | null> {
-  if (firing.eventType === 'goal_state') {
-    return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
-  }
-  if (firing.eventType === 'text') {
+  const condition = conditionsById.get(firing.conditionId);
+  if (condition?.type === 'text') {
     return { kind: 'question', evidence: firing.evidence, note: 'question sentinel matched' };
   }
-  if (firing.eventType === 'goal_end') {
-    const evidence = firing.evidence ?? '';
-    if (evidence.includes('failed')) return { kind: 'goal_failed', evidence };
-    return { kind: 'goal_achieved', evidence };
+  if (firing.eventType === 'goal_state' || condition?.eventType === 'goal_state') {
+    return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
+  }
+  if (firing.eventType === 'goal_end' || condition?.eventType === 'goal_end') {
+    return goalEndOutcome(child.sessionId, firing.evidence ?? '', deps);
   }
   if (firing.eventType === 'agent_end' || firing.eventType === 'deadline') {
     const outcome = await reconcileChildReceipt(child, deps);

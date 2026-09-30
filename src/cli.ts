@@ -17,7 +17,7 @@ import {
 import type { WatchConditionSpec } from './parsers.ts';
 import { ApiError } from './parsers.ts';
 import { ERROR_CODE_EXIT_CODES, exitCodeFor } from './exit-codes.ts';
-import { defaultSocketPath, defaultTokenPath } from './snapshot.ts';
+import { defaultSocketPath, defaultTokenPath, loadSnapshot, liveContractVersion } from './snapshot.ts';
 import { readToken } from './transport.ts';
 
 export interface ClientLike {
@@ -174,7 +174,8 @@ Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interr
 
 export async function runCli(argv: string[], deps: CliDeps): Promise<CliResult> {
   try {
-    return await dispatch(argv, deps);
+    const result = await dispatch(argv, deps);
+    return await withSnapshotStaleness(argv, deps, result);
   } catch (error) {
     if (error instanceof UsageError) {
       const message = `pi-orch: ${error.message}\n\n${HELP}`;
@@ -182,6 +183,49 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<CliResult> 
     }
     return mapError(error);
   }
+}
+
+/**
+ * Correction 04 item 7: the runtime comparison the docs promise. After a
+ * successful API verb, compare the loaded snapshot's contractVersion with the
+ * live /capabilities version. Stale → a SNAPSHOT_STALE warning on stderr and a
+ * `snapshot` field in JSON output; the command itself is never blocked.
+ */
+async function withSnapshotStaleness(argv: string[], deps: CliDeps, result: CliResult): Promise<CliResult> {
+  if (result.exitCode !== 0 || result.stdout === undefined) return result;
+  const args = parseArgs(argv);
+  const KNOWN_API_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'cleanup', 'status']);
+  if (!KNOWN_API_VERBS.has(args.verb)) return result;
+  let snapshot;
+  try {
+    const envOverride = flagString(args, 'snapshot');
+    snapshot = loadSnapshot({ env: { ...deps.env, ...(envOverride ? { PI_ORCH_SNAPSHOT_PATH: envOverride } : {}) } }).snapshot;
+  } catch {
+    return result; // snapshot unavailable: the command stands on its own
+  }
+  let serverVersion: string | undefined;
+  try {
+    const capabilities = await deps.client({}).capabilities();
+    serverVersion = liveContractVersion(capabilities);
+  } catch {
+    return result; // unreachable server: the verb already handled its own errors
+  }
+  if (serverVersion === undefined) return result;
+  const stale = serverVersion !== snapshot.contractVersion;
+  if (stale) {
+    const warning = `SNAPSHOT_STALE: contract snapshot is ${snapshot.contractVersion} but the server reports ${serverVersion} — set PI_ORCH_SNAPSHOT_PATH or update the bundled contract/ copy (regenerate server-side with scripts/generate-client-snapshot.ts)`;
+    deps.stderr(warning);
+  }
+  if (args.flags.has('json')) {
+    try {
+      const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+      parsed.snapshot = { stale, snapshotVersion: snapshot.contractVersion, serverVersion };
+      return { ...result, stdout: `${JSON.stringify(parsed, null, 2)}` };
+    } catch {
+      return result;
+    }
+  }
+  return result;
 }
 
 async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
@@ -392,9 +436,23 @@ function parseConditionList(raw: string, objective: string | undefined): WatchCo
 }
 
 function mapError(error: unknown): CliResult {
-  const anyError = error as { code?: string; status?: number; httpCode?: string; failures?: unknown; retryAfterSeconds?: number; message?: string };
+  const anyError = error as { code?: string; status?: number; httpCode?: string; failures?: unknown; retryAfterSeconds?: number; message?: string; hint?: string; details?: string };
   const code = anyError.httpCode ?? anyError.code;
+  // Correction 04 item 3: an unknown create outcome gets a distinct exit code
+  // and a machine-readable {outcome, hint} body telling the caller to
+  // reconcile — never to blindly re-spawn.
   const rawMessage = anyError.message ?? String(error);
+  if (code === 'CREATE_UNKNOWN') {
+    let hint = anyError.hint;
+    if (!hint && anyError.details) {
+      try { hint = (JSON.parse(anyError.details) as { hint?: string }).hint; } catch { hint = anyError.details; }
+    }
+    return {
+      exitCode: 18,
+      stdout: `${JSON.stringify({ outcome: 'unknown', hint: hint ?? 'reconcile with status --parent before re-spawning' }, null, 2)}`,
+      stderr: `pi-orch: ${rawMessage}`,
+    };
+  }
   const lines = [code ? `pi-orch: ${code}: ${rawMessage}` : rawMessage.startsWith('pi-orch:') ? rawMessage : `pi-orch: ${rawMessage}`];
   if (anyError.failures !== undefined) lines.push(`failures: ${JSON.stringify(anyError.failures)}`);
   const message = lines.join('\n');

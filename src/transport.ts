@@ -46,6 +46,12 @@ export interface RequestOptions {
   timeoutMs?: number;
   /** Internal: used by the retry loop to avoid re-sleeping. */
   _skipRetry?: boolean;
+  /**
+   * Correction 04 item 3: the request is safe to retry after a TRANSPORT
+   * failure because it carries an idempotency key (or is a safe method).
+   * POST /sessions must never be marked: the server has no create idempotency.
+   */
+  _idempotent?: boolean;
 }
 
 export class Transport {
@@ -78,8 +84,13 @@ export class Transport {
       try {
         response = await this.requestOnce(method, path, options);
       } catch (error) {
-        // Transport-level failure: no server verdict, safe to retry within budget.
-        if (attempt < retry.maxAttempts && totalWaited < retry.maxTotalWaitMs) {
+        // Correction 04 item 3: a transport failure (lost connection or
+        // response) gives NO server verdict. Retry only requests that are
+        // provably safe to repeat: safe methods, or requests carrying an
+        // idempotency key. A non-idempotent POST is surfaced immediately —
+        // the caller reconciles instead of duplicating the action.
+        const safeToRepeat = options._idempotent === true || method === 'GET' || method === 'DELETE' || method === 'HEAD';
+        if (safeToRepeat && attempt < retry.maxAttempts && totalWaited < retry.maxTotalWaitMs) {
           await sleep(500);
           continue;
         }
@@ -87,10 +98,17 @@ export class Transport {
       }
       const retryAfter = parseRetryAfter(response.headers['retry-after']);
       const retryable = (response.status === 429 || response.status === 503) && retryAfter !== undefined;
-      if (retryable && attempt < retry.maxAttempts && totalWaited < retry.maxTotalWaitMs && !options._skipRetry) {
-        const waitMs = Math.min(retryAfter * 1000, retry.capPerWaitMs);
-        totalWaited += waitMs;
-        await sleep(waitMs);
+      if (retryable && attempt < retry.maxAttempts && !options._skipRetry) {
+        // Correction 04 item 8: never retry EARLIER than the server asked.
+        // The delay is waited in full unless the remaining budget cannot cover
+        // it — then the refusal is returned with its retry hint instead.
+        const delayMs = retryAfter * 1000;
+        const remainingBudget = retry.maxTotalWaitMs - totalWaited;
+        if (delayMs > remainingBudget) {
+          throw parseApiError(response.status, response.body, retryAfter);
+        }
+        totalWaited += delayMs;
+        await sleep(delayMs);
         continue;
       }
       if (response.status >= 400) {
