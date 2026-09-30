@@ -16,7 +16,7 @@ import {
 } from './builders.ts';
 import type { WatchConditionSpec } from './parsers.ts';
 import { ApiError } from './parsers.ts';
-import { ERROR_CODE_EXIT_CODES, exitCodeFor } from './exit-codes.ts';
+import { ERROR_CODE_EXIT_CODES, exitCodeFor, VERIFY_EXIT_CODES } from './exit-codes.ts';
 import { defaultSocketPath, defaultTokenPath, loadSnapshot, liveContractVersion } from './snapshot.ts';
 import { readToken } from './transport.ts';
 
@@ -25,7 +25,7 @@ export interface ClientLike {
   prompt(sessionId: string, input: Record<string, unknown>): Promise<{ runId: string; sessionId: string; detached: boolean; duplicate: boolean; dispatchMode?: string }>;
   wait(options: { sessionId: string; runId?: string; conditions?: WatchConditionSpec[]; objective?: string; deadlineMs?: number; label?: string }): Promise<{ kind: string; [key: string]: unknown }>;
   result(runId: string, options?: { includeTranscript?: boolean }): Promise<Record<string, unknown>>;
-  verify(input: { sessionId: string; runId?: string }): Promise<{ implemented: false; plannedBy: string }>;
+  verify(input: { sessionId: string; runId?: string }): Promise<{ implemented: false; plannedBy: string } | { sessionId: string; verdict: string; claims: Array<Record<string, unknown>>; summary: string }>;
   cleanup(sessionId: string, options?: { leaseId?: string; ownerId?: string; watchId?: string }): Promise<{ released: boolean; deleted: boolean; notes: string[] }>;
   status(target: { parent?: string; sessionId?: string }): Promise<{ parent?: string; children: Array<Record<string, unknown>> }>;
   models(runtime?: string): Promise<Array<Record<string, unknown>>>;
@@ -59,7 +59,7 @@ interface ParsedArgs {
 
 const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool']);
 /** Flags that never consume the following token (so `--all c1@r1` keeps the id positional). */
-const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript']);
+const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template']);
 
 function parseArgs(argv: string[]): ParsedArgs {
   const verb = argv[0] ?? '';
@@ -140,7 +140,12 @@ Verbs:
   wait <sessionId> [--run-id id]       watch-based wait; never polls; deadline
        [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
   result <runId> [--transcript]        receipt final text + evidence pointers
-  verify <sessionId>                   stub (C3 fills it); exits 13
+  verify <sessionId> [--run-id id]     re-check completion claims (read-only git):
+       [--since ref] [--rerun "cmd"]   commits exist in their repos (reachable
+       [--cwd dir] [--repo dir]        from --since), filesChanged evidence, blocked
+       [--rerun-timeout S]             needs a reason; --rerun runs ONLY the command
+                                       you name, in the child's cwd. Verdicts:
+                                       verified (0) / contradicted (20) / unverifiable (21)
   cleanup <sessionId> [--lease id --owner id] [--watch id]
                                        release the owned lease, then delete
   status [--parent id] | [sessionId]   children by parent: busy, goal, last run
@@ -157,7 +162,10 @@ Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
   --agent-os-capture enabled|disabled
 
 Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
-  --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool
+  --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool,
+  --no-completion-template (both spawn and prompt: skip the C3b END-OF-TASK
+  REPORT instruction, which rides by default on every dispatched message and
+  on a spawn --goal-objective)
 
 Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end+paused matched),
   --deadline S (default 1800), --slice S, --conditions a,b
@@ -232,8 +240,13 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
   const args = parseArgs(argv);
   const json = args.flags.has('json');
 
-  if (args.verb === '' || args.verb === 'help' || args.flags.has('help')) {
-    return { exitCode: args.verb === '' ? 2 : 0, stderr: HELP };
+  if (args.verb === '' && !args.flags.has('help')) {
+    return { exitCode: 2, stderr: HELP };
+  }
+  if (args.verb === 'help' || args.verb === '-h' || args.verb === '--help' || args.flags.has('help')) {
+    // C1 carried-over item: usage on STDOUT with exit 0 (it went to stderr and
+    // was dropped by the exit-0 printing rules — `pi-orch help` printed nothing).
+    return { exitCode: 0, stdout: HELP };
   }
 
   // Validate the verb BEFORE touching the client factory (a bad command must
@@ -292,6 +305,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
           : undefined,
         preflight,
         agentOsCapture: flagString(args, 'agent-os-capture'),
+        completionTemplate: args.flags.has('no-completion-template') ? false : undefined,
       });
       return output(json, body, (value) => {
         const spawned = value as { sessionId: string; leaseId?: string; parentId?: string; resolvedModel?: string };
@@ -320,6 +334,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         verbosity: flagString(args, 'verbosity'),
         requireActiveTurn: args.flags.has('require-active-turn') ? true : undefined,
         preflight,
+        completionTemplate: args.flags.has('no-completion-template') ? false : undefined,
       });
       return output(json, body, (value) => {
         const prompt = value as { runId: string; duplicate: boolean; dispatchMode?: string };
@@ -380,14 +395,25 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       });
     }
     case 'verify': {
-      // Stub interface — plan step C3 fills it. Static response: no server call,
-      // nothing verified, distinct exit code so scripts never mistake it for a pass.
+      // C3b: re-check the child's completion claims against the filesystem.
+      // Read-only; only the parent-named --rerun command is ever executed.
       const sessionId = args.positional[0];
       if (!sessionId) throw new UsageError('verify needs <sessionId>');
+      const rerunTimeout = flagNumber(args, 'rerun-timeout');
+      const body = await getClient().verify({
+        sessionId,
+        ...(flagString(args, 'run-id') !== undefined ? { runId: flagString(args, 'run-id') } : {}),
+        ...(flagString(args, 'since') !== undefined ? { since: flagString(args, 'since') } : {}),
+        ...(flagString(args, 'rerun') !== undefined ? { rerun: flagString(args, 'rerun') } : {}),
+        ...(rerunTimeout !== undefined ? { rerunTimeoutMs: rerunTimeout * 1000 } : {}),
+        ...(flagString(args, 'cwd') !== undefined ? { cwd: flagString(args, 'cwd') } : {}),
+        ...(flagString(args, 'repo') !== undefined ? { repo: flagString(args, 'repo') } : {}),
+      });
+      const verdict = (body as { verdict: string }).verdict;
+      const exitCode = VERIFY_EXIT_CODES[verdict as 'verified' | 'contradicted' | 'unverifiable'] ?? 1;
       return {
-        exitCode: 13,
-        stdout: `${JSON.stringify({ implemented: false, plannedBy: 'C3', sessionId }, null, 2)}`,
-        stderr: 'pi-orch: verify is a stub (filled by plan step C3); nothing was verified',
+        exitCode,
+        stdout: json ? `${JSON.stringify(body, null, 2)}` : renderVerifyHuman(body as unknown as { verdict: string; claims: Array<{ kind: string; claim: string; result: string; detail?: string }>; summary: string }),
       };
     }
     case 'cleanup': {
@@ -421,6 +447,11 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
     default:
       throw new UsageError(`unknown verb '${args.verb}'`);
   }
+}
+
+function renderVerifyHuman(body: { verdict: string; claims: Array<{ kind: string; claim: string; result: string; detail?: string }>; summary: string }): string {
+  const lines = body.claims.map((claim) => `  ${claim.kind}\t${claim.claim}\t${claim.result}${claim.detail ? ` — ${claim.detail}` : ''}`);
+  return [`verify: ${body.verdict}`, ...lines, body.summary].join('\n');
 }
 
 function parseConditionList(raw: string, objective: string | undefined): WatchConditionSpec[] {

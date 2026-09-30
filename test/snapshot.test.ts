@@ -17,12 +17,20 @@ import { loadSnapshot, SNAPSHOT_SEARCH_PATHS } from '../src/snapshot.ts';
  */
 
 test('loads the bundled snapshot by default', () => {
-  const loaded = loadSnapshot({ env: {} });
-  assert.equal(loaded.source, 'bundled');
-  assert.ok(loaded.snapshot.contractVersion.match(/^\d+\.\d+\.\d+$/));
-  assert.equal(loaded.snapshot.$schema, 'pi-orch-contract-snapshot/v1');
-  assert.ok(Object.keys(loaded.snapshot.routes).length >= 16);
-  assert.ok(Object.keys(loaded.snapshot.types).length >= 20);
+  // Hermetic: point the server-checkout layer at an empty dir so the host's
+  // /root/pi-web-ui checkout (which carries a committed snapshot since the
+  // C1/C3a merge) cannot shadow the bundled copy this test pins.
+  const empty = mkdtempSync(join(tmpdir(), 'piorch-empty-'));
+  try {
+    const loaded = loadSnapshot({ env: {}, serverCheckoutRoot: empty });
+    assert.equal(loaded.source, 'bundled');
+    assert.ok(loaded.snapshot.contractVersion.match(/^\d+\.\d+\.\d+$/));
+    assert.equal(loaded.snapshot.$schema, 'pi-orch-contract-snapshot/v1');
+    assert.ok(Object.keys(loaded.snapshot.routes).length >= 16);
+    assert.ok(Object.keys(loaded.snapshot.types).length >= 20);
+  } finally {
+    rmSync(empty, { recursive: true, force: true });
+  }
 });
 
 test('prefers PI_ORCH_SNAPSHOT_PATH over everything else', () => {

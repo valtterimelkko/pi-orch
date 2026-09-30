@@ -1,6 +1,6 @@
 {
   "$schema": "pi-orch-contract-snapshot/v1",
-  "contractVersion": "1.57.0",
+  "contractVersion": "1.58.0",
   "source": {
     "typeFiles": [
       "server/src/internal-api/types.ts",
@@ -609,7 +609,7 @@
           "type": "InternalApiContractInfo"
         },
         "features": {
-          "type": "{ retentionLeases: true; durableRetention: true; residentRetention: true; executionAdmission: true; runLivenessEvidence: true; sessionRecoveryEvidence: true; supportsEventPayloadBudget: true; capacityEndpoint: '/api/v1/capacity'; /** Contract 1.34.0: child-orchestration surfacing (cards + events) is available. */ childSurfacing: true; /** Contract 1.34.0: the normalized event types the surfacing emits. */ childSurfacingEvents: readonly string[]; /** Contract 1.34.0: request header that links an Internal-API call to the calling parent session. */ childParentHeader: 'X-Parent-Session'; /** Additive opaque-generation CAS fields for watch register/delete. */ watchGenerationPreconditions: { generationField: 'generation'; registerField: 'expectedGeneration'; deleteBodyField: 'expectedGeneration'; }; piProviderPolicy: { blockedProviders: string[]; }; /** Contract 1.46.0: Claude backends allowed for Internal API agent execution (SDK only). */ claudeBackendPolicy: { allowedBackends: ['sdk-subscription']; }; /** Contract 1.47.0 (C1): session identity exported to per-session runtime subprocess environments. */ sessionEnvIdentity: { variables: { sessionId: 'PI_WEB_UI_SESSION_ID'; origin: 'PI_WEB_UI_SESSION_ORIGIN'; parentSessionId: 'PI_WEB_UI_PARENT_SESSION_ID'; }; /** Runtimes whose subprocesses receive the variables (Pi keeps PI_SESSION_ID in-process). */ runtimes: Array<'claude' | 'antigravity' | 'commandcode'>; }; /** Contract 1.47.0 (C2): bounded final assistant text on run receipts. */ runReceiptFinalText: { field: 'finalText'; truncatedField: 'finalTextTruncated'; maxChars: number }; /** Contract 1.47.0 (C3): server-side `deadline` watch condition. */ watchDeadlineCondition: { conditionType: 'deadline'; field: 'afterSeconds'; minSeconds: number; maxSeconds: number }; /** Contract 1.47.0 (C4): `fireIfSettled` watch registration option. */ watchFireIfSettled: { registerField: 'fireIfSettled'; eventTypes: string[] }; /** Contract 1.47.0 (Amendment 1): per-session Agent OS capture opt-in on create. */ sessionAgentOsCapture: { createField: 'agentOsCapture'; values: Array<'enabled' | 'disabled'>; env: 'PI_WEB_UI_AGENT_OS_CAPTURE'; }; }"
+          "type": "{ retentionLeases: true; durableRetention: true; residentRetention: true; executionAdmission: true; runLivenessEvidence: true; sessionRecoveryEvidence: true; supportsEventPayloadBudget: true; capacityEndpoint: '/api/v1/capacity'; /** Contract 1.34.0: child-orchestration surfacing (cards + events) is available. */ childSurfacing: true; /** Contract 1.34.0: the normalized event types the surfacing emits. */ childSurfacingEvents: readonly string[]; /** Contract 1.34.0: request header that links an Internal-API call to the calling parent session. */ childParentHeader: 'X-Parent-Session'; /** Additive opaque-generation CAS fields for watch register/delete. */ watchGenerationPreconditions: { generationField: 'generation'; registerField: 'expectedGeneration'; deleteBodyField: 'expectedGeneration'; }; piProviderPolicy: { blockedProviders: string[]; }; /** Contract 1.46.0: Claude backends allowed for Internal API agent execution (SDK only). */ claudeBackendPolicy: { allowedBackends: ['sdk-subscription']; }; /** Contract 1.47.0 (C1): session identity exported to per-session runtime subprocess environments. */ sessionEnvIdentity: { variables: { sessionId: 'PI_WEB_UI_SESSION_ID'; origin: 'PI_WEB_UI_SESSION_ORIGIN'; parentSessionId: 'PI_WEB_UI_PARENT_SESSION_ID'; }; /** Runtimes whose subprocesses receive the variables (Pi keeps PI_SESSION_ID in-process). */ runtimes: Array<'claude' | 'antigravity' | 'commandcode'>; }; /** Contract 1.47.0 (C2): bounded final assistant text on run receipts. */ runReceiptFinalText: { field: 'finalText'; truncatedField: 'finalTextTruncated'; maxChars: number }; /** Contract 1.58.0 (C3a): child completion block schema, capture fields and per-session surface. */ runCompletionBlock: { schema: typeof COMPLETION_SCHEMA_NAME; fenceInfo: typeof COMPLETION_FENCE_INFO; receiptFields: { block: 'completion'; error: 'completionError' }; sessionSurfaceField: 'latestCompletion'; maxBlockChars: number; parseWindowChars: number; }; /** Contract 1.47.0 (C3): server-side `deadline` watch condition. */ watchDeadlineCondition: { conditionType: 'deadline'; field: 'afterSeconds'; minSeconds: number; maxSeconds: number }; /** Contract 1.47.0 (C4): `fireIfSettled` watch registration option. */ watchFireIfSettled: { registerField: 'fireIfSettled'; eventTypes: string[] }; /** Contract 1.47.0 (Amendment 1): per-session Agent OS capture opt-in on create. */ sessionAgentOsCapture: { createField: 'agentOsCapture'; values: Array<'enabled' | 'disabled'>; env: 'PI_WEB_UI_AGENT_OS_CAPTURE'; }; }"
         },
         "runtimes": {
           "type": "{ pi: RuntimeCapabilities; claude: RuntimeCapabilities; opencode: RuntimeCapabilities; antigravity: RuntimeCapabilities; /** Internal-API-only runtime; older clients may ignore the additive key. */ commandcode: RuntimeCapabilities; }"
@@ -1102,6 +1102,18 @@
           "type": "boolean",
           "optional": true
         },
+        "completion": {
+          "type": "CompletionBlock",
+          "optional": true
+        },
+        "completionDelimiter": {
+          "type": "'completion' | 'json-tagged'",
+          "optional": true
+        },
+        "completionError": {
+          "type": "CompletionParseError",
+          "optional": true
+        },
         "mode": {
           "type": "'prompt' | 'follow_up' | 'steer'",
           "optional": true
@@ -1391,6 +1403,10 @@
         },
         "retention": {
           "type": "{ protected: boolean; leases: Array<{ leaseId: string; mode: 'durable' | 'resident'; expiresAt: string }>; latestExpiryAt?: string; }",
+          "optional": true
+        },
+        "latestCompletion": {
+          "type": "SessionCompletionSurface",
           "optional": true
         },
         "tokenUsage": {
@@ -2090,6 +2106,60 @@
       "kind": "type",
       "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'"
     },
+    "CompletionBlock": {
+      "kind": "interface",
+      "fields": {
+        "schema": {
+          "type": "typeof COMPLETION_SCHEMA_NAME"
+        },
+        "status": {
+          "type": "'done' | 'blocked' | 'partial'"
+        },
+        "summary": {
+          "type": "string",
+          "optional": true
+        },
+        "commands": {
+          "type": "Array<{ command: string; exitCode: number; note?: string }>",
+          "optional": true
+        },
+        "tests": {
+          "type": "Array<{ name: string; result: 'pass' | 'fail' | 'skip'; note?: string }>",
+          "optional": true
+        },
+        "commits": {
+          "type": "Array<{ sha: string; repo: string; subject?: string }>",
+          "optional": true
+        },
+        "filesChanged": {
+          "type": "string[]",
+          "optional": true
+        },
+        "openIssues": {
+          "type": "string[]",
+          "optional": true
+        },
+        "blockedReason": {
+          "type": "string",
+          "optional": true
+        }
+      }
+    },
+    "CompletionParseError": {
+      "kind": "interface",
+      "fields": {
+        "code": {
+          "type": "'NO_BLOCK' | 'UNCLOSED_FENCE' | 'OVERSIZED_BLOCK' | 'MALFORMED_JSON' | 'SCHEMA_VIOLATION'"
+        },
+        "message": {
+          "type": "string"
+        },
+        "fieldPath": {
+          "type": "string",
+          "optional": true
+        }
+      }
+    },
     "RunCessationState": {
       "kind": "type",
       "type": "'confirmed' | 'unconfirmed' | 'unknown'"
@@ -2117,6 +2187,33 @@
         },
         "evidence": {
           "type": "Phase7PiShadowEvidence"
+        }
+      }
+    },
+    "SessionCompletionSurface": {
+      "kind": "interface",
+      "fields": {
+        "source": {
+          "type": "| { runId: string } | { kind: 'session_turn'; agentEndAt: string }"
+        },
+        "capturedAt": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'",
+          "optional": true
+        },
+        "completion": {
+          "type": "CompletionBlock",
+          "optional": true
+        },
+        "delimiter": {
+          "type": "'completion' | 'json-tagged'",
+          "optional": true
+        },
+        "completionError": {
+          "type": "CompletionParseError",
+          "optional": true
         }
       }
     },

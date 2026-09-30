@@ -29,13 +29,15 @@ export const EXIT_CODES: readonly ExitCodeEntry[] = [
   { code: 10, name: 'ADMISSION_REFUSED', meaning: '429/503 with Retry-After persisted past the retry budget (slots, heap/lag pressure, draining) — wait the stated time, retry' },
   { code: 11, name: 'PREFLIGHT_FAILED', meaning: 'C4 preflight refused before any model token was spent; fix the listed paths/tools' },
   { code: 12, name: 'REFUSED_BUSY', meaning: '409 refusal (SESSION_BUSY / SESSION_NOT_STREAMING / SESSION_OWNED_BY_OTHER_RUNTIME / SESSION_FENCED) — resolve ownership or use follow_up/steer' },
-  { code: 13, name: 'VERIFY_STUB', meaning: 'verify is a stub interface (filled by plan step C3); nothing was verified' },
+  { code: 13, name: 'VERIFY_STUB', meaning: 'RETIRED in C3b: verify is now implemented (verdicts map to 0/20/21); this code is no longer emitted' },
   { code: 14, name: 'PROMPT_NOT_EXECUTED', meaning: 'Pi accepted the prompt but no turn ever started (extension input-hook swallow)' },
   { code: 15, name: 'TURN_STALLED', meaning: 'The turn stalled past the watchdog window; check the session before re-prompting' },
   { code: 16, name: 'WAIT_TARGET_NOT_FOUND', meaning: 'wait fast-fail: the --run-id is unknown/malformed (no such receipt) or the sessionId is not in the registry — nothing to wait on (correction 01)' },
   { code: 17, name: 'GOAL_CLEARED', meaning: 'The goal ended `cleared` (correction 04: goal_end is classified from the goal projection, not assumed success) — not achieved; go look' },
   { code: 18, name: 'CREATE_UNKNOWN', meaning: 'A create (POST /sessions) lost its connection or response; the server may or may not have created the session — reconcile with status --parent (the client never blindly re-spawns)' },
   { code: 19, name: 'WATCH_CONFLICT', meaning: 'An incompatible watch owned by someone else is active on the child; the client never replaces foreign watches — use a different label or remove the watch' },
+  { code: 20, name: 'VERIFY_CONTRADICTED', meaning: 'verify found at least one claim contradicted by the filesystem (missing sha, wrong repo, file with no evidence, failed parent-named rerun) — the block lies somewhere' },
+  { code: 21, name: 'VERIFY_UNVERIFIABLE', meaning: 'verify could not establish the claims: no completion captured, a typed parse error, an unsafe/absolute path, or nothing independently checkable' },
 ];
 
 export const OUTCOME_EXIT_CODES: Record<string, number> = {
@@ -79,6 +81,13 @@ export const ERROR_CODE_EXIT_CODES: Record<string, number> = {
 export function nameFor(code: number): string | undefined {
   return EXIT_CODES.find((entry) => entry.code === code)?.name;
 }
+
+/** C3b: verify verdicts map to their own exit codes (documented table). */
+export const VERIFY_EXIT_CODES: Record<'verified' | 'contradicted' | 'unverifiable', number> = {
+  verified: 0,
+  contradicted: 20,
+  unverifiable: 21,
+};
 
 export function exitCodeFor(outcome: { kind: string }): number {
   return OUTCOME_EXIT_CODES[outcome.kind] ?? 1;

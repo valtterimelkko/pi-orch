@@ -53,7 +53,10 @@ test('prompt with followUpOnBusy retries once in follow_up mode after 409 SESSIO
   assert.equal(result.dispatchMode, 'follow_up');
   assert.equal(calls.length, 2);
   assert.equal(calls[1]?.body.mode, 'follow_up');
-  assert.equal(calls[1]?.body.message, 'go');
+  assert.ok(
+    typeof calls[1]?.body.message === 'string' && String(calls[1]?.body.message).startsWith('go\n\nEND-OF-TASK REPORT'),
+    'C3b: the retried follow_up carries the same (templated) message',
+  );
 });
 
 test('without followUpOnBusy the 409 propagates to the caller', async () => {

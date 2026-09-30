@@ -21,6 +21,8 @@ import {
   type PromptInput,
 } from './builders.ts';
 import { parseReceipt, ApiError, type Receipt, type WatchConditionSpec } from './parsers.ts';
+import { resolveCompletion, type CompletionBlock, type CompletionParseError, type CompletionDelimiter, type CompletionCaptureSource, type ReceiptWithCompletion, type SessionDetailWithCompletion } from './completion.ts';
+import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, type CompletionLoad } from './verify.ts';
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
 
 export interface ClientConfig {
@@ -312,15 +314,35 @@ export class PiOrchClient {
     finalTextTruncated?: boolean;
     servedModel?: string;
     outputDisposition?: string;
-    evidence: { receipt: string; transcript: string; sessionPath?: string };
+    completion?: CompletionBlock;
+    completionError?: CompletionParseError;
+    completionDelimiter?: CompletionDelimiter;
+    completionSource?: 'receipt' | 'session_surface';
+    completionCapturedAt?: string;
+    completionCapturedBy?: CompletionCaptureSource;
+    evidence: { receipt: string; transcript: string; sessionPath?: string; completion?: string };
     transcript?: Array<{ kind: string; text: string }>;
   }> {
     const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(runId)}`, { headers: this.headers() });
-    const receipt = parseReceipt(response.body);
+    const receipt = parseReceipt(response.body) as Receipt & ReceiptWithCompletion;
     const sessionId = receipt.sessionId;
-    const evidence: { receipt: string; transcript: string; sessionPath?: string } = {
+    // C3b item 2: resolve the completion block — receipt first, the session's
+    // latestCompletion for the receipt-less goal-turn class. One extra session
+    // read ONLY when the receipt captured nothing at all.
+    let sessionDetail: SessionDetailWithCompletion | undefined;
+    if (!receipt.completion && !receipt.completionError) {
+      try {
+        const detailResponse = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() });
+        sessionDetail = detailResponse.body as SessionDetailWithCompletion;
+      } catch {
+        sessionDetail = undefined; // best effort: the receipt result stands alone
+      }
+    }
+    const resolved = resolveCompletion(receipt, sessionDetail);
+    const evidence: { receipt: string; transcript: string; sessionPath?: string; completion?: string } = {
       receipt: `/api/v1/runs/${encodeURIComponent(runId)}`,
       transcript: `/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript?scope=visible_full`,
+      ...(resolved?.source === 'session_surface' ? { completion: `/api/v1/sessions/${encodeURIComponent(sessionId)}` } : resolved ? { completion: `/api/v1/runs/${encodeURIComponent(runId)}` } : {}),
     };
     let transcript: Array<{ kind: string; text: string }> | undefined;
     if (options.includeTranscript) {
@@ -340,14 +362,42 @@ export class PiOrchClient {
       finalTextTruncated: receipt.finalTextTruncated,
       servedModel: receipt.servedModel,
       outputDisposition: receipt.outputEvidence?.disposition,
+      ...(resolved?.completion !== undefined ? { completion: resolved.completion } : {}),
+      ...(resolved?.error !== undefined ? { completionError: resolved.error } : {}),
+      ...(resolved?.delimiter !== undefined ? { completionDelimiter: resolved.delimiter } : {}),
+      ...(resolved !== undefined ? { completionSource: resolved.source } : {}),
+      ...(resolved?.capturedAt !== undefined ? { completionCapturedAt: resolved.capturedAt } : {}),
+      ...(resolved?.capturedBy !== undefined ? { completionCapturedBy: resolved.capturedBy } : {}),
       evidence,
       ...(transcript !== undefined ? { transcript } : {}),
     };
   }
 
-  /** Stub interface — plan step C3 fills it (completion-block verification). */
-  async verify(_input: { sessionId: string; runId?: string }): Promise<{ implemented: false; plannedBy: 'C3' }> {
-    return { implemented: false, plannedBy: 'C3' };
+  /**
+   * C3b item 3: re-check a child's completion claims against the filesystem.
+   * Read-only (allow-listed git, no shell, no writes); the only command ever
+   * executed is the parent-named `--rerun`. With --run-id the named receipt is
+   * authoritative (session-surface fallback, same rule as result()); without
+   * it the session's newest capture (latestCompletion) is checked.
+   */
+  async verify(input: VerifyInput): Promise<VerifyResult> {
+    const deps = makeNodeVerifyDeps();
+    const loadCompletion = async (verifyInput: VerifyInput): Promise<CompletionLoad> => {
+      if (verifyInput.runId) {
+        const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(verifyInput.runId)}`, { headers: this.headers() });
+        const receipt = parseReceipt(response.body) as ReceiptWithCompletion;
+        if (receipt.completion || receipt.completionError) {
+          const resolved = resolveCompletion(receipt, undefined);
+          return resolved ? { ...(resolved.completion !== undefined ? { block: resolved.completion } : {}), ...(resolved.error !== undefined ? { error: resolved.error } : {}), source: resolved.source } : {};
+        }
+      }
+      const detailResponse = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(input.sessionId)}`, { headers: this.headers() });
+      const resolvedSurface = resolveCompletion({ runId: verifyInput.runId ?? '', sessionId: input.sessionId } as ReceiptWithCompletion, detailResponse.body as SessionDetailWithCompletion);
+      return resolvedSurface
+        ? { ...(resolvedSurface.completion !== undefined ? { block: resolvedSurface.completion } : {}), ...(resolvedSurface.error !== undefined ? { error: resolvedSurface.error } : {}), source: resolvedSurface.source }
+        : {};
+    };
+    return verifyChild(input, deps, loadCompletion);
   }
 
   async cleanup(sessionId: string, options: { leaseId?: string; ownerId?: string; watchId?: string } = {}): Promise<{

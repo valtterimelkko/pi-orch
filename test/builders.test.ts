@@ -121,12 +121,15 @@ test('prompt body: idempotency key bounds (1..128) and required message', () => 
   assert.throws(() => buildPromptBody({ message: '' }), /message/);
 });
 
-test('prompt body: defaults are detached-dispatch shaped', () => {
+test('prompt body: defaults are detached-dispatch shaped (C3b: message ends with the completion template)', () => {
   const body = buildPromptBody({ message: 'hello child' });
-  assert.equal(body.message, 'hello child');
   assert.equal(body.verbosity, 'answers');
   assert.equal(body.mode, 'prompt');
   assert.ok(typeof body.idempotencyKey === 'string' && body.idempotencyKey.length >= 1);
+  assert.ok(
+    typeof body.message === 'string' && body.message.startsWith('hello child\n\nEND-OF-TASK REPORT'),
+    'C3b: the dispatched message carries the completion template by default',
+  );
 });
 
 test('watch body: conditions non-empty; goal set uses goal_end + paused with the exact objective', () => {

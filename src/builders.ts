@@ -6,6 +6,7 @@
  */
 
 import type { WatchConditionSpec } from './parsers.ts';
+import { applyCompletionTemplate } from './completion-template.ts';
 
 const RUNTIMES = ['pi', 'claude', 'opencode', 'antigravity', 'commandcode'] as const;
 export type Runtime = (typeof RUNTIMES)[number];
@@ -26,6 +27,8 @@ export interface CreateInput {
   preflight?: { paths?: string[]; tools?: string[] };
   parentSessionId?: string;
   agentOsCapture?: 'enabled' | 'disabled';
+  /** Default true: the goal objective carries the C3b completion-report template. */
+  completionTemplate?: boolean;
 }
 
 export function buildCreateBody(input: CreateInput): Record<string, unknown> {
@@ -59,7 +62,19 @@ export function buildCreateBody(input: CreateInput): Record<string, unknown> {
     if (input.goal.maxTurns !== undefined && (!Number.isInteger(input.goal.maxTurns) || input.goal.maxTurns < 1 || input.goal.maxTurns > 100)) {
       throw new Error('pi-orch: goal.maxTurns must be an integer in 1..100');
     }
-    body.goal = { ...input.goal };
+    // C3b: goal children are the receipt-less class — the completion template
+    // rides on the objective by default so the block is captured on the
+    // session surface. The server caps the objective at 4000 chars AFTER our
+    // injection, so validate the final string and point at the opt-out.
+    const templated = input.completionTemplate === false
+      ? input.goal.objective
+      : applyCompletionTemplate(input.goal.objective);
+    if (templated.length > 4000) {
+      throw new Error(
+        `pi-orch: goal.objective with the completion template is ${templated.length} chars (server limit 4000); shorten the objective or pass completionTemplate: false / --no-completion-template`,
+      );
+    }
+    body.goal = { ...input.goal, objective: templated };
   }
   if (input.preflight) {
     body.preflight = buildPreflightSpec(input.preflight);
@@ -95,10 +110,19 @@ export interface PromptInput {
   preflight?: { paths?: string[]; tools?: string[] };
   /** Default true: disconnected clients must not cancel the run. */
   detach?: boolean;
+  /** Default true: the message carries the C3b completion-report template. */
+  completionTemplate?: boolean;
 }
 
 export function buildPromptBody(input: PromptInput, randomId: () => string = defaultRandomId): Record<string, unknown> {
   if (!input.message) throw new Error('pi-orch: message is required');
+  // C3b: the completion template rides by default on every dispatched prompt
+  // (the brief's default-for-prompt rule); opt out per call when the message
+  // is not a task (steer/follow_up chatter) with completionTemplate: false.
+  const message = input.completionTemplate === false ? input.message : applyCompletionTemplate(input.message);
+  if (message.length > 100_000) {
+    throw new Error(`pi-orch: message with the completion template is ${message.length} chars (server limit 100000); shorten it or pass completionTemplate: false / --no-completion-template`);
+  }
   const detach = input.detach ?? true;
   const verbosity = input.verbosity ?? 'answers';
   if (detach && verbosity !== 'answers') {
@@ -112,7 +136,7 @@ export function buildPromptBody(input: PromptInput, randomId: () => string = def
   if (!['prompt', 'follow_up', 'steer'].includes(mode)) {
     throw new Error('pi-orch: mode must be prompt, follow_up or steer');
   }
-  const body: Record<string, unknown> = { message: input.message, verbosity, mode, idempotencyKey };
+  const body: Record<string, unknown> = { message, verbosity, mode, idempotencyKey };
   if (detach) body.detach = true;
   if (input.requireActiveTurn !== undefined) body.requireActiveTurn = input.requireActiveTurn;
   if (input.preflight) body.preflight = buildPreflightSpec(input.preflight);

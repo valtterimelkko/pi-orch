@@ -34,16 +34,39 @@ test('usage: unknown verb exits 2', async () => {
   assert.ok((result.stderr ?? '').includes('unknown verb'));
 });
 
-test('help exits 0', async () => {
+test('help prints usage on stdout with exit 0 (C1 carried-over item: it printed nothing)', async () => {
   const result = await runCli(['help'], fakeDeps());
   assert.equal(result.exitCode, 0);
+  assert.ok((result.stdout ?? '').includes('usage: pi-orch'), 'usage on STDOUT');
+  assert.equal(result.stderr, undefined);
 });
 
-test('verify is a documented stub exiting 13', async () => {
-  const result = await runCli(['verify', 'sess-1'], fakeDeps());
-  assert.equal(result.exitCode, 13);
-  assert.ok((result.stdout ?? '').includes('"implemented": false'));
-  assert.ok((result.stderr ?? '').includes('stub'));
+test('--help prints usage on stdout with exit 0', async () => {
+  const result = await runCli(['--help'], fakeDeps());
+  assert.equal(result.exitCode, 0);
+  assert.ok((result.stdout ?? '').includes('usage: pi-orch'));
+});
+
+test('-h prints usage on stdout with exit 0 (previously rejected as an unknown verb)', async () => {
+  const result = await runCli(['-h'], fakeDeps());
+  assert.equal(result.exitCode, 0);
+  assert.ok((result.stdout ?? '').includes('usage: pi-orch'));
+});
+
+test('verify surfaces the child verdict and exit codes (C3b: stub removed)', async () => {
+  const result = await runCli(
+    ['verify', 'sess-1', '--json'],
+    fakeDeps({
+      client: () => ({
+        async verify() {
+          return { sessionId: 'sess-1', verdict: 'contradicted', claims: [], summary: 'contradicted: 1 claim(s) contradicted' };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(result.exitCode, 20);
+  const parsed = JSON.parse(result.stdout ?? '{}') as { verdict?: string };
+  assert.equal(parsed.verdict, 'contradicted');
 });
 
 test('spawn prints the session id and lease as json', async () => {
