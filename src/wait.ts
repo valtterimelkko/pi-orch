@@ -329,7 +329,15 @@ async function outcomeFromFirings(
       if (firing.eventType === 'deadline') return { kind: 'deadline', note: 'server-side deadline condition fired; child still not terminal' };
       // agent_end without a readable receipt (e.g. no runId and no evidence
       // access): the turn ended — surface it honestly rather than waiting on.
+      // C3b live-found race: NOT while a goal the one-shot probe missed is
+      // active — the guard settles it instead (the exact early-false-completed
+      // the carried-over acceptance item exists to kill).
       if (!options.runId) {
+        if (!options.objective) {
+          const guard = await runlessGoalGuard(options.sessionId, deps);
+          if (guard === 'keep-waiting') continue;
+          if (guard) return withAutoGoalNote(guard);
+        }
         return { kind: 'completed', note: 'agent_end observed; no runId provided for receipt read-back' };
       }
     }
@@ -655,6 +663,11 @@ async function firingOutcome(
     if (outcome) return outcome;
     if (firing.eventType === 'deadline') return { kind: 'deadline', note: 'server-side deadline condition fired; child still not terminal' };
     if (!child.runId) {
+      if (!objective) {
+        const guard = await runlessGoalGuard(child.sessionId, deps);
+        if (guard === 'keep-waiting') return null; // keep the child unsettled; the goal settles it
+        if (guard) return withAutoGoalNote(guard);
+      }
       return { kind: 'completed', note: 'agent_end observed; no runId provided for receipt read-back' };
     }
   }

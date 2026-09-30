@@ -209,3 +209,26 @@ test('a genuinely goal-less child is unaffected by the guard (terminal run compl
   assert.equal(outcome.kind, 'completed');
   assert.equal(outcome.note, undefined);
 });
+
+test('agent_end firing on a run-less wait does NOT declare completed while a goal the probe missed is active', async () => {
+  const { deps, state } = makeDeps();
+  // Probe: idle (plain path, agent_end conditions registered).
+  // Guard at the agent_end shortcut: running (keep waiting).
+  // Guard at the next slice reconcile: achieved (settle).
+  state.goalScripts.set('child', [
+    { supported: true, status: 'idle' },
+    running('Slow goal'),
+    running('Slow goal'),
+    achieved('Slow goal'),
+  ]);
+  state.evidenceBySession.set('child', { runs: [{ runId: 'r-tpl', status: 'completed' }] });
+  state.pendingFiring = {
+    fired: true,
+    waitedMs: 5,
+    nextCursor: 'c2',
+    watches: [{ watchId: 'watch-child', sessionId: 'child', firings: [{ conditionId: 'done-1', firedAt: 1, eventType: 'agent_end' }], firingCount: 1 }],
+  };
+  const outcome = await waitOnChild({ sessionId: 'child', deadlineMs: 60_000, sliceMs: 5_000, deps });
+  assert.equal(outcome.kind, 'goal_achieved', `got ${outcome.kind}`);
+  assert.ok(outcome.note?.includes('auto-detected'));
+});
