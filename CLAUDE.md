@@ -94,7 +94,8 @@ surfaces `SNAPSHOT_STALE` on stderr and in `--json`; it never blocks a command.
 - A new refusal class gets a **distinct** code and a matching row in the help
   text (`src/cli.ts`). The latest additions: `20/21` (verify verdicts), `22`
   (template not delivered), `23` (`CREDENTIAL_IN_REPO`), `24`
-  (`REMOTE_API_BASE_REFUSED`).
+  (`REMOTE_API_BASE_REFUSED`), `25` (`ROUTE_LIMIT`, the per-route child
+  concurrency cap; `--wait-for-slot` reuses `3 DEADLINE` on timeout).
 - Error mapping lives in `mapError` (`src/cli.ts`); server error codes map via
   `ERROR_CODE_EXIT_CODES`.
 

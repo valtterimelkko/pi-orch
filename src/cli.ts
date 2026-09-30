@@ -16,6 +16,7 @@ import {
 import type { WatchConditionSpec } from './parsers.ts';
 import { ApiError } from './parsers.ts';
 import { ERROR_CODE_EXIT_CODES, exitCodeFor, VERIFY_EXIT_CODES } from './exit-codes.ts';
+import { resolveRouteLimits } from './route-limits.ts';
 import { defaultSocketPath, defaultTokenPath, loadSnapshot, liveContractVersion } from './snapshot.ts';
 import { readToken } from './transport.ts';
 
@@ -56,7 +57,7 @@ interface ParsedArgs {
   repeatable: Map<string, string[]>;
 }
 
-const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool']);
+const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool', 'route-limit']);
 /** Flags that never consume the following token (so `--all c1@r1` keeps the id positional). */
 const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template']);
 
@@ -124,6 +125,34 @@ function preflightFrom(args: ParsedArgs): ReturnType<typeof buildPreflightSpec> 
   return buildPreflightSpec({ paths, tools });
 }
 
+/** G1: parse repeatable --route-limit 'selector=N|unlimited' values into an override map. */
+export function routeLimitOverrides(values: string[]): Record<string, number> {
+  const overrides: Record<string, number> = {};
+  for (const raw of values) {
+    const eq = raw.indexOf('=');
+    if (eq <= 0 || eq === raw.length - 1) {
+      throw new UsageError(`--route-limit expects '<model-selector>=<limit>' (for example 'zai/glm-5.3-flash=2'), got '${raw}'`);
+    }
+    const route = raw.slice(0, eq).trim();
+    const value = raw.slice(eq + 1).trim();
+    if (value === 'unlimited') {
+      overrides[route] = 0;
+      continue;
+    }
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new UsageError(`--route-limit expects an integer >= 0 (0 = unlimited) or 'unlimited' for '${route}', got '${value}'`);
+    }
+    overrides[route] = parsed;
+  }
+  return overrides;
+}
+
+/** G1: the effective limit map the CLI passes to the client — flags win over the env, env over the defaults. */
+export function mergeRouteLimits(env: Record<string, string | undefined>, overrides: Record<string, number>): Record<string, number> {
+  return resolveRouteLimits({ env, overrides });
+}
+
 class UsageError extends Error {}
 
 // ─── verbs ───────────────────────────────────────────────────────────────────
@@ -159,7 +188,11 @@ Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
   --owner ID [--ttl S] [--label L] (durable retention with your ownerId),
   --goal-objective OBJ [--goal-max-turns N] [--goal-verify CMD],
   --preflight-path P (repeatable), --preflight-tool T (repeatable),
-  --agent-os-capture enabled|disabled
+  --agent-os-capture enabled|disabled,
+  --route-limit 'SEL=N' (repeatable; per-call per-route concurrency cap;
+    N=0 or 'unlimited' lifts the cap; wins over PI_ORCH_ROUTE_LIMITS),
+  --wait-for-slot S (instead of refusing over the limit, watch the live
+    children on that route and spawn when one settles; exit 3 on timeout)
 
 Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
   --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool,
@@ -180,7 +213,8 @@ Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interr
   executed · 15 turn stalled · 16 wait target not found · 17 goal cleared
   18 create unknown · 19 watch conflict · 20 verify contradicted
   21 verify unverifiable · 22 template not delivered · 23 credential in repo
-  · 24 remote api base refused. Full table: README.md
+  · 24 remote api base refused · 25 route limit (G1: spawn refused before any
+  child was created; --wait-for-slot waits instead). Full table: README.md
 `;
 
 export async function runCli(argv: string[], deps: CliDeps): Promise<CliResult> {
@@ -296,6 +330,8 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const owner = flagString(args, 'owner');
       const goalObjective = flagString(args, 'goal-objective');
       const preflight = preflightFrom(args);
+      // G1: validate the flag (cheap usage error) BEFORE the client factory runs.
+      const waitForSlotMs = args.flags.has('wait-for-slot') ? waitForSlotSeconds(args) : undefined;
       const body = await getClient().spawn({
         runtime,
         cwd,
@@ -309,6 +345,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         preflight,
         agentOsCapture: flagString(args, 'agent-os-capture'),
         completionTemplate: args.flags.has('no-completion-template') ? false : undefined,
+        ...(waitForSlotMs !== undefined ? { waitForSlotMs } : {}),
       });
       const rendered = output(json, body, (value) => {
         const spawned = value as { sessionId: string; leaseId?: string; parentId?: string; resolvedModel?: string };
@@ -468,6 +505,12 @@ function renderVerifyHuman(body: { verdict: string; claims: Array<{ kind: string
   return [`verify: ${body.verdict}`, ...lines, body.summary].join('\n');
 }
 
+function waitForSlotSeconds(args: ParsedArgs): number {
+  const seconds = flagNumber(args, 'wait-for-slot');
+  if (seconds === undefined || seconds <= 0) throw new UsageError('--wait-for-slot must be a positive number of seconds');
+  return seconds * 1000;
+}
+
 function parseConditionList(raw: string, objective: string | undefined): WatchConditionSpec[] {
   return raw.split(',').map((token) => {
     const trimmed = token.trim();
@@ -525,11 +568,13 @@ export function makeClientFactory(argv: string[]): (config: { parentSessionId?: 
   const socket = flagString(args, 'socket') ?? process.env.PI_WEB_UI_SOCKET ?? defaultSocketPath(process.env);
   const tokenPath = flagString(args, 'token-path') ?? process.env.PI_WEB_UI_TOKEN_PATH ?? defaultTokenPath(process.env);
   const apiBase = flagString(args, 'api-base') ?? process.env.PI_WEB_UI_API_BASE;
+  const routeLimits = mergeRouteLimits(process.env, routeLimitOverrides(args.repeatable.get('route-limit') ?? []));
   return ({ parentSessionId }) => {
     const token = readToken(tokenPath);
     return new PiOrchClient({
       transport: { socketPath: apiBase ? undefined : socket, apiBase, token },
       parentSessionId,
+      routeLimits,
     }) as unknown as ClientLike;
   };
 }
