@@ -151,3 +151,36 @@ test('help documents --route-limit, --wait-for-slot and exit code 25', async () 
   assert.match(help, /PI_ORCH_ROUTE_LIMITS/);
   assert.match(help, /25 route limit/);
 });
+
+test('correction01/7: --route-limit bad is a usage error through runCli (exit 2), never an uncaught stack', async () => {
+  let clientUsed = false;
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w', '--model-selector', 'zai/glm-5.3-flash', '--route-limit', 'bad'],
+    fakeDeps({
+      client: () => {
+        clientUsed = true;
+        throw new Error('client must not be reached');
+      },
+    }),
+  );
+  assert.equal(result.exitCode, 2);
+  assert.match(result.stderr ?? '', /--route-limit/);
+  assert.equal(clientUsed, false, 'the client factory is never reached with junk flags');
+});
+
+test('prompt accepts --owner for route counting (correction01/4 CLI surface)', async () => {
+  let seen: Record<string, unknown> | undefined;
+  const result = await runCli(
+    ['prompt', 'sess-9', '--message', 'go', '--owner', 'o1', '--json'],
+    fakeDeps({
+      client: () => ({
+        async prompt(_sessionId: string, input: Record<string, unknown>) {
+          seen = input;
+          return { runId: 'run-77', sessionId: 'sess-9', detached: true, duplicate: false };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(seen?.routeOwner, 'o1');
+});

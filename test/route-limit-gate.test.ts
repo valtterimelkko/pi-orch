@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { PiOrchClient } from '../src/client.ts';
 import { ApiError } from '../src/parsers.ts';
-import { RouteLimitError, RouteLimitWaitDeadlineError } from '../src/route-limits.ts';
+import { RouteLimitError, RouteLimitWaitDeadlineError, RouteLimitsConfigError } from '../src/route-limits.ts';
 import type { TransportResponse } from '../src/transport.ts';
 
 /**
@@ -263,6 +263,22 @@ test('a per-call routeLimit of 0 lifts the cap for this call', async () => {
   assert.equal(created(calls), 1);
 });
 
+test('correction01/6: a negative, fractional or NaN per-call routeLimit is a usage-class error', async () => {
+  const { transport, calls } = fakeTransport({ children: [{ sessionId: 'c1', model: ZAI, busy: true }] });
+  const client = gateClient(transport, { parentSessionId: 'parent-1', routeLimits: { [ZAI]: 5 } });
+  for (const bad of [-1, 1.5, Number.NaN]) {
+    await assert.rejects(
+      client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, routeLimit: bad }),
+      (error: unknown) => {
+        assert.ok(error instanceof RouteLimitsConfigError, `routeLimit ${bad} must be rejected`);
+        assert.match((error as Error).message, /route-limit|limit/);
+        return true;
+      },
+    );
+  }
+  assert.equal(created(calls), 0, 'nothing was created');
+});
+
 test('children without a model on record are not counted against a route', async () => {
   const { transport, calls } = fakeTransport({
     children: [{ sessionId: 'c1', busy: true }],
@@ -516,4 +532,224 @@ test('prompt on an unlimited route never gates', async () => {
   const client = gateClient(transport, { parentSessionId: 'parent-1', routeLimits: { [ZAI]: 1 } });
   await client.prompt('target', { message: 'go' });
   assert.equal(dispatched(calls), 1);
+});
+
+// ── correction 01 ────────────────────────────────────────────────────────────
+
+function waitForLockFile(dir: string, timeoutMs = 2000): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const tick = (): void => {
+      try {
+        const entries = readdirSync(dir).filter((name) => name.endsWith('.lock'));
+        if (entries.length > 0) return resolve(join(dir, entries[0] as string));
+      } catch { /* dir not created yet */ }
+      if (Date.now() > deadline) return resolve(null);
+      setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
+
+test('correction01/1: a concurrent pair at cap 1 creates exactly one (count→create serialised per caller+route)', async () => {
+  const lockDir = mkdtempSync(join(tmpdir(), 'piorch-lock-'));
+  const calls: Array<RecordedCall> = [];
+  const created: string[] = [];
+  let releaseA: (() => void) | undefined;
+  const gateA = new Promise<void>((resolve) => { releaseA = resolve; });
+  const children: FakeChild[] = [];
+  const base = fakeTransport({ children });
+  const transport = {
+    request: async (method: string, path: string, options_: { body?: Record<string, unknown> } = {}): Promise<TransportResponse> => {
+      calls.push({ method, path });
+      if (method === 'POST' && path === '/api/v1/sessions') {
+        const sessionId = `c-${created.length + 1}`;
+        await gateA; // A's create POST holds the route lock while we hold the test
+        created.push(sessionId);
+        children.push({ sessionId, model: ZAI, busy: true });
+        return ok({ sessionId });
+      }
+      return (base.transport as { request: (m: string, p: string, o?: { body?: Record<string, unknown> }) => Promise<TransportResponse> }).request(method, path, options_);
+    },
+  } as never;
+  const config = { parentSessionId: 'parent-race', routeLimits: { [ZAI]: 1 }, spawnLockDir: lockDir };
+  const clientA = gateClient(transport, config);
+  const clientB = gateClient(transport, config);
+
+  const spawnA = clientA.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI });
+  const lockFile = await waitForLockFile(lockDir);
+  assert.ok(lockFile, 'A holds an exclusive route lock across count→create');
+
+  // While A holds the lock, B cannot even COUNT — it must wait, not race.
+  const spawnB = clientB.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI });
+  await assert.rejects(spawnB, (error: unknown) => {
+      assert.match((error as Error).message, /route lock|lock/i);
+      assert.equal((error as { code?: string }).code, 'ROUTE_LOCK_TIMEOUT');
+      return true;
+    });
+  assert.equal(created.length, 0, 'B created nothing while A held the lock');
+
+  releaseA?.();
+  const resultA = await spawnA;
+  assert.ok(resultA.sessionId.startsWith('c-'));
+  assert.equal(created.length, 1, 'exactly one create so far');
+
+  // Now B acquires the freed lock, counts A's busy child, and is refused.
+  await assert.rejects(
+    clientB.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI }),
+    (error: unknown) => error instanceof RouteLimitError,
+  );
+  assert.equal(created.length, 1, 'the pair created exactly one child');
+});
+
+test('correction01/2: an unreadable goal/evidence read counts the child as live (fail closed, reason unknown)', async () => {
+  const inner = fakeTransport({ children: [{ sessionId: 'c1', model: ZAI, busy: false }] });
+  const transport = {
+    request: async (method: string, path: string, options_: { body?: Record<string, unknown> } = {}): Promise<TransportResponse> => {
+      if (path.endsWith('/goal') || path.endsWith('/evidence')) {
+        throw new ApiError(503, 'SERVER_BUSY', 'goal/evidence read failing');
+      }
+      return (inner.transport as { request: (m: string, p: string, o?: { body?: Record<string, unknown> }) => Promise<TransportResponse> }).request(method, path, options_);
+    },
+  } as never;
+  const client = gateClient(transport, { parentSessionId: 'parent-1', routeLimits: { [ZAI]: 1 } });
+  await assert.rejects(
+    client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI }),
+    (error: unknown) => {
+      assert.ok(error instanceof RouteLimitError);
+      assert.deepEqual(error.live, [{ sessionId: 'c1', reason: 'unknown' }]);
+      assert.match(error.message, /unknown/);
+      return true;
+    },
+  );
+});
+
+test('correction01/3a: wait-for-slot re-counts when a live child has vanished (session_not_found), instead of refusing', async () => {
+  let listReads = 0;
+  const inner = fakeTransport({ children: [{ sessionId: 'c1', model: ZAI, busy: true }] });
+  const transport = {
+    request: async (method: string, path: string, options_: { body?: Record<string, unknown> } = {}): Promise<TransportResponse> => {
+      if (method === 'GET' && path.startsWith('/api/v1/sessions?')) {
+        listReads += 1;
+        // The registry list is eventually consistent: it keeps reporting the
+        // vanished child for the first two counts, then drops it.
+        return ok(listReads <= 2 ? { sessions: [{ sessionId: 'c1', model: ZAI, busy: true }] } : { sessions: [] });
+      }
+      if (method === 'GET' && path === '/api/v1/sessions/c1') {
+        // vanished from the registry: every detail read 404s → session_not_found from the wait
+        throw new ApiError(404, 'SESSION_NOT_FOUND', 'no session c1 in the registry');
+      }
+      return (inner.transport as { request: (m: string, p: string, o?: { body?: Record<string, unknown> }) => Promise<TransportResponse> }).request(method, path, options_);
+    },
+  } as never;
+  const client = gateClient(transport, { parentSessionId: 'parent-1', routeLimits: { [ZAI]: 1 } });
+  const result = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, waitForSlotMs: 30_000 });
+  assert.ok(result.sessionId.startsWith('new-'));
+  assert.ok(listReads >= 3, 'the wait re-counted instead of refusing');
+});
+
+test('correction01/3b: wait-for-slot waits on the watchable children when others hold foreign watches', async () => {
+  let live = true;
+  const watched: FakeChild = { sessionId: 'c1', model: ZAI, busy: true }; // foreign watch below
+  const settleable: FakeChild = { sessionId: 'c2', model: ZAI };
+  let longPolls = 0;
+  const { transport, calls } = fakeTransport({
+    children: [watched, settleable],
+    longPoll: async () => {
+      longPolls += 1;
+      live = false;
+      return { fired: true };
+    },
+  });
+  Object.defineProperties(settleable, {
+    busy: { get: () => live },
+    lastRunStatus: { get: () => (live ? 'started' : 'completed') },
+  });
+  const raw = transport as { request: (m: string, p: string, o?: { body?: Record<string, unknown> }) => Promise<TransportResponse> };
+  const inner = raw.request.bind(raw);
+  const watchRegistrations: string[] = [];
+  (raw as { request: unknown }).request = async (method: string, path: string, options?: { body?: Record<string, unknown> }) => {
+    if (method === 'GET' && path === '/api/v1/sessions/c1/watch') {
+      // c1 carries a foreign active watch (different conditions, no label)
+      return ok({ watchId: 'w-foreign', status: 'active', conditions: [{ id: 'x', type: 'text', contains: 'foreign' }] } as never);
+    }
+    if (method === 'POST' && path.endsWith('/watch')) watchRegistrations.push(path);
+    return inner(method, path, options);
+  };
+  const client = gateClient(transport, { parentSessionId: 'parent-1', routeLimits: { [ZAI]: 2 } });
+  const result = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, waitForSlotMs: 60_000 });
+  assert.ok(result.sessionId.startsWith('new-'));
+  assert.equal(watchRegistrations.some((p) => p.includes('/c1/')), false, 'the foreign-watched child was not registered');
+  assert.equal(watchRegistrations.some((p) => p.includes('/c2/')), true, 'the watchable child was waited on');
+  void calls;
+});
+
+test('correction01/4: the bare-CLI prompt gate counts the target owner from the ledger (and honours an explicit routeOwner)', async () => {
+  const ledger = tmpLedger();
+  writeFileSync(ledger, `${JSON.stringify([
+    { sessionId: 'busy1', route: ZAI, ownerId: 'o1', at: '2026-09-30T00:00:00Z' },
+    { sessionId: 'target', route: ZAI, ownerId: 'o1', at: '2026-09-30T00:00:00Z' },
+  ], null, 1)}\n`);
+  const { transport, calls } = fakeTransport({
+    all: [
+      { sessionId: 'busy1', model: ZAI, busy: true },
+      { sessionId: 'target', model: ZAI, busy: false, lastRunStatus: 'completed' },
+    ],
+  });
+  const client = gateClient(transport, { routeLimits: { [ZAI]: 1 }, spawnLedgerPath: ledger });
+  await assert.rejects(
+    client.prompt('target', { message: 'go' }),
+    (error: unknown) => {
+      assert.ok(error instanceof RouteLimitError);
+      assert.deepEqual(error.live.map((entry) => entry.sessionId), ['busy1']);
+      return true;
+    },
+  );
+  assert.equal(dispatched(calls), 0);
+  // A different explicit owner has no live children on the route: proceeds.
+  await client.prompt('target', { message: 'go', routeOwner: 'someone-else' });
+  assert.equal(dispatched(calls), 1);
+});
+
+test('correction01/5: a stale identity (404 parent) falls back to the owner ledger when an owner is available', async () => {
+  const ledger = tmpLedger();
+  writeFileSync(ledger, `${JSON.stringify([{ sessionId: 's1', route: ZAI, ownerId: 'o1', at: '2026-09-30T00:00:00Z' }], null, 1)}\n`);
+  const inner = fakeTransport({ all: [{ sessionId: 's1', model: ZAI, busy: true }] });
+  const transport = {
+    request: async (method: string, path: string, options_: { body?: Record<string, unknown> } = {}): Promise<TransportResponse> => {
+      if (method === 'GET' && path.startsWith('/api/v1/sessions?')) {
+        throw new ApiError(404, 'SESSION_NOT_FOUND', 'Parent session not found: stale-id');
+      }
+      return (inner.transport as { request: (m: string, p: string, o?: { body?: Record<string, unknown> }) => Promise<TransportResponse> }).request(method, path, options_);
+    },
+  } as never;
+  const client = gateClient(transport, {
+    parentSessionId: 'stale-id',
+    routeLimits: { [ZAI]: 1 },
+    spawnLedgerPath: ledger,
+  });
+  await assert.rejects(
+    client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, retention: { mode: 'durable', ownerId: 'o1' } }),
+    (error: unknown) => {
+      assert.ok(error instanceof RouteLimitError);
+      assert.deepEqual(error.live.map((entry) => entry.sessionId), ['s1']);
+      return true;
+    },
+  );
+});
+
+test('correction01/8: caps configured + a selector-less spawn warns once that it is not counted', async () => {
+  const warnings: string[] = [];
+  const { transport, calls } = fakeTransport({ children: [] });
+  const client = gateClient(transport, {
+    parentSessionId: 'parent-1',
+    routeLimits: { [ZAI]: 2 },
+    onWarn: (line: string) => warnings.push(line),
+  });
+  await client.spawn({ runtime: 'pi', cwd: '/tmp/w' }); // no model selector
+  await client.spawn({ runtime: 'pi', cwd: '/tmp/w' });
+  assert.equal(created(calls), 2);
+  assert.equal(warnings.length, 1, 'warned once, not per spawn');
+  assert.match(warnings[0] ?? '', /--model-selector/);
+  assert.match(warnings[0] ?? '', /not counted/);
 });

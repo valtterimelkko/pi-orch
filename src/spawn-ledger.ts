@@ -65,6 +65,16 @@ export class SpawnLedger {
     }
   }
 
+  /** The retention owner a child was spawned with (G1 correction 01: the bare-CLI prompt gate counts that owner's siblings). */
+  ownerOf(sessionId: string): string | undefined {
+    if (!this.path) return undefined;
+    try {
+      return this.readAll().find((entry) => entry.sessionId === sessionId)?.ownerId;
+    } catch {
+      return undefined; // unreadable ledger: no owner attribution
+    }
+  }
+
   private readAll(): LedgerEntry[] {
     let raw: string;
     try {

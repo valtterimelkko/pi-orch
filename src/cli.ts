@@ -196,6 +196,8 @@ Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
 
 Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
   --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool,
+  --owner ID (route counting only: the per-route gate counts THIS owner's
+    live children when the prompt would start a new turn on an idle child),
   --no-completion-template (both spawn and prompt: skip the C3b END-OF-TASK
   REPORT instruction, which rides by default on every dispatched message and
   on a spawn --goal-objective)
@@ -292,6 +294,13 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
   if (!KNOWN_VERBS.has(args.verb)) {
     throw new UsageError(`unknown verb '${args.verb}'`);
   }
+  // Correction 01 item 7: junk --route-limit values must surface as a usage
+  // error (exit 2) through runCli — never as an uncaught stack from the real
+  // client factory. Validated here (the factory re-parses the same pure
+  // function when it builds the actual client).
+  if (args.repeatable.has('route-limit')) {
+    routeLimitOverrides(args.repeatable.get('route-limit') ?? []);
+  }
 
   const parentSessionId =
     flagString(args, 'parent-session') ??
@@ -385,6 +394,8 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         requireActiveTurn: args.flags.has('require-active-turn') ? true : undefined,
         preflight,
         completionTemplate: args.flags.has('no-completion-template') ? false : undefined,
+        // Correction 01 item 4: counting owner for the prompt-side route gate.
+        ...(flagString(args, 'owner') !== undefined ? { routeOwner: flagString(args, 'owner') } : {}),
       });
       return output(json, body, (value) => {
         const prompt = value as { runId: string; duplicate: boolean; dispatchMode?: string };

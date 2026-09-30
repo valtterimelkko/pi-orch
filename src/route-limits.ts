@@ -56,6 +56,16 @@ export function resolveRouteLimits(options: ResolveRouteLimitsOptions = {}): Rec
 }
 
 function parseLimitValue(route: string, value: unknown, source: string): number {
+  return validateLimitValue(route, value, source);
+}
+
+/**
+ * One limit value validated by the shared rules (integer >= 0; 0 = unlimited).
+ * Used by the environment map, the CLI flags and the module-API per-call
+ * override alike — a bad value is always a usage-class error, never a silent
+ * fallback (G1 correction 01 item 6).
+ */
+export function validateLimitValue(route: string, value: unknown, source: string): number {
   if (typeof value === 'number') {
     if (!Number.isInteger(value) || value < 0) {
       throw new RouteLimitsConfigError(`${source}: limit for '${route}' must be an integer >= 0 (0 = unlimited), got ${value}`);

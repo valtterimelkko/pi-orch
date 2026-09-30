@@ -63,7 +63,7 @@ pi-orch spawn --runtime rt --cwd /dir [--model-selector SEL | --model-match SUB]
   [--preflight-path P --preflight-tool T] [--agent-os-capture enabled|disabled] \
   [--route-limit 'SEL=N' ...] [--wait-for-slot S]
 pi-orch prompt <sessionId> --message "..."     # detached + idempotency key -> runId
-                                               # [--mode prompt|follow_up|steer]
+                                               # [--mode prompt|follow_up|steer] [--owner ID]
 pi-orch wait <sessionId> [--run-id <runId>] [--objective "..."] [--deadline S]
 pi-orch wait --all|--any <id>[@<runId>] ...    # several children, ONE long poll
 pi-orch result <runId> [--transcript]          # final text + completion + evidence
@@ -87,10 +87,10 @@ One provider route can only serve so many children at once (measured 2026-09-30:
 - The built-in default is `zai/glm-5.3-flash: 5`; every other route is unlimited until configured.
 - Configure with `PI_ORCH_ROUTE_LIMITS`, a JSON map of model selector → limit, and per call with repeatable `--route-limit 'SEL=N'` flags — the flag wins. `N=0` (or `unlimited`) lifts the cap for that route. A malformed limit map is a hard error, never a silent unlimited.
 - **Live** means the child can still be generating: busy, a nonterminal run receipt, or a goal `running`/`wrapping_up`. A finished idle child never counts.
-- `spawn` counts your live children on the route (by your session identity, or by your `--owner` retention owner for bare-CLI callers) and **refuses before creating anything** over the limit — exit **25 (`ROUTE_LIMIT`)**, naming the live children. With `--wait-for-slot S` it instead watches the live children and spawns when one settles; on timeout it exits **3 (`DEADLINE`)**. It never polls and never sleeps.
-- `prompt` applies the same gate when it would START a new turn on an idle child of a limited route (a prompt to a live child queues after its current turn and cannot raise route concurrency; `steer` is never gated).
-- Counting uses the server's own views: `GET /sessions?parent=<your session>` when your identity is known; otherwise a local spawn ledger (`PI_ORCH_SPAWN_LEDGER`, default `~/.pi-orch/spawn-ledger.json`) keyed by your `--owner`. With neither an identity nor an owner the limit cannot be counted: the client warns once (`ROUTE_LIMIT_UNCOUNTED`) and proceeds.
-- Children spawned without `--model-selector` carry no route on record and are not counted against any limit — always pass an explicit selector when you care about the cap.
+- `spawn` counts your live children on the route (by your session identity, or by your `--owner` retention owner for bare-CLI callers) and **refuses before creating anything** over the limit — exit **25 (`ROUTE_LIMIT`)**, naming the live children. With `--wait-for-slot S` it instead watches the live children and spawns when one settles; on timeout it exits **3 (`DEADLINE`)**. It never polls and never sleeps. The count→create span is serialised across processes with an exclusive lock file under the pi-orch state dir (held only across the count and the create POST; a wait for the lock is bounded and fails with a clear `ROUTE_LOCK_TIMEOUT` error).
+- `prompt` applies the same gate when it would START a new turn on an idle child of a limited route (a prompt to a live child queues after its current turn and cannot raise route concurrency; `steer` is never gated). A bare-CLI caller counts the target child's owner from the spawn ledger, or an explicitly passed `--owner`.
+- Counting uses the server's own views: `GET /sessions?parent=<your session>` when your identity is known; otherwise a local spawn ledger (`PI_ORCH_SPAWN_LEDGER`, default `~/.pi-orch/spawn-ledger.json`) keyed by your `--owner`. A stale identity falls back to the owner ledger when an owner is known. With neither an identity nor an owner the limit cannot be counted: the client warns once (`ROUTE_LIMIT_UNCOUNTED`) and proceeds.
+- **Caps apply only to spawns that name `--model-selector`** — a spawn with no selector on record is never counted against any cap, and the client warns once when caps are configured and such a spawn is made. If liveness reads fail for a child, it counts as live (fail closed).
 
 ```bash
 PI_ORCH_ROUTE_LIMITS='{"zai/glm-5.3-flash": 2}' \

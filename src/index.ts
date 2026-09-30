@@ -84,3 +84,4 @@ export {
   type LiveReason,
 } from './route-limits.ts';
 export { SpawnLedger, defaultLedgerPath, type LedgerEntry } from './spawn-ledger.ts';
+export { withRouteLock, routeLockPath, RouteLockTimeoutError } from './route-lock.ts';

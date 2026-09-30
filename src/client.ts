@@ -24,8 +24,10 @@ import { resolveCompletion, type CompletionBlock, type CompletionParseError, typ
 import { COMPLETION_REPORT_INSTRUCTION } from './completion-template.ts';
 import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, type CompletionLoad } from './verify.ts';
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
-import { limitFor, liveReason, resolveRouteLimits, routeOfSession, RouteLimitError, RouteLimitWaitDeadlineError } from './route-limits.ts';
+import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError } from './route-limits.ts';
 import { SpawnLedger, defaultLedgerPath } from './spawn-ledger.ts';
+import { withRouteLock } from './route-lock.ts';
+import { dirname } from 'node:path';
 
 export interface ClientConfig {
   /** Socket/http transport options; omit when `transportInstance` is given. */
@@ -45,6 +47,10 @@ export interface ClientConfig {
   env?: Record<string, string | undefined>;
   /** G1: where the bare-CLI spawn ledger lives (default PI_ORCH_SPAWN_LEDGER or ~/.pi-orch/spawn-ledger.json). */
   spawnLedgerPath?: string;
+  /** G1 correction 01: directory for the per-(caller, route) spawn locks (default the ledger's directory). */
+  spawnLockDir?: string;
+  /** G1 correction 01: how long a spawn waits for the route lock before failing (default 30 000 ms). */
+  routeLockTimeoutMs?: number;
   /** G1: warning sink (default a line on stderr). */
   onWarn?: (line: string) => void;
 }
@@ -58,6 +64,8 @@ export class PiOrchClient {
   private readonly templateFollowUpCheckDelayMs: number;
   readonly routeLimits: Record<string, number>;
   private readonly spawnLedger: SpawnLedger;
+  private readonly spawnLockDir: string;
+  private readonly routeLockTimeoutMs: number;
   private readonly onWarn: (line: string) => void;
   private readonly warned = new Set<string>();
 
@@ -73,7 +81,10 @@ export class PiOrchClient {
     this.templateFollowUpCheckDelayMs = config.templateFollowUpCheckDelayMs ?? 3_000;
     this.routeLimits = config.routeLimits ?? resolveRouteLimits({ env: config.env ?? process.env });
     this.onWarn = config.onWarn ?? ((line: string) => { process.stderr.write(`${line}\n`); });
-    this.spawnLedger = new SpawnLedger(config.spawnLedgerPath ?? defaultLedgerPath(config.env ?? process.env));
+    const ledgerPath = config.spawnLedgerPath ?? defaultLedgerPath(config.env ?? process.env);
+    this.spawnLedger = new SpawnLedger(ledgerPath);
+    this.spawnLockDir = config.spawnLockDir ?? dirname(ledgerPath);
+    this.routeLockTimeoutMs = config.routeLockTimeoutMs ?? 30_000;
   }
 
   private warnOnce(line: string): void {
@@ -83,33 +94,46 @@ export class PiOrchClient {
     this.onWarn(line);
   }
 
-  /** The cap for one spawn/prompt call: the per-call value wins; 0 lifts the cap. */
+  /** The cap for one spawn/prompt call: the per-call value wins; 0 lifts the cap.
+    * A bad value is a usage-class error, never a silent unlimited (correction 01 item 6). */
   private effectiveLimit(route: string | undefined, perCall: number | undefined): number | undefined {
-    if (perCall !== undefined) return perCall > 0 ? perCall : undefined;
+    if (perCall !== undefined) {
+      validateLimitValue(route ?? '(per-call)', perCall, 'route-limit');
+      return perCall > 0 ? perCall : undefined;
+    }
     return limitFor(route, this.routeLimits);
+  }
+
+  private get capsConfigured(): boolean {
+    return Object.values(this.routeLimits).some((value) => value > 0);
   }
 
   // ── G1: per-route live-children accounting ──────────────────────────────
 
-  private async goalStatusOf(sessionId: string): Promise<string | undefined> {
+  private async goalStatusOf(sessionId: string): Promise<{ value?: string; failed: boolean }> {
     try {
       const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() });
-      return (response.body as { status?: string }).status;
+      return { value: (response.body as { status?: string }).status, failed: false };
     } catch {
-      return undefined; // unreadable projection: the other evidence decides
+      return { failed: true }; // unreadable projection: liveness unknown
     }
   }
 
-  private async lastRunStatusOf(sessionId: string): Promise<string | undefined> {
+  private async lastRunStatusOf(sessionId: string): Promise<{ value?: string; failed: boolean }> {
     try {
       const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/evidence`, { headers: this.headers() });
-      return (response.body as { runChronology?: Array<{ status?: string }> }).runChronology?.[0]?.status;
+      return { value: (response.body as { runChronology?: Array<{ status?: string }> }).runChronology?.[0]?.status, failed: false };
     } catch {
-      return undefined; // unreadable evidence: the other evidence decides
+      return { failed: true }; // unreadable evidence: liveness unknown
     }
   }
 
-  /** Which of these sessions (on `route`) are still live, with the reason each is. */
+  /**
+   * Which of these sessions (on `route`) are still live, with the reason each
+   * is. A child whose goal/evidence reads FAIL counts as live with reason
+   * 'unknown' — fail closed (correction 01 item 2): an unknown child is never
+   * treated as settled.
+   */
   private async liveAmong(
     sessions: Array<Record<string, unknown>>,
     route: string,
@@ -122,9 +146,20 @@ export class PiOrchClient {
         const session = queue.shift();
         if (!session) return;
         const sessionId = String(session.sessionId);
-        const [goalStatus, lastRunStatus] = await Promise.all([this.goalStatusOf(sessionId), this.lastRunStatusOf(sessionId)]);
-        const reason = liveReason({ busy: session.busy === true, goalStatus, lastRunStatus });
-        if (reason) live.push({ sessionId, reason });
+        const busy = session.busy === true;
+        const [goal, evidence] = await Promise.all([this.goalStatusOf(sessionId), this.lastRunStatusOf(sessionId)]);
+        const reason = liveReason({
+          busy,
+          goalStatus: goal.failed ? undefined : goal.value,
+          lastRunStatus: evidence.failed ? undefined : evidence.value,
+        });
+        if (reason) {
+          live.push({ sessionId, reason });
+        } else if (!busy && (goal.failed || evidence.failed)) {
+          // All KNOWN evidence says settled, but a read failed: liveness is
+          // unknown — count it as live so the cap stays honest.
+          live.push({ sessionId, reason: 'unknown' });
+        }
       }
     };
     await Promise.all([worker(), worker(), worker(), worker()]);
@@ -135,8 +170,10 @@ export class PiOrchClient {
    * Live children of THIS caller on `route`. Counted from the server by the
    * caller's session identity (`GET /sessions?parent=…`, authoritative); a
    * bare-CLI caller counts by its retention owner through the local spawn
-   * ledger (the server has no owner filter); with neither, the limit cannot
-   * be applied: warn once and proceed (brief rule).
+   * ledger (the server has no owner filter). When the parent identity is
+   * STALE (404) but an owner is available, the owner ledger is used instead
+   * of giving up (correction 01 item 5). With neither, the limit cannot be
+   * applied: warn once and proceed (brief rule).
    */
   private async countLiveOnRoute(
     route: string,
@@ -149,11 +186,12 @@ export class PiOrchClient {
         const live = await this.liveAmong(sessions, route);
         return { count: live.length, live, countedBy: 'parent' };
       } catch (error) {
-        if ((error as { status?: number }).status === 404) {
+        if ((error as { status?: number }).status !== 404) throw error;
+        if (!owner) {
           this.warnOnce(`pi-orch: ROUTE_LIMIT_UNCOUNTED — parent session ${this.parentSessionId} is not known to this server; cannot count live children on route '${route}'; proceeding without the limit`);
           return { count: 0, live: [], countedBy: 'none' };
         }
-        throw error;
+        // stale identity + an owner: fall back to the ledger below
       }
     }
     if (owner) {
@@ -171,35 +209,35 @@ export class PiOrchClient {
   }
 
   /**
-   * G1 --wait-for-slot: wait for one live child on the route to settle via
-   * the existing watch-based wait (no polling, no sleep), then re-check;
-   * bounded by the caller's deadline.
-   *
-   * Watches the wait creates are removed again afterwards: a leftover
-   * slot-watch would count as a foreign, incompatible watch for the parent's
-   * own later wait on that child (live-found in the G1 proof: wait exit 19).
-   * Only watches that did not exist before the wait are ours to remove.
+   * G1 --wait-for-slot, ONE wait attempt (the caller's loop owns the deadline
+   * and the re-count). Waits only on WATCHABLE children: a child that already
+   * carries an active watch is skipped (registering would conflict with a
+   * foreign or differently-shaped watch). Watches this attempt creates are
+   * removed afterwards (live-found in the G1 proof: a leftover slot-watch
+   * made the parent's own later wait fail with WATCH_CONFLICT). A child that
+   * vanished (session_not_found) is simply reported back: the caller
+   * re-counts instead of refusing (correction 01 item 3).
    */
-  private async waitForRouteSlot(route: string, limit: number, owner: string | undefined, waitForSlotMs: number): Promise<void> {
-    const deadline = Date.now() + waitForSlotMs;
-    for (;;) {
-      const { count, live, countedBy } = await this.countLiveOnRoute(route, owner);
-      if (countedBy === 'none' || count < limit) return;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new RouteLimitWaitDeadlineError(route, limit, waitForSlotMs);
-      const watchBefore = await Promise.all(live.map((entry) => this.getWatch(entry.sessionId).catch(() => null)));
-      const oursToClean = live.filter((_, index) => watchBefore[index] === null).map((entry) => entry.sessionId);
-      const waited = await this.waitMany({ mode: 'any', children: live.map((entry) => ({ sessionId: entry.sessionId })), deadlineMs: remaining });
-      await Promise.all(oursToClean.map((sessionId) => this.deleteWatch(sessionId).catch(() => undefined)));
-      const kinds = waited.children.map((child) => child.outcome?.kind);
-      if (kinds.length > 0 && kinds.every((kind) => kind === 'watch_conflict' || kind === 'session_not_found')) {
-        // Every live child carries an unremovable foreign watch (or is gone):
-        // there is no watchable settle to wait for. Refuse with the normal
-        // over-limit error so the caller can act now.
-        throw new RouteLimitError(route, limit, live);
-      }
-      // loop: re-count — the settled child drops out of the live set
+  private async waitForRouteSlotOnce(
+    route: string,
+    limit: number,
+    live: Array<{ sessionId: string; reason: string }>,
+    remainingMs: number,
+  ): Promise<void> {
+    const watchBefore = await Promise.all(live.map((entry) => this.getWatch(entry.sessionId).catch(() => null)));
+    const watchable = live.filter((_, index) => !(watchBefore[index] !== null && watchBefore[index]?.status === 'active'));
+    if (watchable.length === 0) {
+      // Every live child carries an unremovable foreign watch: there is no
+      // watchable settle to wait for. Refuse with the normal over-limit error
+      // so the caller can act now.
+      throw new RouteLimitError(route, limit, live);
     }
+    const oursToClean = watchable.map((entry) => entry.sessionId);
+    const waited = await this.waitMany({ mode: 'any', children: watchable.map((entry) => ({ sessionId: entry.sessionId })), deadlineMs: remainingMs });
+    await Promise.all(oursToClean.map((sessionId) => this.deleteWatch(sessionId).catch(() => undefined)));
+    // session_not_found (a vanished child) is NOT a refusal: the caller
+    // re-counts and the next attempt uses the fresh live set.
+    void waited;
   }
 
   private headers(): Record<string, string> {
@@ -247,54 +285,67 @@ export class PiOrchClient {
   }> {
     const modelSelector = input.modelSelector ?? (input.modelMatch ? await this.resolveModel(input.runtime, input.modelMatch) : undefined);
     const body = buildCreateBody({ ...input, modelSelector });
+    // G1 correction 01 (accepted finding): caps apply only to spawns that
+    // name --model-selector. Say so once per client when caps are configured
+    // and this spawn carries no selector.
+    if (!modelSelector && this.capsConfigured) {
+      this.warnOnce('pi-orch: ROUTE_LIMIT_UNCOUNTED — this spawn names no --model-selector, so it is not counted against any per-route cap (caps apply only to spawns that name --model-selector)');
+    }
+    const routeLimit = modelSelector ? this.effectiveLimit(modelSelector, input.routeLimit) : undefined;
+    const owner = input.retention?.ownerId;
+    // The create itself, so the gate can hold the route lock ACROSS the
+    // count and the create POST (correction 01 item 1: two concurrent spawns
+    // at the cap must not both create).
+    const runCreate = async (): Promise<{
+      raw: Record<string, unknown>;
+      retention: { leaseId?: string } | undefined;
+      sessionId: string;
+    }> => {
+      let response: Awaited<ReturnType<Transport['request']>>;
+      try {
+        response = await this.transport.request('POST', '/api/v1/sessions', { body, headers: this.headers() });
+      } catch (error) {
+        // Correction 04 item 3: POST /sessions has no server idempotency, so a
+        // lost connection/response is NEVER retried — the server may have created
+        // the session. Surface an explicit unknown outcome with a reconcile hint.
+        if (error instanceof TransportError) {
+          throw new ApiError(0, 'CREATE_UNKNOWN', `create outcome unknown: ${error.message}`, {
+            details: JSON.stringify({
+              outcome: 'unknown',
+              hint: `do NOT blindly re-spawn. Reconcile first: pi-orch status --parent <your sessionId> (children carry your ownerId${input.retention?.label ? ` / label '${input.retention.label}'` : ''}); delete an orphaned child if you find one, then re-spawn`,
+            }),
+          });
+        }
+        throw error;
+      }
+      const raw = response.body as Record<string, unknown>;
+      const retention = raw.retention as { leaseId?: string } | undefined;
+      const sessionId = String(raw.sessionId);
+      // G1: bare-CLI bookkeeping — the spawn ledger is how a caller with no
+      // session identity counts its own children by retention owner later.
+      // Written only without an identity: with one, ?parent= counting is
+      // server-authoritative and the ledger would be a second, weaker copy.
+      if (!this.parentSessionId) {
+        const recorded = this.spawnLedger.record({
+          sessionId,
+          route: modelSelector,
+          ownerId: input.retention?.ownerId,
+          at: new Date().toISOString(),
+        });
+        if (recorded.note) this.warnOnce(`pi-orch: ${recorded.note}`);
+      }
+      return { raw, retention, sessionId };
+    };
     // G1: per-route concurrency gate — refuse BEFORE creating anything when
     // this caller already has the limit's worth of LIVE children on the
-    // route, or wait for a slot when --wait-for-slot asks for that.
-    const routeLimit = this.effectiveLimit(modelSelector, input.routeLimit);
-    if (routeLimit !== undefined) {
-      const owner = input.retention?.ownerId;
-      const { count, live, countedBy } = await this.countLiveOnRoute(modelSelector as string, owner);
-      if (countedBy !== 'none' && count >= routeLimit) {
-        if (input.waitForSlotMs !== undefined) {
-          await this.waitForRouteSlot(modelSelector as string, routeLimit, owner, input.waitForSlotMs);
-        } else {
-          throw new RouteLimitError(modelSelector as string, routeLimit, live);
-        }
-      }
-    }
-    let response: Awaited<ReturnType<Transport['request']>>;
-    try {
-      response = await this.transport.request('POST', '/api/v1/sessions', { body, headers: this.headers() });
-    } catch (error) {
-      // Correction 04 item 3: POST /sessions has no server idempotency, so a
-      // lost connection/response is NEVER retried — the server may have created
-      // the session. Surface an explicit unknown outcome with a reconcile hint.
-      if (error instanceof TransportError) {
-        throw new ApiError(0, 'CREATE_UNKNOWN', `create outcome unknown: ${error.message}`, {
-          details: JSON.stringify({
-            outcome: 'unknown',
-            hint: `do NOT blindly re-spawn. Reconcile first: pi-orch status --parent <your sessionId> (children carry your ownerId${input.retention?.label ? ` / label '${input.retention.label}'` : ''}); delete an orphaned child if you find one, then re-spawn`,
-          }),
-        });
-      }
-      throw error;
-    }
-    const raw = response.body as Record<string, unknown>;
-    const retention = raw.retention as { leaseId?: string } | undefined;
-    const sessionId = String(raw.sessionId);
-    // G1: bare-CLI bookkeeping — the spawn ledger is how a caller with no
-    // session identity counts its own children by retention owner later.
-    // Written only without an identity: with one, ?parent= counting is
-    // server-authoritative and the ledger would be a second, weaker copy.
-    if (!this.parentSessionId) {
-      const recorded = this.spawnLedger.record({
-        sessionId,
-        route: modelSelector,
-        ownerId: input.retention?.ownerId,
-        at: new Date().toISOString(),
-      });
-      if (recorded.note) this.warnOnce(`pi-orch: ${recorded.note}`);
-    }
+    // route, or wait for a slot when --wait-for-slot asks for that. The
+    // count→create span is serialised across processes with an exclusive
+    // route lock (correction 01 item 1); the lock is held only across the
+    // count and the create POST — a --wait-for-slot wait happens OUTSIDE it.
+    const created = routeLimit !== undefined && modelSelector
+      ? await this.spawnUnderRouteGate(modelSelector, owner, routeLimit, input.waitForSlotMs, runCreate)
+      : await runCreate();
+    const { raw, retention, sessionId } = created;
     // C3b: a templated GOAL child gets the verbatim instruction paragraph as a
     // queued follow_up (the server keeps objectives single-line, so the
     // objective carries only the flattened pointer). follow_up queues on the
@@ -314,7 +365,38 @@ export class PiOrchClient {
     };
   }
 
-  async prompt(sessionId: string, input: PromptInput & { followUpOnBusy?: boolean; routeLimit?: number }): Promise<{
+  /**
+   * G1 correction 01 item 1: the gated create. Every count→create span runs
+   * under the exclusive per-(caller, route) route lock, so two concurrent
+   * spawns at the cap cannot both create. A --wait-for-slot wait happens
+   * OUTSIDE the lock (the lock is held only across the count and the create
+   * POST); after each wait the next attempt re-counts under a fresh lock.
+   */
+  private async spawnUnderRouteGate(
+    route: string,
+    owner: string | undefined,
+    limit: number,
+    waitForSlotMs: number | undefined,
+    create: () => Promise<{ raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string }>,
+  ): Promise<{ raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string }> {
+    const key = `${this.parentSessionId ?? (owner ? `owner:${owner}` : 'no-identity')}|${route}`;
+    const deadline = waitForSlotMs !== undefined ? Date.now() + waitForSlotMs : undefined;
+    for (;;) {
+      const outcome = await withRouteLock({ dir: this.spawnLockDir, key, timeoutMs: this.routeLockTimeoutMs }, async (): Promise<{ action: 'wait'; live: Array<{ sessionId: string; reason: string }> } | { action: 'create'; response: { raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string } }> => {
+        const { count, live, countedBy } = await this.countLiveOnRoute(route, owner);
+        if (countedBy !== 'none' && count >= limit) return { action: 'wait', live };
+        return { action: 'create', response: await create() };
+      });
+      if (outcome.action === 'create') return outcome.response;
+      if (waitForSlotMs === undefined) throw new RouteLimitError(route, limit, outcome.live);
+      const remaining = (deadline as number) - Date.now();
+      if (remaining <= 0) throw new RouteLimitWaitDeadlineError(route, limit, waitForSlotMs);
+      await this.waitForRouteSlotOnce(route, limit, outcome.live, remaining);
+      // loop: re-count under a fresh lock
+    }
+  }
+
+  async prompt(sessionId: string, input: PromptInput & { followUpOnBusy?: boolean; routeLimit?: number; routeOwner?: string }): Promise<{
     runId: string;
     sessionId: string;
     detached: boolean;
@@ -329,7 +411,7 @@ export class PiOrchClient {
     // server (409), so it cannot raise route concurrency. steer never starts
     // a turn. Decided and recorded in the G1 evidence bundle.
     if (input.mode !== 'steer') {
-      await this.gatePromptStart(sessionId, input.routeLimit);
+      await this.gatePromptStart(sessionId, input.routeLimit, input.routeOwner);
     }
     const body = buildPromptBody(input, this.randomId);
     const path = `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompt`;
@@ -415,7 +497,7 @@ export class PiOrchClient {
   }
 
   /** G1: the prompt-side half of the per-route gate (see prompt). */
-  private async gatePromptStart(sessionId: string, perCall: number | undefined): Promise<void> {
+  private async gatePromptStart(sessionId: string, perCall: number | undefined, routeOwner: string | undefined): Promise<void> {
     let detail: Record<string, unknown>;
     try {
       const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() });
@@ -428,9 +510,14 @@ export class PiOrchClient {
     const route = routeOfSession(detail as { modelSelector?: string; model?: string });
     const limit = this.effectiveLimit(route, perCall);
     if (limit === undefined) return;
-    const [goalStatus, lastRunStatus] = await Promise.all([this.goalStatusOf(sessionId), this.lastRunStatusOf(sessionId)]);
-    if (liveReason({ busy: detail.busy === true, goalStatus, lastRunStatus })) return; // live: no new concurrency
-    const { count, live, countedBy } = await this.countLiveOnRoute(route as string, undefined);
+    const [goal, evidence] = await Promise.all([this.goalStatusOf(sessionId), this.lastRunStatusOf(sessionId)]);
+    if (liveReason({ busy: detail.busy === true, goalStatus: goal.value, lastRunStatus: evidence.value })) return; // live: no new concurrency
+    if (goal.failed || evidence.failed) return; // liveness unknown → fail closed: never gate on an unknown child
+    // Correction 01 item 4: a bare-CLI caller counts the TARGET's owner (from
+    // the local spawn ledger), or an explicitly passed routeOwner (--owner on
+    // the CLI), so an idle child cannot start a new turn past its owner's cap.
+    const owner = routeOwner ?? this.spawnLedger.ownerOf(sessionId);
+    const { count, live, countedBy } = await this.countLiveOnRoute(route as string, owner);
     if (countedBy === 'none' || count < limit) return;
     throw new RouteLimitError(route as string, limit, live);
   }

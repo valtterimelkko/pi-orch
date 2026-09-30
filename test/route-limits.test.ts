@@ -6,6 +6,8 @@ import {
   limitFor,
   routeOfSession,
   liveReason,
+  validateLimitValue,
+  RouteLimitsConfigError,
 } from '../src/route-limits.ts';
 
 /**
@@ -89,4 +91,13 @@ test('liveReason: settled children are not live (finished idle does not count)',
   assert.equal(liveReason({ busy: false, goalStatus: 'paused' }), null, 'a paused goal is not generating');
   assert.equal(liveReason({}), null, 'a fresh child with no runs and no goal is idle');
   assert.equal(liveReason({ goalStatus: 'cleared', lastRunStatus: 'completed' }), null);
+});
+
+test('validateLimitValue: integers >= 0 pass; negative, fractional, NaN and non-numbers are usage-class errors', () => {
+  assert.equal(validateLimitValue('r', 0, 'test'), 0);
+  assert.equal(validateLimitValue('r', 5, 'test'), 5);
+  for (const bad of [-1, 1.5, Number.NaN]) {
+    assert.throws(() => validateLimitValue('r', bad, 'test'), RouteLimitsConfigError);
+  }
+  assert.throws(() => validateLimitValue('r', '3', 'test'), RouteLimitsConfigError);
 });
