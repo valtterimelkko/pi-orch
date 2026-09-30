@@ -149,8 +149,7 @@ cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 
 ## Skill pack
 
-The agent skills that use this client — parent orchestration, long-horizon waiting, the child worker protocol — live in the public skill pack:
-**[https://github.com/valtterimelkko/agent-workflow-skills](https://github.com/valtterimelkko/agent-workflow-skills)** <!-- exact pack path added by the publisher -->
+The agent skills that use this client (parent orchestration, long-horizon waiting, the orchestrated child worker protocol and secret scanning) live in the public **[Pi Web UI orchestration pack](https://github.com/valtterimelkko/agent-workflow-skills/tree/main/packs/pi-web-ui-orchestration-pack)**.
 
 ## Development
 
@@ -169,4 +168,4 @@ MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Valtteri Melkko.
 ## See also
 
 - **[Pi Web UI](https://github.com/valtterimelkko/pi-web-ui)** — the server this client talks to (MIT).
-- Public skill pack: [valtterimelkko/agent-workflow-skills](https://github.com/valtterimelkko/agent-workflow-skills).
+- Public skill pack: [Pi Web UI orchestration pack](https://github.com/valtterimelkko/agent-workflow-skills/tree/main/packs/pi-web-ui-orchestration-pack).
