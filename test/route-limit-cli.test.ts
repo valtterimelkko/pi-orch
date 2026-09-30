@@ -187,7 +187,7 @@ test('prompt accepts --owner for route counting (correction01/4 CLI surface)', a
 });
 
 test('correction03/4: the REAL binary maps --route-limit bad to exit 2 with a usage message and no stack', () => {
-  
+
   const bin = new URL('../bin/pi-orch', import.meta.url).pathname;
   const run = spawnSync(process.execPath, [bin, 'spawn', '--runtime', 'pi', '--cwd', '/tmp', '--model-selector', 'zai/glm-5.3-flash', '--route-limit', 'bad'], {
     encoding: 'utf8',
