@@ -1,7 +1,7 @@
 {
   "name": "pi-orch",
   "version": "0.1.0",
-  "description": "Thin parent client for the Pi Web UI Internal API (plan C1). Local only until the owner approves publishing.",
+  "description": "Thin parent client (CLI + module) for Pi Web UI's Internal API: spawn, prompt, wait, result, verify.",
   "type": "module",
   "private": true,
   "license": "MIT",

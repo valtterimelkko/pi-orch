@@ -1,127 +1,83 @@
 # pi-orch
 
-Thin parent client for the Pi Web UI Internal API (orchestration-scaling plan
-step C1; C3b adds the completion template, `result` completion fields and
-`verify`). TypeScript, Node >= 22.18, **zero runtime dependencies beyond Node's
-standard library**. Provides an importable module (`src/index.ts`) and a
-shell-friendly CLI (`bin/pi-orch`) so parent agents stop hand-writing curl,
-guessing request shapes and sleeping in loops.
+**Client for [Pi Web UI](https://github.com/valtterimelkko/pi-web-ui)'s Internal API** — one small CLI plus an importable module that spawns and supervises child agent sessions, so parent agents stop hand-writing curl, guessing request shapes and sleeping in loops.
 
-Local-only until the owner approves publishing. Do not add a remote.
+[![Pi Web UI Internal API](https://img.shields.io/badge/Pi_Web_UI-Internal_API-blue)](https://github.com/valtterimelkko/pi-web-ui) ![Node >= 22.18](https://img.shields.io/badge/node-%3E%3D22.18-brightgreen) ![runtime dependencies: zero](https://img.shields.io/badge/runtime_dependencies-zero-brightgreen) ![licence: MIT](https://img.shields.io/badge/licence-MIT-blue)
+
+## What it is and why
+
+Pi Web UI runs autonomous agent sessions and exposes them through a same-host Internal API: create a session, prompt it, watch it, read its receipt, attach a goal. `pi-orch` is the thin parent client for that API. Verbs: `spawn`, `prompt`, `wait` (watch-based — never a poll loop), `result`, `verify`, `cleanup`, `status`, `capabilities`, `capacity`, `models`.
+
+It always sends `X-Parent-Session` so child lineage is recorded, honours `Retry-After` within a bounded budget, and uses documented exit codes so a shell-calling agent can branch on the outcome instead of parsing prose.
+
+TypeScript, **zero runtime dependencies** beyond Node's standard library. Node ≥ 22.18 runs the TypeScript sources directly; there is no build step.
+
+## Requirements
+
+- A running **[Pi Web UI](https://github.com/valtterimelkko/pi-web-ui)** on the same host, with its Internal API socket and bearer token (defaults: `~/.pi-web-ui/internal-api.sock` and `~/.pi-web-ui/internal-api-token`). The client talks to the Unix socket, not the network.
+- Node.js **>= 22.18**.
+
+## Install
+
+```bash
+git clone https://github.com/valtterimelkko/pi-orch
+# no runtime dependencies — nothing else to install
+./pi-orch/bin/pi-orch capabilities
+```
+
+Optional: put it on `PATH` (`ln -s "$PWD/pi-orch/bin/pi-orch" ~/.local/bin/pi-orch`) or run it in place.
+
+## 60-second quickstart
+
+```bash
+# 1. Is the API reachable, and at which contract version?
+pi-orch capabilities
+
+# 2. Which model selectors are live? (spawn and prompt accept one selector)
+pi-orch models --runtime pi --match <substring>
+
+# 3. Spawn a child session in a directory (prints the session id)
+session=$(pi-orch spawn --runtime pi --cwd /tmp/demo \
+  --model-selector <provider>/<model> --thinking low \
+  --owner demo --ttl 600 --id-only)
+
+# 4. Send it a task (prints the run id)
+run=$(pi-orch prompt "$session" --message "Say hello, then finish." --id-only)
+
+# 5. Wait for it — one watch-backed long poll, no sleep loop
+pi-orch wait "$session"
+
+# 6. Read the result (final text, completion block, evidence pointer)
+pi-orch result "$run" --json
+```
 
 ## Verbs
 
 ```
 pi-orch capabilities                     # contract version, runtime features
 pi-orch capacity                         # admission preflight
-pi-orch models --runtime pi [--match zai]  # live selectors; exactly one match
-pi-orch spawn --runtime pi --cwd /dir --model-selector zai/glm-5.3-flash \
-  --thinking low --owner <parent-id> --ttl 3600 \
-  [--goal-objective "..." --goal-max-turns 20] \
-  [--preflight-path /dir/brief.md --preflight-tool node] \
-  [--no-completion-template]
+pi-orch models --runtime pi [--match sub]  # live selectors; exactly one match
+pi-orch spawn --runtime rt --cwd /dir [--model-selector SEL | --model-match SUB] \
+  [--thinking LEVEL] [--owner ID --ttl S [--label L]] \
+  [--goal-objective "..." --goal-max-turns N --goal-verify CMD] \
+  [--preflight-path P --preflight-tool T] [--agent-os-capture enabled|disabled]
 pi-orch prompt <sessionId> --message "..."     # detached + idempotency key -> runId
-                                               # [--no-completion-template]
-pi-orch wait <sessionId> [--run-id <runId>] [--objective "..."]
+                                               # [--mode prompt|follow_up|steer]
+pi-orch wait <sessionId> [--run-id <runId>] [--objective "..."] [--deadline S]
 pi-orch wait --all|--any <id>[@<runId>] ...    # several children, ONE long poll
 pi-orch result <runId> [--transcript]          # final text + completion + evidence
 pi-orch verify <sessionId> [--run-id id] [--since ref] [--rerun "cmd"] \
   [--cwd dir] [--repo dir] [--rerun-timeout s] # re-check completion claims
-pi-orch cleanup <sessionId> --lease <id> --owner <id> [--watch <id>]
-pi-orch status --parent <sessionId>            # children: busy, goal, last run
+pi-orch cleanup <sessionId> [--lease id --owner id] [--watch id]
+pi-orch status [--parent <sessionId>] | [<sessionId>]  # children: busy, goal, last run
 pi-orch help | --help | -h                     # usage on stdout, exit 0
 ```
 
-`--json` gives machine output; default is human-readable. `--id-only` prints
-the bare id for `$(...)` capture: `spawn` prints the sessionId, `prompt` prints
-the runId. Never parse the human output (its wording can change at any time).
+`--json` gives machine output; the default is human-readable. `--id-only` prints the bare id for `$(...)` capture: `spawn` prints the session id, `prompt` prints the run id. Never parse the human output — its wording can change at any time.
 
-`wait` never polls: it registers a watch on the child and blocks in the
-server's long poll (`GET /watches/wait`), advancing the cursor, reconciling the
-run receipt at slice boundaries. It distinguishes `interruptedByRestart`,
-`NEVER_STARTED`, `RUN_BUDGET_EXCEEDED` and `RUN_TRANSPORT_LOST`, and survives a
-server restart by re-registering the watch with `fireIfSettled`.
+`wait` never polls: it registers a watch on the child and blocks in the server's long poll, advancing the cursor and reconciling the run receipt at slice boundaries. `wait --all` settles every named child and `wait --any` returns with the first to settle — one long-poll request covers all watches. Unknown runs or sessions fail fast (exit 16). On a goal child, pass `--objective`; without it, `wait` reads the child's goal projection once and adopts the goal conditions when a goal is active or running.
 
-`wait --all` settles every named child, `wait --any` returns with the first to
-settle — one long-poll request covers all watches, so a parent fans out without
-a shell loop. Unknown runs/sessions fail fast (exit 16) instead of sitting out
-the deadline. On a goal child, pass `--objective` (goal_end+paused matched on
-the exact string). Without `--objective`, wait reads the child's goal
-projection once and — when a goal is active or running — adopts the goal
-conditions and settlement automatically, and says so in the output (C3b fix:
-a forgotten `--objective` no longer yields an early false `completed`).
-
-## Completion template (C3b)
-
-Every dispatched `prompt` message and every `spawn --goal-objective` carries
-the END-OF-TASK REPORT instruction by default: the child is told to end its
-final answer with a fenced `completion` block (schema `pi-completion/v1`:
-status, summary, commands with exit codes, tests, commits with repo paths,
-filesChanged, openIssues, blockedReason). The wording is one module constant
-(`src/completion-template.ts`) pinned byte-for-byte by test to the paragraph
-live-proved in C3a (16/16 parse rate). Pass `--no-completion-template` (CLI)
-or `completionTemplate: false` (module) to skip it — e.g. for steer/follow_up
-chatter that is not a task. The server caps a goal objective at 4000 chars;
-the template is ~600, and an overflowing objective fails with an error naming
-the opt-out.
-
-## result: completion fields (C3b)
-
-`pi-orch result <runId> --json` returns, alongside the receipt fields:
-
-- `completion` — the parsed block; from the run receipt when the run captured
-  one, else from the session's `latestCompletion` (goal children work in
-  receipt-less goal-engine continuation turns; the session surface is the only
-  capture path there).
-- `completionError` — the typed parse error (`NO_BLOCK`, `UNCLOSED_FENCE`,
-  `OVERSIZED_BLOCK`, `MALFORMED_JSON`, `SCHEMA_VIOLATION`) when the block
-  failed.
-- `completionDelimiter` — `completion` (the protocol fence) or `json-tagged`
-  (the schema-tagged tolerance).
-- `completionSource` — `receipt` or `session_surface` (which record it came
-  from), plus `completionCapturedAt`/`completionCapturedBy` for surface
-  provenance.
-- `evidence.completion` — the API path that holds the completion record.
-
-## verify: re-check the child's claims (C3b)
-
-`pi-orch verify <sessionId>` reads the child's completion block (with
-`--run-id`, that receipt is authoritative; without it, the session's newest
-capture) and re-checks its cheap facts against the filesystem with READ-ONLY
-git:
-
-- every claimed commit exists in its claimed repo
-  (`git cat-file -e <sha>^{commit}`); pass `--since <base>` to additionally
-  require that each claimed commit is reachable from that base (the
-  `pi-completion/v1` schema has no branch field, so reachability is always
-  checked against the base the parent names);
-- every `filesChanged` entry shows CHANGE evidence: the path appears in a
-  claimed commit's diff (`git diff-tree`), or the working tree shows it
-  modified, added, deleted or untracked (`git status --porcelain`). A path
-  that exists but is clean and absent from every claimed commit is
-  contradicted ("exists but unchanged");
-- claimed commands with exit codes are recorded (never re-run automatically);
-- a claimed test is re-run ONLY when the parent names the exact command:
-  `--rerun "npm test"` runs it once in the child's cwd (`--cwd`, bounded by
-  `--rerun-timeout`, default 120 s); a failing rerun contradicts every claimed
-  `pass` and confirms an honest `fail`;
-- `status: "blocked"` requires `blockedReason`.
-
-verify never mutates anything: allow-listed read-only git subcommands, argv
-arrays (no shell), no network, no writes. The only command ever executed is
-the parent-named `--rerun`.
-
-Output (use `--json` for the claims table): a per-claim table and an overall
-verdict. Verdict precedence: any contradicted claim → `contradicted`; any
-unverifiable claim (or nothing independently checkable) → `unverifiable`;
-else `verified`.
-
-Every request carries `X-Parent-Session` from `--parent-session`, else
-`PI_ORCH_PARENT_SESSION`, else `PI_WEB_UI_SESSION_ID`, else `PI_SESSION_ID` —
-so parent lineage (C5) is recorded automatically.
-
-429/503 responses with `Retry-After` are retried within a bounded budget
-(attempts and total wait); exhaustion exits `10` with the header echoed.
+By default every dispatched `prompt` message and every `spawn --goal-objective` asks the child to end its final answer with a fenced `completion` block (schema `pi-completion/v1`: status, summary, commands with exit codes, tests, commits, filesChanged, openIssues, blockedReason). `result` parses it into `completion` / `completionError` fields; `verify` re-checks its cheap facts against the filesystem with read-only git (claimed commits exist, `filesChanged` shows change evidence, and a claimed test is re-run only when you name the exact command with `--rerun`). Use `--no-completion-template` for steering chatter that is not a task.
 
 ## Environment
 
@@ -130,27 +86,32 @@ so parent lineage (C5) is recorded automatically.
 | `PI_WEB_UI_SOCKET` | Unix socket path (default `~/.pi-web-ui/internal-api.sock`) |
 | `PI_WEB_UI_TOKEN_PATH` | Bearer token file (default `~/.pi-web-ui/internal-api-token`) |
 | `PI_WEB_UI_API_BASE` | http base instead of the socket (tests/odd deployments) |
-| `PI_ORCH_PARENT_SESSION` | Explicit parent id for bare-CLI parents |
 | `PI_WEB_UI_REPO` | Pi Web UI checkout root whose `docs/contract/` snapshot should be used (see below) |
 | `PI_ORCH_SNAPSHOT_PATH` | Contract snapshot file override (wins over everything; see below) |
+| `PI_ORCH_PARENT_SESSION` | Explicit parent id for bare-CLI parents |
+| `PI_ORCH_TSC` | Optional path to a TypeScript entry point for `npm run typecheck` |
+
+CLI flags `--socket`, `--token-path`, `--api-base` and `--parent-session` override the environment.
+
+## Security model
+
+- The client talks to a **same-host Unix socket**; the bearer token is read from a file. Neither is sent over a network.
+- **The token must live outside this repository.** The code enforces it: resolving a credential path inside the package root — including through a symlink, and whether or not the file exists — is refused with a clear error and the distinct exit code **23 (`CREDENTIAL_IN_REPO`)**. A token that ends up in a checkout (or its history) is a leaked token; the guard stops the read before it happens.
+- `.gitignore` excludes `.env*`, token-shaped names and local artefacts, but **it is belt and braces, not the protection**. The guard is the protection.
+- `pi-orch` loads **no `.env` file of any kind**; the environment and the explicit flags are the only credential inputs. A test scans the sources to keep it that way.
 
 ## Contract snapshot (drift guard)
 
-The server repo generates `docs/contract/internal-api-client-snapshot.json`
-from its zod schemas and types (`npx tsx scripts/generate-client-snapshot.ts`);
-its drift test fails CI when a server schema changes without regeneration.
-This client's tests validate the request builders and response parsers against
-that snapshot. Resolution order, in code, tests and here: (1)
-`PI_ORCH_SNAPSHOT_PATH`; (2) `$PI_WEB_UI_REPO/docs/contract/internal-api-client-snapshot.json`
-when the variable is set (a set-but-unusable repo is a loud error); (3)
-`~/pi-web-ui/docs/contract/internal-api-client-snapshot.json` when that checkout
-is present; (4) the bundled copy in `contract/` — so the client's tests pass on
-a machine with no Pi Web UI checkout at all. At runtime the client compares the
-snapshot's `contractVersion` with live `/capabilities`; a mismatch means the
-snapshot is stale relative to the server being talked to. Regenerate the
-bundled copy with:
+Pi Web UI generates `docs/contract/internal-api-client-snapshot.json` from its zod schemas and types; its drift test fails CI when a server schema changes without regeneration. This client validates its request builders and response parsers against that snapshot. Resolution order, in code, tests and here:
 
-```
+1. `PI_ORCH_SNAPSHOT_PATH`;
+2. `$PI_WEB_UI_REPO/docs/contract/internal-api-client-snapshot.json` when the variable is set (a set-but-unusable repo is a loud error);
+3. `~/pi-web-ui/docs/contract/internal-api-client-snapshot.json` when that checkout is present;
+4. the bundled copy in `contract/` — so the client's tests pass on a machine with no Pi Web UI checkout at all.
+
+At runtime the client compares the snapshot's `contractVersion` with live `/capabilities`; a mismatch surfaces `SNAPSHOT_STALE` on stderr (and in `--json`) without blocking the command. Refresh the bundled copy with:
+
+```bash
 cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 ```
 
@@ -183,14 +144,26 @@ cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 | 22 | `TEMPLATE_NOT_DELIVERED` | spawn: the goal completion-template follow-up failed both delivery attempts — the child holds only the pointer objective; re-send the template or re-dispatch |
 | 23 | `CREDENTIAL_IN_REPO` | a credential path (the Internal API token) resolves inside this repository; the token must come from outside the repo — point `PI_WEB_UI_TOKEN_PATH` at a path outside the package root |
 
+## Skill pack
+
+The agent skills that use this client — parent orchestration, long-horizon waiting, the child worker protocol — live in the public skill pack:
+**[https://github.com/valtterimelkko/agent-workflow-skills](https://github.com/valtterimelkko/agent-workflow-skills)** <!-- exact pack path added by the publisher -->
+
 ## Development
 
-```
-npm test        # node --test (Node >= 22.18 runs TS directly; no install needed)
+```bash
+npm test              # node --test; Node >= 22.18 runs the TS sources directly
+npm install           # devDependencies only (typescript, @types/node)
+npm run typecheck
 ```
 
-Typecheck (uses the host's TypeScript; this repo installs nothing):
+`AGENTS.md` (identical to `CLAUDE.md`) is the maintainer reference: layout, TDD, snapshot refresh, exit-code rules, the security rule and the release checklist.
 
-```
-node /root/pi-web-ui/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
-```
+## Licence
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Valtteri Melkko.
+
+## See also
+
+- **[Pi Web UI](https://github.com/valtterimelkko/pi-web-ui)** — the server this client talks to (MIT).
+- Public skill pack: [valtterimelkko/agent-workflow-skills](https://github.com/valtterimelkko/agent-workflow-skills).
