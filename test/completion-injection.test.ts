@@ -125,3 +125,50 @@ test('client.spawn without a goal: no follow-up (prompt template unaffected)', a
   await client.spawn({ runtime: 'pi', cwd: '/tmp/w' });
   assert.equal(calls.length, 1, 'only the create call');
 });
+
+// ─── C3b live-found race: the queued follow-up can fail mid-arm-turn ─────────
+
+test('client.spawn retries the template follow-up ONCE when the first delivery fails', async () => {
+  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  let followUpCount = 0;
+  const runReceipts: Record<string, Record<string, unknown>> = {};
+  const transport = {
+    request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
+      calls.push({ path, body: options.body ?? {} });
+      if (path === '/api/v1/sessions') return ok({ sessionId: 's-goal', retention: { leaseId: 'l1' }, goal: { armed: true } });
+      if (path.endsWith('/prompt')) {
+        followUpCount += 1;
+        const runId = `r-follow-${followUpCount}`;
+        // The FIRST delivery fails at runtime (Pi refused mid-arm-turn); the retry succeeds.
+        runReceipts[runId] = followUpCount === 1
+          ? { runId, status: 'failed', errorCode: 'RUNTIME_ERROR' }
+          : { runId, status: 'completed' };
+        return ok({ runId, sessionId: 's-goal', detached: true, dispatchMode: 'follow_up' });
+      }
+      const runId = path.split('/').pop() as string;
+      return ok(runReceipts[runId]);
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  assert.equal(followUpCount, 2, 'exactly one retry');
+  assert.equal((spawned as { templateFollowUpRunId?: string }).templateFollowUpRunId, 'r-follow-2');
+  assert.equal((spawned.raw as { __templateFollowUpRetried?: boolean }).__templateFollowUpRetried, true);
+  assert.equal((spawned.raw as { __templateFollowUpFirstRunId?: string }).__templateFollowUpFirstRunId, 'r-follow-1');
+});
+
+test('client.spawn does not retry when the first follow-up run is healthy', async () => {
+  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const transport = {
+    request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
+      calls.push({ path, body: options.body ?? {} });
+      if (path === '/api/v1/sessions') return ok({ sessionId: 's-goal', retention: {} });
+      if (path.endsWith('/prompt')) return ok({ runId: 'r-ok', sessionId: 's-goal', detached: true });
+      return ok({ runId: 'r-ok', status: 'completed' });
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship it' } });
+  assert.equal(calls.filter((call) => call.path.endsWith('/prompt')).length, 1);
+  assert.equal((spawned as { templateFollowUpRunId?: string }).templateFollowUpRunId, 'r-ok');
+});

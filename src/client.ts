@@ -36,6 +36,8 @@ export interface ClientConfig {
   randomId?: () => string;
   waitDeadlineMs?: number;
   waitSliceMs?: number;
+  /** C3b: delay before the goal-template follow-up health check (default 3000; tests inject small values). */
+  templateFollowUpCheckDelayMs?: number;
 }
 
 export class PiOrchClient {
@@ -44,6 +46,7 @@ export class PiOrchClient {
   private readonly randomId: () => string;
   private readonly waitDeadlineMs: number;
   private readonly waitSliceMs: number;
+  private readonly templateFollowUpCheckDelayMs: number;
 
   constructor(config: ClientConfig) {
     if (config.transportInstance === undefined && config.transport === undefined) {
@@ -54,6 +57,7 @@ export class PiOrchClient {
     this.randomId = config.randomId ?? defaultRandomId;
     this.waitDeadlineMs = config.waitDeadlineMs ?? 30 * 60_000;
     this.waitSliceMs = config.waitSliceMs ?? 45_000;
+    this.templateFollowUpCheckDelayMs = config.templateFollowUpCheckDelayMs ?? 3_000;
   }
 
   private headers(): Record<string, string> {
@@ -127,19 +131,8 @@ export class PiOrchClient {
     // busy arm turn and delivers after it — the C3a live-proven sequencing.
     let templateFollowUpRunId: string | undefined;
     if (input.goal && input.completionTemplate !== false) {
-      try {
-        const followUp = await this.prompt(sessionId, {
-          message: `Report instructions for your active goal (${input.goal.objective}):\n\n${COMPLETION_REPORT_INSTRUCTION}\n\nIf your goal is already complete, reply with the report block now. Otherwise keep working toward the goal and end your FINAL answer with the report block.`,
-          mode: 'follow_up',
-          idempotencyKey: `${this.randomId()}-tpl`,
-        });
-        templateFollowUpRunId = followUp.runId;
-      } catch (error) {
-        // The create stands; the parent can re-send the template itself. Named,
-        // never silent: the flag rides on the return value.
-        templateFollowUpRunId = undefined;
-        (raw as Record<string, unknown>).__templateFollowUpError = (error as Error).message;
-      }
+      const delivery = await this.deliverGoalTemplate(sessionId, input.goal.objective, raw);
+      templateFollowUpRunId = delivery;
     }
     return {
       sessionId,
@@ -191,6 +184,55 @@ export class PiOrchClient {
       dispatchMode: typeof raw.dispatchMode === 'string' ? raw.dispatchMode : undefined,
       raw,
     };
+  }
+
+  /**
+   * C3b: deliver the goal-template follow-up and verify it actually ran. A
+   * follow_up queued behind the arm turn can still be refused at delivery
+   * (live: RUNTIME_ERROR, 'Agent is already processing a prompt' — the C3a
+   * round-2 shape), so after a bounded settle the run's receipt is read ONCE;
+   * a failed/terminal-bad delivery is retried exactly once after a further
+   * settle. Named, never silent: attempts and failures ride on `raw`.
+   */
+  private async deliverGoalTemplate(sessionId: string, objective: string, raw: Record<string, unknown>): Promise<string | undefined> {
+    const send = async (suffix: string): Promise<{ runId: string } | { error: string }> => {
+      try {
+        const followUp = await this.prompt(sessionId, {
+          message: `Report instructions for your active goal (${objective}):\n\n${COMPLETION_REPORT_INSTRUCTION}\n\nIf your goal is already complete, reply with the report block now. Otherwise keep working toward the goal and end your FINAL answer with the report block.`,
+          mode: 'follow_up',
+          idempotencyKey: `${this.randomId()}-tpl${suffix}`,
+        });
+        return { runId: followUp.runId };
+      } catch (error) {
+        return { error: (error as Error).message };
+      }
+    };
+    const sleep = (ms: number): Promise<void> => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+    const first = await send('');
+    if ('error' in first) {
+      (raw as Record<string, unknown>).__templateFollowUpError = first.error;
+      return undefined;
+    }
+    const firstRunId = first.runId;
+    await sleep(this.templateFollowUpCheckDelayMs);
+    let health: 'unknown' | 'ok' | 'failed' = 'unknown';
+    try {
+      const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(firstRunId)}`, { headers: this.headers() });
+      const receipt = response.body as { status?: string };
+      health = receipt.status === undefined || receipt.status === 'completed' || receipt.status === 'started' ? 'ok' : 'failed';
+    } catch {
+      health = 'unknown'; // unreadable receipt: report the runId, no retry theatre
+    }
+    if (health !== 'failed') return firstRunId;
+    (raw as Record<string, unknown>).__templateFollowUpFirstRunId = firstRunId;
+    await sleep(this.templateFollowUpCheckDelayMs);
+    const retry = await send('-retry');
+    (raw as Record<string, unknown>).__templateFollowUpRetried = true;
+    if ('error' in retry) {
+      (raw as Record<string, unknown>).__templateFollowUpError = retry.error;
+      return firstRunId;
+    }
+    return retry.runId;
   }
 
   async registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; raw: unknown }> {
