@@ -1,8 +1,26 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PiOrchClient } from '../src/client.ts';
+import { PiOrchClient, defaultConditions } from '../src/client.ts';
 import { ApiError } from '../src/parsers.ts';
 import type { TransportResponse } from '../src/transport.ts';
+
+test('defaultConditions: goal children get goal_end+paused+deadline and NO per-turn agent_end', () => {
+  // goals.md: a per-turn agent_end on a goal-armed child fires at every turn
+  // boundary, producing false wakes that read like completion — the wait must
+  // not carry one (the real-parent proof hit exactly this: the goal-start
+  // turn's agent_end ended the wait before the work was done).
+  const goal = defaultConditions('Do the bounded thing', 300_000);
+  assert.equal(goal.some((condition) => condition.eventType === 'agent_end'), false);
+  assert.deepEqual(
+    goal.filter((condition) => condition.type !== 'deadline').map((condition) => condition.eventType),
+    ['goal_end', 'goal_state'],
+  );
+  const plain = defaultConditions(undefined, 300_000);
+  assert.deepEqual(
+    plain.map((condition) => condition.eventType ?? 'deadline'),
+    ['agent_end', 'deadline'],
+  );
+});
 
 /**
  * Live-found race (C1 proof, 2026-09-29): a create-time goal arms a detached
