@@ -316,6 +316,71 @@ test('wait-for-slot: exits with the deadline error when nothing settles in time'
   assert.equal(created(calls), 0, 'never created');
 });
 
+test('wait-for-slot: leaves no leftover watch on the children it watched (the parent must be able to wait on them next)', async () => {
+  // Live-found (G1 proof, 2026-09-30): the slot-wait registered agent_end+
+  // deadline watches on BOTH busy children; the winner's watch fired, the
+  // loser's lingered, and the parent's own later wait on the loser hit
+  // WATCH_CONFLICT (exit 19) — the client never replaces foreign-shaped
+  // watches. The slot-wait must clean up the watches it created itself.
+  let live = true;
+  const fluctuating: FakeChild = { sessionId: 'c1', model: ZAI };
+  const { transport, calls } = fakeTransport({
+    children: [fluctuating],
+    longPoll: async () => {
+      live = false;
+      return { fired: true };
+    },
+  });
+  Object.defineProperties(fluctuating, {
+    busy: { get: () => live },
+    lastRunStatus: { get: () => (live ? 'started' : 'completed') },
+  });
+  const client = gateClient(transport, { parentSessionId: 'parent-1', routeLimits: { [ZAI]: 1 } });
+  await client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, waitForSlotMs: 60_000 });
+  assert.equal(created(calls), 1);
+  const watchDeletes = calls.filter((call) => call.method === 'DELETE' && call.path.endsWith('/watch'));
+  assert.ok(watchDeletes.length >= 1, 'the slot-wait deleted the watch it created on the settled child');
+});
+
+test('wait-for-slot: never deletes a pre-existing watch; refuses when nothing is watchable', async () => {
+  let live = true;
+  const fluctuating: FakeChild = { sessionId: 'c1', model: ZAI };
+  let watchState: Record<string, unknown> | null = { watchId: 'w-pre', status: 'active', conditions: [] };
+  const { transport } = fakeTransport({
+    children: [fluctuating],
+    longPoll: async () => {
+      live = false;
+      return { fired: true };
+    },
+  });
+  Object.defineProperties(fluctuating, {
+    busy: { get: () => live },
+    lastRunStatus: { get: () => (live ? 'started' : 'completed') },
+  });
+  const raw = transport as { request: (m: string, p: string, o?: { body?: Record<string, unknown> }) => Promise<TransportResponse> };
+  const inner = raw.request.bind(raw);
+  (raw as { request: unknown }).request = async (method: string, path: string, options?: { body?: Record<string, unknown> }) => {
+    if (method === 'GET' && path.endsWith('/watch')) return ok(watchState as never);
+    if (method === 'DELETE' && path.endsWith('/watch')) {
+      throw new Error('pre-existing watch must not be deleted');
+    }
+    return inner(method, path, options);
+  };
+  const client = gateClient(transport, { parentSessionId: 'parent-1', routeLimits: { [ZAI]: 1 } });
+  // The only live child has an incompatible (foreign) watch: there is nothing
+  // watchable to wait on, so the client refuses instead of waiting out the
+  // clock — and the pre-existing watch survives untouched.
+  await assert.rejects(
+    client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, waitForSlotMs: 60_000 }),
+    (error: unknown) => {
+      assert.ok(error instanceof RouteLimitError);
+      assert.equal(error.code, 'ROUTE_LIMIT_EXCEEDED');
+      return true;
+    },
+  );
+  assert.ok(watchState !== null, 'the pre-existing watch survives the slot wait');
+});
+
 // ── identity: warn once and proceed ──────────────────────────────────────────
 
 test('no identity and no owner: warns once and proceeds unlimited', async () => {

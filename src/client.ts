@@ -174,6 +174,11 @@ export class PiOrchClient {
    * G1 --wait-for-slot: wait for one live child on the route to settle via
    * the existing watch-based wait (no polling, no sleep), then re-check;
    * bounded by the caller's deadline.
+   *
+   * Watches the wait creates are removed again afterwards: a leftover
+   * slot-watch would count as a foreign, incompatible watch for the parent's
+   * own later wait on that child (live-found in the G1 proof: wait exit 19).
+   * Only watches that did not exist before the wait are ours to remove.
    */
   private async waitForRouteSlot(route: string, limit: number, owner: string | undefined, waitForSlotMs: number): Promise<void> {
     const deadline = Date.now() + waitForSlotMs;
@@ -182,7 +187,17 @@ export class PiOrchClient {
       if (countedBy === 'none' || count < limit) return;
       const remaining = deadline - Date.now();
       if (remaining <= 0) throw new RouteLimitWaitDeadlineError(route, limit, waitForSlotMs);
-      await this.waitMany({ mode: 'any', children: live.map((entry) => ({ sessionId: entry.sessionId })), deadlineMs: remaining });
+      const watchBefore = await Promise.all(live.map((entry) => this.getWatch(entry.sessionId).catch(() => null)));
+      const oursToClean = live.filter((_, index) => watchBefore[index] === null).map((entry) => entry.sessionId);
+      const waited = await this.waitMany({ mode: 'any', children: live.map((entry) => ({ sessionId: entry.sessionId })), deadlineMs: remaining });
+      await Promise.all(oursToClean.map((sessionId) => this.deleteWatch(sessionId).catch(() => undefined)));
+      const kinds = waited.children.map((child) => child.outcome?.kind);
+      if (kinds.length > 0 && kinds.every((kind) => kind === 'watch_conflict' || kind === 'session_not_found')) {
+        // Every live child carries an unremovable foreign watch (or is gone):
+        // there is no watchable settle to wait for. Refuse with the normal
+        // over-limit error so the caller can act now.
+        throw new RouteLimitError(route, limit, live);
+      }
       // loop: re-count — the settled child drops out of the live set
     }
   }
