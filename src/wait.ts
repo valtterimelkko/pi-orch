@@ -179,17 +179,21 @@ export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
   }
 }
 
-/** Semantic condition shape for compatibility (ids are caller-chosen; ignored). */
+/** Semantic condition shape for compatibility: EVERY behaviour-affecting field (correction 05 item 1); ids and labels are the only ignored values. */
 function conditionShape(condition: WatchConditionSpec): Record<string, unknown> {
   return {
     type: condition.type,
     ...(condition.eventType !== undefined ? { eventType: condition.eventType } : {}),
     ...(condition.dataMatch !== undefined ? { dataMatch: condition.dataMatch } : {}),
-    ...(condition.contains !== undefined ? { contains: condition.contains } : {}),
     ...(condition.toolName !== undefined ? { toolName: condition.toolName } : {}),
     ...(condition.phase !== undefined ? { phase: condition.phase } : {}),
     ...(condition.argIncludes !== undefined ? { argIncludes: condition.argIncludes } : {}),
+    ...(condition.contains !== undefined ? { contains: condition.contains } : {}),
+    ...(condition.pattern !== undefined ? { pattern: condition.pattern } : {}),
+    ...(condition.patternFlags !== undefined ? { patternFlags: condition.patternFlags } : {}),
+    ...(condition.source !== undefined ? { source: condition.source } : {}),
     ...(condition.afterSeconds !== undefined ? { afterSeconds: condition.afterSeconds } : {}),
+    ...(condition.once !== undefined ? { once: condition.once } : {}),
   };
 }
 
@@ -321,10 +325,17 @@ async function reconcileReceipt(
     const last = evidence.runs[0];
     if (!last || !last.status) return null;
     if (['completed', 'failed', 'cancelled', 'interrupted'].includes(last.status)) {
-      return fromClassification(
+      const classified = fromClassification(
         classifyReceipt({ runId: last.runId ?? 'unknown', sessionId: options.sessionId, status: last.status, errorCode: last.errorCode }),
         last.runId ? ({ runId: last.runId, sessionId: options.sessionId, status: last.status, errorCode: last.errorCode } as Receipt) : undefined,
       );
+      // Correction 05 item 2: the run-less path applies the same goal
+      // settlement as the run-id path — an objective-armed wait does not
+      // complete on a terminal last run while the goal is unsettled.
+      if (classified?.kind === 'completed' && options.objective) {
+        return await settledGoalOutcome(options.sessionId, deps) ?? null;
+      }
+      return classified;
     }
     return null;
   } catch {
@@ -579,10 +590,15 @@ async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps, objective
     const last = evidence.runs[0];
     if (!last || !last.status) return null;
     if (['completed', 'failed', 'cancelled', 'interrupted'].includes(last.status)) {
-      return fromClassification(
+      const classified = fromClassification(
         classifyReceipt({ runId: last.runId ?? 'unknown', sessionId: child.sessionId, status: last.status, errorCode: last.errorCode }),
         last.runId ? ({ runId: last.runId, sessionId: child.sessionId, status: last.status, errorCode: last.errorCode } as Receipt) : undefined,
       );
+      // Correction 05 item 2: same settlement for the multi-child path.
+      if (classified?.kind === 'completed' && objective) {
+        return await settledGoalOutcome(child.sessionId, deps) ?? null;
+      }
+      return classified;
     }
     return null;
   } catch {
