@@ -58,4 +58,11 @@ export {
   type CompletionLoad,
 } from './verify.ts';
 export { Transport, TransportError, readToken, parseRetryAfter } from './transport.ts';
+export {
+  CredentialPathError,
+  CREDENTIAL_IN_REPO_EXIT_CODE,
+  assertCredentialPathOutsideRepo,
+  isInsideRepo,
+  packageRoot,
+} from './credentials.ts';
 export { runCli, main, type CliDeps, type CliResult, type ClientLike } from './cli.ts';

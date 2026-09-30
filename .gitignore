@@ -1,3 +1,12 @@
+# Local artefacts and credentials — belt and braces ONLY.
+# The real protection is outside .gitignore: the client refuses to read a
+# credential (the Internal API token) from a path inside this repository tree
+# (CREDENTIAL_IN_REPO, exit code 23). See README.md, "Security model".
 node_modules/
 test-results/
 *.log
+.env
+.env.*
+*.token
+internal-api-token*
+*.sock

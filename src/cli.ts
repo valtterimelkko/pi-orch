@@ -179,7 +179,8 @@ Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interr
   10 admission refused · 11 preflight failed · 12 refused busy · 14 prompt not
   executed · 15 turn stalled · 16 wait target not found · 17 goal cleared
   18 create unknown · 19 watch conflict · 20 verify contradicted
-  21 verify unverifiable · 22 template not delivered. Full table: README.md
+  21 verify unverifiable · 22 template not delivered · 23 credential in repo.
+  Full table: README.md
 `;
 
 export async function runCli(argv: string[], deps: CliDeps): Promise<CliResult> {

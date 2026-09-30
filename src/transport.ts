@@ -13,6 +13,7 @@
 import { request } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { ApiError, parseApiError } from './parsers.ts';
+import { assertCredentialPathOutsideRepo } from './credentials.ts';
 
 export interface TransportConfig {
   socketPath?: string;
@@ -183,6 +184,9 @@ export function parseRetryAfter(headerValue: string | string[] | undefined): num
 }
 
 export function readToken(tokenPath: string): string {
+  // Public-repo guard: a token path inside this repository is refused before
+  // any read (typed CREDENTIAL_IN_REPO refusal, exit code 23).
+  assertCredentialPathOutsideRepo(tokenPath);
   try {
     return readFileSync(tokenPath, 'utf8').trim();
   } catch (error) {

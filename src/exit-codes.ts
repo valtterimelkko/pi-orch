@@ -39,6 +39,7 @@ export const EXIT_CODES: readonly ExitCodeEntry[] = [
   { code: 20, name: 'VERIFY_CONTRADICTED', meaning: 'verify found at least one claim contradicted by the filesystem (missing sha, wrong repo, file with no evidence, failed parent-named rerun) — the block lies somewhere' },
   { code: 21, name: 'VERIFY_UNVERIFIABLE', meaning: 'verify could not establish the claims: no completion captured, a typed parse error, an unsafe/absolute path, nothing independently checkable, or the named run belongs to another session' },
   { code: 22, name: 'TEMPLATE_NOT_DELIVERED', meaning: 'spawn: the goal completion-template follow-up failed both delivery attempts — the child holds only the pointer objective, not the full report instructions. Re-send the template or re-dispatch' },
+  { code: 23, name: 'CREDENTIAL_IN_REPO', meaning: 'A credential path (the Internal API token) resolves inside this repository; the token must come from outside the repo — point PI_WEB_UI_TOKEN_PATH at a path outside the package root' },
 ];
 
 export const OUTCOME_EXIT_CODES: Record<string, number> = {
@@ -65,6 +66,7 @@ export const OUTCOME_EXIT_CODES: Record<string, number> = {
 
 /** Server error codes that map to a specific exit (others fall back to 1/4/12). */
 export const ERROR_CODE_EXIT_CODES: Record<string, number> = {
+  CREDENTIAL_IN_REPO: 23,
   PREFLIGHT_FAILED: 11,
   SESSION_BUSY: 12,
   SESSION_NOT_STREAMING: 12,
