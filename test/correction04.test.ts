@@ -398,3 +398,63 @@ test('correction04: new outcome kinds are exhaustively mapped', () => {
     assert.ok(exitCodeFor({ kind }) >= 0, `${kind} has an exit code`);
   }
 });
+
+// ─── Item 11 (run-5 lesson): an objective-armed wait settles on the GOAL outcome ──
+
+test('correction04/11: with an objective, a completed brief-run receipt does NOT end the wait while the goal is unsettled', async () => {
+  const { deps, state } = makeDeps();
+  // The brief run completed, but the goal engine has not verified yet.
+  state.receipts.set('r1', { runId: 'r1', sessionId: 'child', runtime: 'pi', status: 'completed', acceptedAt: 't' });
+  state.goals.set('child', { supported: true, status: 'running' });
+  let call = 0;
+  const outcome = await waitOnChild({
+    sessionId: 'child',
+    runId: 'r1',
+    objective: 'Do the bounded thing',
+    deadlineMs: 600_000,
+    sliceMs: 5_000,
+    deps: {
+      ...deps,
+      async longPoll(input) {
+        call += 1;
+        if (call === 1) {
+          // The goal engine verifies and fires goal_end on the second slice.
+          state.goals.set('child', { supported: true, status: 'achieved' });
+          return { kind: 'fired', body: firingBody([{ conditionId: 'outcome', firedAt: 1, eventType: 'goal_end', evidence: 'achieved' }], 1, 'cg') };
+        }
+        return { kind: 'timeout' };
+      },
+    },
+  });
+  assert.equal(outcome.kind, 'goal_achieved', `an objective-armed wait must settle on the goal outcome, got ${outcome.kind}`);
+});
+
+test('correction04/11: with an objective, a completed receipt plus an achieved projection classifies immediately', async () => {
+  const { deps, state } = makeDeps();
+  state.receipts.set('r1', { runId: 'r1', sessionId: 'child', runtime: 'pi', status: 'completed', acceptedAt: 't' });
+  state.goals.set('child', { supported: true, status: 'achieved' });
+  const outcome = await waitOnChild({
+    sessionId: 'child',
+    runId: 'r1',
+    objective: 'Do the bounded thing',
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps,
+  });
+  assert.equal(outcome.kind, 'goal_achieved');
+  assert.equal(state.longPollCalls, 0, 'settled in preflight — no poll needed');
+});
+
+test('correction04/11: without an objective, a completed receipt still completes immediately (plain children unchanged)', async () => {
+  const { deps, state } = makeDeps();
+  state.receipts.set('r1', { runId: 'r1', sessionId: 'child', runtime: 'pi', status: 'completed', acceptedAt: 't' });
+  const outcome = await waitOnChild({
+    sessionId: 'child',
+    runId: 'r1',
+    conditions: [agentEnd()],
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps,
+  });
+  assert.equal(outcome.kind, 'completed');
+});

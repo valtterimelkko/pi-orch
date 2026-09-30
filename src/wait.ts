@@ -53,7 +53,7 @@ export type WaitOutcome =
 export interface WaitOptions {
   sessionId: string;
   runId?: string;
-  conditions: WatchConditionSpec[];
+  conditions?: WatchConditionSpec[];
   objective?: string;
   /** Overall deadline in ms (client-side). */
   deadlineMs: number;
@@ -76,7 +76,7 @@ const RECOVERY_BACKOFF_MS = 1_000;
  * already-terminal receipt returns its classified outcome immediately.
  */
 async function preflightWait(
-  child: { sessionId: string; runId?: string },
+  child: { sessionId: string; runId?: string; objective?: string },
   deps: WaitDeps,
 ): Promise<WaitOutcome | null> {
   try {
@@ -96,7 +96,16 @@ async function preflightWait(
         note: `mismatch: run ${child.runId} belongs to session ${receipt.sessionId}, not ${child.sessionId}`,
       };
     }
-    return fromClassification(classifyReceipt(receipt), receipt);
+    const classified = fromClassification(classifyReceipt(receipt), receipt);
+    // Correction 04 (run-5 lesson): an OBJECTIVE-ARMED wait does not complete
+    // on the brief run's receipt while the goal is unsettled — the classified
+    // goal outcome is the result (goals.md: prefer goal_end).
+    if (classified?.kind === 'completed' && child.objective) {
+      const settled = await settledGoalOutcome(child.sessionId, deps);
+      if (settled) return settled;
+      return null; // goal unsettled: fall through into the watch loop
+    }
+    return classified;
   } catch (error) {
     const status = (error as { status?: number }).status;
     const code = (error as { code?: string }).code;
@@ -109,13 +118,14 @@ async function preflightWait(
 
 export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
   const { deps } = options;
-  const fast = await preflightWait({ sessionId: options.sessionId, runId: options.runId }, deps);
+  const fast = await preflightWait({ sessionId: options.sessionId, runId: options.runId, objective: options.objective }, deps);
   if (fast) return fast;
   const sliceMs = Math.min(options.sliceMs ?? 45_000, MAX_SLICE_MS);
   const start = deps.now();
-  const conditionsById = new Map(options.conditions.flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
+  const conditions = options.conditions ?? defaultConditions(options.objective, options.deadlineMs);
+  const conditionsById = new Map(conditions.flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
 
-  let watch = await registerOrReuse(options.sessionId, options.conditions, options.label, deps);
+  let watch = await registerOrReuse(options.sessionId, conditions, options.label, deps);
   if (watch.conflict) return { kind: 'watch_conflict', note: watch.conflict };
   let watchId = watch.watchId as string;
   let cursor: string | undefined = undefined; // fresh ledger view on first registration
@@ -142,7 +152,7 @@ export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
       await deps.sleep(RECOVERY_BACKOFF_MS);
       const existing = await deps.getWatch(options.sessionId).catch(() => null);
       if (!existing || existing.status === 'detached') {
-        watch = await registerOrReuse(options.sessionId, options.conditions, options.label, deps, true);
+        watch = await registerOrReuse(options.sessionId, conditions, options.label, deps, true);
         if (watch.conflict) return { kind: 'watch_conflict', note: watch.conflict };
         watchId = watch.watchId as string;
         cursor = undefined; // new ledger: start at 0 so a reconciled firing is seen
@@ -297,7 +307,15 @@ async function reconcileReceipt(
   try {
     if (options.runId) {
       const receipt = await deps.getReceipt(options.runId);
-      return fromClassification(classifyReceipt(receipt), receipt);
+      const classified = fromClassification(classifyReceipt(receipt), receipt);
+      // Correction 04 (run-5 lesson): for an OBJECTIVE-ARMED wait, the brief
+      // run's completion is not the goal outcome (goals.md: prefer goal_end).
+      // While the projection is still unsettled, keep waiting for the
+      // classified goal result; when it is settled, return it classified.
+      if (classified?.kind === 'completed' && options.objective) {
+        return await settledGoalOutcome(options.sessionId, deps) ?? null;
+      }
+      return classified;
     }
     const evidence = await deps.getSessionEvidence(options.sessionId);
     const last = evidence.runs[0];
@@ -311,6 +329,27 @@ async function reconcileReceipt(
     return null;
   } catch {
     return null; // reconciliation is best-effort; the long poll remains the wake source
+  }
+}
+
+/** Read the live projection and classify it; null when the goal is still unsettled. */
+async function settledGoalOutcome(sessionId: string, deps: WaitDeps): Promise<WaitOutcome | null> {
+  try {
+    const goal = await deps.getGoal(sessionId);
+    switch (goal.status) {
+      case 'achieved':
+        return { kind: 'goal_achieved', note: 'classified from the goal projection' };
+      case 'failed':
+        return { kind: 'goal_failed', note: `classified from the goal projection (failed: ${goal.pausedReason ?? goal.lastReason ?? 'reason unknown'})` };
+      case 'cleared':
+        return { kind: 'goal_cleared', note: 'classified from the goal projection (cleared — not achieved)' };
+      case 'paused':
+        return { kind: 'paused', note: `classified from the goal projection (paused: ${goal.pausedReason ?? 'reason unknown'})` };
+      default:
+        return null; // running / wrapping_up / unknown: keep waiting
+    }
+  } catch {
+    return null; // projection unreadable: keep waiting (deadline backstop bounds this)
   }
 }
 
@@ -373,7 +412,7 @@ export async function waitOnChildren(options: {
 
   // Fast-fail preflight per child.
   for (const [index, child] of options.children.entries()) {
-    const fast = await preflightWait(child, deps);
+    const fast = await preflightWait({ ...child, objective: options.objective }, deps);
     if (fast) results.set(index, fast);
   }
   const exitCodeForChild = (outcome: WaitOutcome | undefined): number =>
@@ -466,7 +505,7 @@ export async function waitOnChildren(options: {
       for (const [index] of [...unsettled.entries()]) {
         const child = options.children[index];
         if (!child) continue;
-        const outcome = await reconcileChildReceipt(child, deps);
+        const outcome = await reconcileChildReceipt(child, deps, options.objective);
         if (outcome) {
           results.set(index, outcome);
           unsettled.delete(index);
@@ -526,11 +565,15 @@ async function firingOutcome(
   return null;
 }
 
-async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps): Promise<WaitOutcome | null> {
+async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps, objective?: string): Promise<WaitOutcome | null> {
   try {
     if (child.runId) {
       const receipt = await deps.getReceipt(child.runId);
-      return fromClassification(classifyReceipt(receipt), receipt);
+      const classified = fromClassification(classifyReceipt(receipt), receipt);
+      if (classified?.kind === 'completed' && objective) {
+        return await settledGoalOutcome(child.sessionId, deps) ?? null;
+      }
+      return classified;
     }
     const evidence = await deps.getSessionEvidence(child.sessionId);
     const last = evidence.runs[0];
