@@ -230,3 +230,88 @@ test('missing required flags are usage errors', async () => {
   assert.equal(result.exitCode, 2);
   assert.ok((result.stderr ?? '').includes('--cwd'));
 });
+
+// ─── Correction 01 item 3: scripting ergonomics ─────────────────────────────
+
+test('--id-only prints exactly the sessionId for spawn and the runId for prompt', async () => {
+  const spawn = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w1', '--id-only'],
+    fakeDeps({
+      client: () => ({
+        async spawn() {
+          return { sessionId: 'sess-only', leaseId: 'l1' };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(spawn.exitCode, 0);
+  assert.equal(spawn.stdout?.trim(), 'sess-only');
+
+  const prompt = await runCli(
+    ['prompt', 'sess-only', '--message', 'go', '--id-only'],
+    fakeDeps({
+      client: () => ({
+        async prompt() {
+          return { runId: 'run-only', sessionId: 'sess-only', detached: true, duplicate: false };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(prompt.exitCode, 0);
+  assert.equal(prompt.stdout?.trim(), 'run-only');
+});
+
+test('help tells models to use --json or --id-only, never human output', async () => {
+  const result = await runCli(['help'], fakeDeps());
+  const help = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+  assert.ok(help.includes('--id-only'));
+  assert.ok(help.includes('never parse the human-readable output'));
+});
+
+test('wait --all waits several children in one call and reports per-child outcomes', async () => {
+  const waits: Array<{ ids: string[] }> = [];
+  const result = await runCli(
+    ['wait', '--all', 'c1@r1', 'c2@r2', '--deadline', '30', '--json'],
+    fakeDeps({
+      client: () => ({
+        async waitMany(options: { mode: string; children: Array<{ sessionId: string; runId?: string }> }) {
+          waits.push({ ids: options.children.map((child) => child.sessionId) });
+          assert.equal(options.mode, 'all');
+          return {
+            mode: 'all',
+            children: [
+              { sessionId: 'c1', runId: 'r1', outcome: { kind: 'completed' } },
+              { sessionId: 'c2', runId: 'r2', outcome: { kind: 'completed' } },
+            ],
+            exitCode: 0,
+          };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(waits[0]?.ids, ['c1', 'c2']);
+  const parsed = JSON.parse(result.stdout ?? '{}') as { children: Array<{ sessionId: string }> };
+  assert.equal(parsed.children.length, 2);
+});
+
+test('wait --any returns the first settled child and its exit code', async () => {
+  const result = await runCli(
+    ['wait', '--any', 'c1@r1', 'c2@r2', '--json'],
+    fakeDeps({
+      client: () => ({
+        async waitMany() {
+          return {
+            mode: 'any',
+            children: [{ sessionId: 'c2', runId: 'r2', outcome: { kind: 'never_started' } }],
+            exitCode: 6,
+          };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(result.exitCode, 6);
+  const parsed = JSON.parse(result.stdout ?? '{}') as { mode: string; children: Array<{ sessionId: string }> };
+  assert.equal(parsed.mode, 'any');
+  assert.equal(parsed.children[0]?.sessionId, 'c2');
+});

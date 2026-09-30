@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { waitOnChild, type WaitDeps, type WaitOutcome } from '../src/wait.ts';
+import { waitOnChild, waitOnChildren, type WaitDeps, type WaitOutcome } from '../src/wait.ts';
 import { agentEnd, goalEnd, goalPaused } from '../src/builders.ts';
 import type { Receipt } from '../src/parsers.ts';
 
@@ -44,6 +44,9 @@ function makeDeps(script: Array<(state: DepsState) => Promise<void>> = []): { de
         return { kind: 'fired' as const, body: firing };
       }
       return { kind: 'timeout' as const };
+    },
+    async getSession(sessionId) {
+      return { sessionId, status: 'running' };
     },
     async getReceipt(runId) {
       state.receiptChecks += 1;
@@ -118,7 +121,7 @@ const receiptNeverStarted = {
 
 test('agent_end firing then terminal receipt completes the wait', async () => {
   const { deps, state } = makeDeps();
-  state.receipts.set('run-1', receiptCompleted);
+  state.receipts.set('run-1', { runId: 'run-1', sessionId: 'child', runtime: 'pi', status: 'started', acceptedAt: 't' });
   const outcome = await waitOnChild({
     sessionId: 'child',
     runId: 'run-1',
@@ -131,6 +134,7 @@ test('agent_end firing then terminal receipt completes the wait', async () => {
         state.longPollCalls += 1;
         state.cursors.push(input.cursor);
         if (state.longPollCalls === 1) {
+          state.receipts.set('run-1', receiptCompleted);
           return { kind: 'fired', body: firingBody([{ conditionId: 'done', firedAt: 1, eventType: 'agent_end', evidence: 'end' }], 1, 'c1') };
         }
         return { kind: 'timeout' };
@@ -168,7 +172,7 @@ test('RUN_TRANSPORT_LOST is a distinct outcome', async () => {
 
 test('a transport reset mid-wait reconnects, preserves the cursor when the watch survives, then completes', async () => {
   const { deps, state } = makeDeps();
-  state.receipts.set('run-1', receiptCompleted);
+  state.receipts.set('run-1', { runId: 'run-1', sessionId: 'child', runtime: 'pi', status: 'started', acceptedAt: 't' });
   let call = 0;
   const outcome = await waitOnChild({
     sessionId: 'child',
@@ -193,6 +197,7 @@ test('a transport reset mid-wait reconnects, preserves the cursor when the watch
         }
         if (call === 2) throw new Error('socket hang up (ECONNRESET)');
         if (call === 3) {
+          state.receipts.set('run-1', receiptCompleted);
           return { kind: 'fired', body: firingBody([{ conditionId: 'done', firedAt: 2, eventType: 'agent_end', evidence: 'end' }], 2, 'c9') };
         }
         return { kind: 'timeout' };
@@ -206,7 +211,7 @@ test('a transport reset mid-wait reconnects, preserves the cursor when the watch
 
 test('a lost watch after restart is re-registered with fireIfSettled and the cursor resets', async () => {
   const { deps, state } = makeDeps();
-  state.receipts.set('run-1', receiptCompleted);
+  state.receipts.set('run-1', { runId: 'run-1', sessionId: 'child', runtime: 'pi', status: 'started', acceptedAt: 't' });
   let call = 0;
   const outcome = await waitOnChild({
     sessionId: 'child',
@@ -220,6 +225,7 @@ test('a lost watch after restart is re-registered with fireIfSettled and the cur
         call += 1;
         if (call === 1) throw new Error('WATCH_NOT_FOUND');
         if (call === 2) {
+          state.receipts.set('run-1', receiptCompleted);
           return { kind: 'fired', body: firingBody([{ conditionId: 'done', firedAt: 3, eventType: 'agent_end', evidence: 'reconciled' }], 1, 'c7') };
         }
         return { kind: 'timeout' };
@@ -334,8 +340,129 @@ test('wait outcome kinds are exhaustively mapped in the exit-code table', async 
     'completed', 'failed', 'never_started', 'budget_exceeded', 'transport_lost',
     'prompt_not_executed', 'turn_stalled', 'interrupted', 'cancelled', 'paused',
     'question', 'goal_achieved', 'goal_failed', 'deadline',
+    'run_not_found', 'session_not_found',
   ];
   for (const kind of kinds) {
     assert.ok(kind in OUTCOME_EXIT_CODES, `outcome '${kind}' has no exit code`);
   }
+});
+
+// ─── Correction 01 item 2: wait fails fast on a run it cannot find ──────────
+
+test('correction 01: wait --run-id with an unknown run fails fast (no watch, no long poll)', async () => {
+  const { deps, state } = makeDeps();
+  const outcome = await waitOnChild({
+    sessionId: 'child',
+    runId: 'run-missing',
+    conditions: [agentEnd()],
+    deadlineMs: 600_000,
+    sliceMs: 5_000,
+    deps: {
+      ...deps,
+      async getReceipt() {
+        const error = new Error('run not found') as Error & { status?: number; code?: string };
+        error.status = 404;
+        error.code = 'RUN_NOT_FOUND';
+        throw error;
+      },
+      async getSession() {
+        return { sessionId: 'child', status: 'idle' };
+      },
+    },
+  });
+  assert.equal(outcome.kind, 'run_not_found');
+  assert.equal(state.registrations, 0, 'no watch registered');
+  assert.equal(state.longPollCalls, 0, 'no long poll started');
+});
+
+test('correction 01: wait with an already-terminal receipt returns its outcome immediately', async () => {
+  const { deps, state } = makeDeps();
+  state.receipts.set('run-1', receiptCompleted);
+  const outcome = await waitOnChild({
+    sessionId: 'child',
+    runId: 'run-1',
+    conditions: [agentEnd()],
+    deadlineMs: 600_000,
+    sliceMs: 5_000,
+    deps: {
+      ...deps,
+      async getSession() {
+        return { sessionId: 'child', status: 'idle' };
+      },
+    },
+  });
+  assert.equal(outcome.kind, 'completed');
+  assert.equal(state.registrations, 0);
+  assert.equal(state.longPollCalls, 0);
+});
+
+test('correction 01: wait on a session that does not exist fails fast', async () => {
+  const { deps, state } = makeDeps();
+  const outcome = await waitOnChild({
+    sessionId: 'nope',
+    conditions: [agentEnd()],
+    deadlineMs: 600_000,
+    sliceMs: 5_000,
+    deps: {
+      ...deps,
+      async getSession() {
+        return null; // 404
+      },
+    },
+  });
+  assert.equal(outcome.kind, 'session_not_found');
+  assert.equal(state.registrations, 0);
+  assert.equal(state.longPollCalls, 0);
+});
+
+// ─── Correction 01 item 3: wait on several children in one call ─────────────
+
+test('waitOnChildren --all settles every child and reports per-child outcomes', async () => {
+  const { deps, state } = makeDeps();
+  state.receipts.set('r1', receiptCompleted);
+  state.receipts.set('r2', { ...receiptCompleted, runId: 'r2', errorCode: 'RUN_BUDGET_EXCEEDED', status: 'failed' });
+  // Both children already terminal: everything settles in preflight, no polls.
+  const result = await waitOnChildren({
+    mode: 'all',
+    children: [
+      { sessionId: 'c1', runId: 'r1' },
+      { sessionId: 'c2', runId: 'r2' },
+    ],
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps: { ...deps, async getSession() { return { sessionId: 'x', status: 'idle' }; } },
+  });
+  assert.equal(result.mode, 'all');
+  const outcomes = result.children.map((child) => child.outcome?.kind);
+  assert.deepEqual(outcomes, ['completed', 'budget_exceeded']);
+  assert.equal(result.exitCode > 0, true, 'a failed child makes the all-wait nonzero');
+});
+
+test('waitOnChildren --any returns the first child to settle', async () => {
+  const { deps, state } = makeDeps();
+  state.receipts.set('r2', { runId: 'r2', sessionId: 'c2', runtime: 'pi', status: 'completed', acceptedAt: 't' });
+  // c1 has no receipt (stays running); c2 is terminal in preflight.
+  const result = await waitOnChildren({
+    mode: 'any',
+    children: [
+      { sessionId: 'c1', runId: 'r9' },
+      { sessionId: 'c2', runId: 'r2' },
+    ],
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps: {
+      ...deps,
+      async getSession() { return { sessionId: 'x', status: 'idle' }; },
+      async getReceipt(runId) {
+        if (runId === 'r9') {
+          return { runId: 'r9', sessionId: 'c1', runtime: 'pi', status: 'started', acceptedAt: 't' };
+        }
+        return state.receipts.get(runId) as Receipt;
+      },
+    },
+  });
+  assert.equal(result.mode, 'any');
+  assert.equal(result.children.length, 1);
+  assert.equal(result.children[0]?.sessionId, 'c2');
+  assert.equal(result.children[0]?.outcome?.kind, 'completed');
 });

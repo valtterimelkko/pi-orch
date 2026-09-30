@@ -163,6 +163,24 @@ function defaultRandomId(): string {
   return `piorch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/**
+ * Default conditions. Plain child: agent_end + a server-side deadline backstop.
+ * Goal-armed child (objective given): goal_end + paused, matched on the EXACT
+ * objective, plus the deadline — and deliberately NO per-turn agent_end
+ * (goals.md: on a goal child it fires at every turn boundary, producing false
+ * wakes that read like completion and burn the wake budget).
+ */
+export function defaultConditions(objective: string | undefined, deadlineMs: number): WatchConditionSpec[] {
+  const conditions: WatchConditionSpec[] = objective
+    ? [goalEnd(objective), goalPaused(objective)]
+    : [agentEnd()];
+  const deadlineSeconds = Math.floor(deadlineMs / 1000);
+  if (deadlineSeconds >= 1 && deadlineSeconds <= 86_400) {
+    conditions.push(deadlineCondition(deadlineSeconds));
+  }
+  return conditions;
+}
+
 export interface WatchInput {
   conditions: WatchConditionSpec[];
   label?: string;

@@ -32,6 +32,7 @@ export const EXIT_CODES: readonly ExitCodeEntry[] = [
   { code: 13, name: 'VERIFY_STUB', meaning: 'verify is a stub interface (filled by plan step C3); nothing was verified' },
   { code: 14, name: 'PROMPT_NOT_EXECUTED', meaning: 'Pi accepted the prompt but no turn ever started (extension input-hook swallow)' },
   { code: 15, name: 'TURN_STALLED', meaning: 'The turn stalled past the watchdog window; check the session before re-prompting' },
+  { code: 16, name: 'WAIT_TARGET_NOT_FOUND', meaning: 'wait fast-fail: the --run-id is unknown/malformed (no such receipt) or the sessionId is not in the registry — nothing to wait on (correction 01)' },
 ];
 
 export const OUTCOME_EXIT_CODES: Record<string, number> = {
@@ -49,6 +50,8 @@ export const OUTCOME_EXIT_CODES: Record<string, number> = {
   transport_lost: 9,
   prompt_not_executed: 14,
   turn_stalled: 15,
+  run_not_found: 16,
+  session_not_found: 16,
 };
 
 /** Server error codes that map to a specific exit (others fall back to 1/4/12). */

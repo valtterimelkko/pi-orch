@@ -4,7 +4,7 @@
  * contract snapshot. Zero runtime dependencies beyond Node's standard library.
  */
 
-export { PiOrchClient, defaultConditions, type ClientConfig } from './client.ts';
+export { PiOrchClient, type ClientConfig } from './client.ts';
 export {
   buildCreateBody,
   buildPromptBody,

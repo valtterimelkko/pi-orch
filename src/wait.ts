@@ -11,13 +11,17 @@
  * reconciled firing, and the cursor resets to 0 for the new ledger.
  */
 
+import { defaultConditions } from './builders.ts';
 import type { WatchConditionSpec } from './parsers.ts';
+import { OUTCOME_EXIT_CODES } from './exit-codes.ts';
 import { classifyReceipt, isTerminalReceipt, parseWatchesWait, type Receipt, type ReceiptClassification } from './parsers.ts';
 
 export interface WaitDeps {
   longPoll(input: { ids: string[]; cursor?: string; timeoutMs: number }): Promise<{ kind: 'fired'; body: unknown } | { kind: 'timeout' }>;
   getReceipt(runId: string): Promise<Receipt>;
   getSessionEvidence(sessionId: string): Promise<{ runs: Array<{ runId?: string; status?: string; errorCode?: string }> }>;
+  /** Existence preflight: null when the registry has no such session (404). */
+  getSession(sessionId: string): Promise<{ sessionId: string; status?: string } | null>;
   registerWatch(sessionId: string, body: Record<string, unknown>): Promise<{ watchId: string; status?: string }>;
   getWatch(sessionId: string): Promise<{ watchId: string; status?: string } | null>;
   sleep(ms: number): Promise<void>;
@@ -38,7 +42,9 @@ export type WaitOutcome =
   | { kind: 'question'; evidence?: string; note?: string }
   | { kind: 'goal_achieved'; evidence?: string; note?: string }
   | { kind: 'goal_failed'; evidence?: string; note?: string }
-  | { kind: 'deadline'; note?: string };
+  | { kind: 'deadline'; note?: string }
+  | { kind: 'run_not_found'; note?: string }
+  | { kind: 'session_not_found'; note?: string };
 
 export interface WaitOptions {
   sessionId: string;
@@ -57,8 +63,42 @@ const MAX_SLICE_MS = 300_000;
 const RECOVERY_ATTEMPTS = 10;
 const RECOVERY_BACKOFF_MS = 1_000;
 
+/**
+ * Correction 01 item 2: before any watch is registered, wait knows whether its
+ * target exists and whether the run already ended. An unknown/malformed run id
+ * or a nonexistent session returns IMMEDIATELY with a distinct outcome (exit
+ * 16) instead of sitting out the full deadline — a scripting parent waiting 600
+ * s for a mistyped id is exactly the loop this verb exists to remove. An
+ * already-terminal receipt returns its classified outcome immediately.
+ */
+async function preflightWait(
+  child: { sessionId: string; runId?: string },
+  deps: WaitDeps,
+): Promise<WaitOutcome | null> {
+  try {
+    const session = await deps.getSession(child.sessionId);
+    if (!session) return { kind: 'session_not_found', note: `no session ${child.sessionId} in the registry` };
+  } catch {
+    // Existence check is best-effort; the receipt check below is decisive.
+  }
+  if (!child.runId) return null;
+  try {
+    const receipt = await deps.getReceipt(child.runId);
+    return fromClassification(classifyReceipt(receipt), receipt);
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    const code = (error as { code?: string }).code;
+    if (status === 404 || code === 'RUN_NOT_FOUND') {
+      return { kind: 'run_not_found', note: `run ${child.runId} is unknown or malformed` };
+    }
+    return null; // transient receipt-read failure: proceed into the wait
+  }
+}
+
 export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
   const { deps } = options;
+  const fast = await preflightWait({ sessionId: options.sessionId, runId: options.runId }, deps);
+  if (fast) return fast;
   const sliceMs = Math.min(options.sliceMs ?? 45_000, MAX_SLICE_MS);
   const start = deps.now();
 
@@ -218,3 +258,200 @@ function fromClassification(classification: ReceiptClassification, receipt?: Rec
 }
 
 export { isTerminalReceipt };
+
+// ─── Multi-child wait (correction 01 item 3) ─────────────────────────────────
+
+export interface WaitChild {
+  sessionId: string;
+  runId?: string;
+}
+
+export interface WaitOnChildrenResult {
+  mode: 'all' | 'any';
+  children: Array<{ sessionId: string; runId?: string; outcome?: WaitOutcome }>;
+  exitCode: number;
+}
+
+/**
+ * Wait on several children in ONE call: `all` settles every child, `any`
+ * returns with the first to settle. One long-poll request covers all watches
+ * (the server's /watches/wait takes an id list and one shared cursor), so a
+ * parent fans out without a shell loop. Fast-fail preflight per child.
+ */
+export async function waitOnChildren(options: {
+  mode: 'all' | 'any';
+  children: WaitChild[];
+  conditions?: WatchConditionSpec[];
+  objective?: string;
+  deadlineMs: number;
+  sliceMs?: number;
+  label?: string;
+  deps: WaitDeps;
+}): Promise<WaitOnChildrenResult> {
+  const { deps } = options;
+  const sliceMs = Math.min(options.sliceMs ?? 45_000, MAX_SLICE_MS);
+  const results = new Map<number, WaitOutcome>();
+
+  // Fast-fail preflight per child.
+  for (const [index, child] of options.children.entries()) {
+    const fast = await preflightWait(child, deps);
+    if (fast) results.set(index, fast);
+  }
+  const exitCodeForChild = (outcome: WaitOutcome | undefined): number =>
+    OUTCOME_EXIT_CODES[outcome?.kind ?? 'deadline'] ?? 1;
+  const resultFor = (index: number): WaitOnChildrenResult['children'][number] => {
+    const child = options.children[index] as { sessionId: string; runId?: string };
+    return { ...child, ...(results.has(index) ? { outcome: results.get(index) } : {}) };
+  };
+
+  if (options.mode === 'any' && results.size > 0) {
+    const first = options.children.findIndex((_, index) => results.has(index));
+    return { mode: 'any', children: [resultFor(first)], exitCode: exitCodeForChild(results.get(first)) };
+  }
+  if (options.mode === 'all' && results.size === options.children.length) {
+    const children = options.children.map((_, index) => resultFor(index));
+    return { mode: 'all', children, exitCode: allExitCode(children) };
+  }
+
+  const unsettled = new Map<number, { watchId: string }>();
+  for (const [index, child] of options.children.entries()) {
+    if (results.has(index)) continue;
+    unsettled.set(index, { watchId: (await registerOrReuse(child.sessionId, childConditions(options, child), options.label, deps)).watchId });
+  }
+
+  const start = deps.now();
+  let cursor: string | undefined = undefined;
+  let recoveryAttempts = 0;
+
+  while (unsettled.size > 0) {
+    const remaining = options.deadlineMs - (deps.now() - start);
+    if (remaining <= 0) {
+      for (const index of unsettled.keys()) results.set(index, { kind: 'deadline', note: 'shared deadline elapsed' });
+      break;
+    }
+    const ids = [...unsettled.values()].map((entry) => entry.watchId);
+    let result: { kind: 'fired'; body: unknown } | { kind: 'timeout' };
+    try {
+      result = await deps.longPoll({ ids, cursor, timeoutMs: Math.min(sliceMs, remaining) });
+    } catch {
+      recoveryAttempts += 1;
+      if (recoveryAttempts > RECOVERY_ATTEMPTS) {
+        for (const index of unsettled.keys()) results.set(index, { kind: 'deadline', note: `transport lost past ${RECOVERY_ATTEMPTS} recovery attempts` });
+        break;
+      }
+      await deps.sleep(RECOVERY_BACKOFF_MS);
+      for (const [index, entry] of [...unsettled.entries()]) {
+        const child = options.children[index];
+        if (!child) continue;
+        const existing = await deps.getWatch(child.sessionId).catch(() => null);
+        if (!existing || existing.status === 'detached') {
+          unsettled.set(index, { watchId: (await registerOrReuse(child.sessionId, childConditions(options, child), options.label, deps, true)).watchId });
+          cursor = undefined; // new ledger: start at 0 so reconciled firings are seen
+        }
+      }
+      continue;
+    }
+    recoveryAttempts = 0;
+
+    if (result.kind === 'fired') {
+      const parsed = parseWatchesWait(result.body);
+      cursor = parsed.nextCursor;
+      const byWatchId = new Map([...unsettled.entries()].map(([index, entry]) => [entry.watchId, index]));
+      for (const watch of parsed.watches) {
+        const index = byWatchId.get(watch.watchId);
+        const child = index === undefined ? undefined : options.children[index];
+        if (index === undefined || !child) continue;
+        for (const firing of watch.firings) {
+          const outcome = await firingOutcome(firing, child, deps);
+          if (outcome) {
+            results.set(index, outcome);
+            unsettled.delete(index);
+            break;
+          }
+        }
+      }
+    } else {
+      // Slice timeout: one bounded receipt reconciliation per unsettled child.
+      for (const [index] of [...unsettled.entries()]) {
+        const child = options.children[index];
+        if (!child) continue;
+        const outcome = await reconcileChildReceipt(child, deps);
+        if (outcome) {
+          results.set(index, outcome);
+          unsettled.delete(index);
+        }
+      }
+    }
+
+    if (options.mode === 'any' && results.size > 0) {
+      const first = options.children.findIndex((_, index) => results.has(index));
+      return { mode: 'any', children: [resultFor(first)], exitCode: exitCodeForChild(results.get(first)) };
+    }
+  }
+
+  const children = options.children.map((_, index) => resultFor(index));
+  return { mode: options.mode, children, exitCode: allExitCode(children) };
+}
+
+function childConditions(
+  options: { conditions?: WatchConditionSpec[]; objective?: string; deadlineMs: number },
+  _child: WaitChild,
+): WatchConditionSpec[] {
+  return options.conditions ?? defaultConditions(options.objective, options.deadlineMs);
+}
+
+function allExitCode(children: Array<{ outcome?: WaitOutcome }>): number {
+  for (const child of children) {
+    const code = OUTCOME_EXIT_CODES[child.outcome?.kind ?? 'deadline'] ?? 1;
+    if (code !== 0) return code; // first nonzero in child order (deterministic)
+  }
+  return 0;
+}
+
+async function firingOutcome(
+  firing: { conditionId: string; eventType: string; evidence?: string },
+  child: WaitChild,
+  deps: WaitDeps,
+): Promise<WaitOutcome | null> {
+  if (firing.eventType === 'goal_state') {
+    return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
+  }
+  if (firing.eventType === 'text') {
+    return { kind: 'question', evidence: firing.evidence, note: 'question sentinel matched' };
+  }
+  if (firing.eventType === 'goal_end') {
+    const evidence = firing.evidence ?? '';
+    if (evidence.includes('failed')) return { kind: 'goal_failed', evidence };
+    return { kind: 'goal_achieved', evidence };
+  }
+  if (firing.eventType === 'agent_end' || firing.eventType === 'deadline') {
+    const outcome = await reconcileChildReceipt(child, deps);
+    if (outcome) return outcome;
+    if (firing.eventType === 'deadline') return { kind: 'deadline', note: 'server-side deadline condition fired; child still not terminal' };
+    if (!child.runId) {
+      return { kind: 'completed', note: 'agent_end observed; no runId provided for receipt read-back' };
+    }
+  }
+  return null;
+}
+
+async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps): Promise<WaitOutcome | null> {
+  try {
+    if (child.runId) {
+      const receipt = await deps.getReceipt(child.runId);
+      return fromClassification(classifyReceipt(receipt), receipt);
+    }
+    const evidence = await deps.getSessionEvidence(child.sessionId);
+    const last = evidence.runs[0];
+    if (!last || !last.status) return null;
+    if (['completed', 'failed', 'cancelled', 'interrupted'].includes(last.status)) {
+      return fromClassification(
+        classifyReceipt({ runId: last.runId ?? 'unknown', sessionId: child.sessionId, status: last.status, errorCode: last.errorCode }),
+        last.runId ? ({ runId: last.runId, sessionId: child.sessionId, status: last.status, errorCode: last.errorCode } as Receipt) : undefined,
+      );
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}

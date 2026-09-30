@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PiOrchClient, defaultConditions } from '../src/client.ts';
+import { PiOrchClient } from '../src/client.ts';
+import { defaultConditions } from '../src/builders.ts';
 import { ApiError } from '../src/parsers.ts';
 import type { TransportResponse } from '../src/transport.ts';
 

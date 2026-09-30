@@ -4,7 +4,7 @@
  * factory) so no test needs a server or a real process.
  */
 
-import { PiOrchClient, defaultConditions } from './client.ts';
+import { PiOrchClient } from './client.ts';
 import {
   agentEnd,
   goalEnd,
@@ -12,6 +12,7 @@ import {
   questionSentinel,
   deadlineCondition,
   buildPreflightSpec,
+  defaultConditions,
 } from './builders.ts';
 import type { WatchConditionSpec } from './parsers.ts';
 import { ApiError } from './parsers.ts';
@@ -30,6 +31,7 @@ export interface ClientLike {
   models(runtime?: string): Promise<Array<Record<string, unknown>>>;
   capabilities(): Promise<Record<string, unknown>>;
   capacity(): Promise<Record<string, unknown>>;
+  waitMany(options: { mode: 'all' | 'any'; children: Array<{ sessionId: string; runId?: string }>; objective?: string; deadlineMs?: number; label?: string }): Promise<{ mode: string; children: Array<{ sessionId: string; runId?: string; outcome?: { kind: string } }>; exitCode: number }>;
 }
 
 export interface CliDeps {
@@ -56,6 +58,8 @@ interface ParsedArgs {
 }
 
 const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool']);
+/** Flags that never consume the following token (so `--all c1@r1` keeps the id positional). */
+const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript']);
 
 function parseArgs(argv: string[]): ParsedArgs {
   const verb = argv[0] ?? '';
@@ -76,6 +80,8 @@ function parseArgs(argv: string[]): ParsedArgs {
         repeatable.set(name, list);
       } else if (inlineValue !== undefined) {
         flags.set(name, inlineValue);
+      } else if (BOOLEAN_FLAGS.has(name)) {
+        flags.set(name, true);
       } else {
         const next = argv[index + 1];
         if (next !== undefined && !next.startsWith('--')) {
@@ -132,11 +138,15 @@ Verbs:
   spawn --runtime rt --cwd dir [...]   create a child (retention, goal, preflight)
   prompt <sessionId> --message text    detached dispatch with idempotency key
   wait <sessionId> [--run-id id]       watch-based wait; never polls; deadline
+       [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
   result <runId> [--transcript]        receipt final text + evidence pointers
   verify <sessionId>                   stub (C3 fills it); exits 13
   cleanup <sessionId> [--lease id --owner id] [--watch id]
                                        release the owned lease, then delete
   status [--parent id] | [sessionId]   children by parent: busy, goal, last run
+
+Scripting: use --json for full machine output, or --id-only (spawn: prints the
+sessionId; prompt: prints the runId) for $(...) capture. never parse the human-readable output (its wording can change at any time).
 
 Common flags: --socket P --token-path P --api-base URL --parent-session ID --json
 
@@ -151,7 +161,10 @@ Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
 
 Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end+paused matched),
   --deadline S (default 1800), --slice S, --conditions a,b
-  (agent_end|goal_end|paused|question:TEXT|deadline:S)
+  (agent_end|goal_end|paused|question:TEXT|deadline:S),
+  --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
+  --all settles every child, --any returns the first to settle. Unknown runs
+  or sessions fail fast (exit 16) instead of sitting out the deadline.
 
 Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interrupted
   6 never started · 7 budget exceeded · 8 cancelled · 9 transport lost
@@ -238,6 +251,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       });
       return output(json, body, (value) => {
         const spawned = value as { sessionId: string; leaseId?: string; parentId?: string; resolvedModel?: string };
+        if (args.flags.has('id-only')) return spawned.sessionId;
         return [
           `session ${spawned.sessionId}`,
           spawned.leaseId ? `lease ${spawned.leaseId}` : undefined,
@@ -265,6 +279,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       });
       return output(json, body, (value) => {
         const prompt = value as { runId: string; duplicate: boolean; dispatchMode?: string };
+        if (args.flags.has('id-only')) return prompt.runId;
         return [
           `run ${prompt.runId}${prompt.duplicate ? ' (duplicate: idempotent replay)' : ''}`,
           prompt.dispatchMode ? `dispatch ${prompt.dispatchMode}` : undefined,
@@ -274,11 +289,24 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       });
     }
     case 'wait': {
-      const sessionId = args.positional[0];
-      if (!sessionId) throw new UsageError('wait needs <sessionId>');
       const deadlineSeconds = flagNumber(args, 'deadline') ?? 1800;
       const objective = flagString(args, 'objective');
       const conditionsFlag = flagString(args, 'conditions');
+      if (args.flags.has('all') || args.flags.has('any')) {
+        const mode = args.flags.has('all') ? 'all' as const : 'any' as const;
+        if (args.positional.length === 0) throw new UsageError(`wait --${mode} needs at least one <sessionId>[@<runId>]`);
+        const children = args.positional.map((token) => {
+          const at = token.indexOf('@');
+          return at === -1 ? { sessionId: token } : { sessionId: token.slice(0, at), runId: token.slice(at + 1) };
+        });
+        const body = await getClient().waitMany({ mode, children, objective, deadlineMs: deadlineSeconds * 1000, label: flagString(args, 'label') });
+        const stdout = json ? `${JSON.stringify(body, null, 2)}` : body.children
+          .map((child) => `${child.sessionId}: ${child.outcome?.kind ?? 'no outcome'}`)
+          .join('\n');
+        return { exitCode: body.exitCode, stdout, ...(body.exitCode === 0 ? {} : { stderr: stdout }) };
+      }
+      const sessionId = args.positional[0];
+      if (!sessionId) throw new UsageError('wait needs <sessionId>');
       const conditions = conditionsFlag
         ? parseConditionList(conditionsFlag, objective)
         : defaultConditions(objective, deadlineSeconds * 1000);

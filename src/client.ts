@@ -16,11 +16,12 @@ import {
   goalEnd,
   goalPaused,
   questionSentinel,
+  defaultConditions,
   type CreateInput,
   type PromptInput,
 } from './builders.ts';
 import { parseReceipt, ApiError, type Receipt, type WatchConditionSpec } from './parsers.ts';
-import { waitOnChild, type WaitOutcome, type WaitDeps } from './wait.ts';
+import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
 
 export interface ClientConfig {
   /** Socket/http transport options; omit when `transportInstance` is given. */
@@ -187,7 +188,44 @@ export class PiOrchClient {
     label?: string;
   }): Promise<WaitOutcome> {
     const conditions = options.conditions ?? defaultConditions(options.objective, options.deadlineMs ?? this.waitDeadlineMs);
-    const deps: WaitDeps = {
+    const deps = this.waitDeps();
+    return waitOnChild({
+      sessionId: options.sessionId,
+      runId: options.runId,
+      conditions,
+      objective: options.objective,
+      deadlineMs: options.deadlineMs ?? this.waitDeadlineMs,
+      sliceMs: this.waitSliceMs,
+      label: options.label,
+      deps,
+    });
+  }
+
+  /**
+   * Wait on SEVERAL children in one call (correction 01 item 3): `all` settles
+   * every child, `any` returns with the first to settle. One long-poll request
+   * covers all watches; fast-fail preflight per child.
+   */
+  async waitMany(options: {
+    mode: 'all' | 'any';
+    children: WaitChild[];
+    objective?: string;
+    deadlineMs?: number;
+    label?: string;
+  }): Promise<WaitOnChildrenResult> {
+    return waitOnChildren({
+      mode: options.mode,
+      children: options.children,
+      objective: options.objective,
+      deadlineMs: options.deadlineMs ?? this.waitDeadlineMs,
+      sliceMs: this.waitSliceMs,
+      label: options.label,
+      deps: this.waitDeps(),
+    });
+  }
+
+  private waitDeps(): WaitDeps {
+    return {
       longPoll: async ({ ids, cursor, timeoutMs }) => {
         const params = new URLSearchParams({ ids: ids.join(','), timeout: String(timeoutMs) });
         if (cursor !== undefined) params.set('cursor', cursor);
@@ -214,6 +252,16 @@ export class PiOrchClient {
         const body = response.body as { runChronology?: Array<{ runId?: string; status?: string; errorCode?: string }> };
         return { runs: body.runChronology ?? [] };
       },
+      getSession: async (sessionId) => {
+        try {
+          const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() });
+          const body = response.body as { sessionId?: string };
+          return { sessionId: String(body.sessionId ?? sessionId) };
+        } catch (error) {
+          if ((error as { status?: number }).status === 404) return null;
+          throw error;
+        }
+      },
       registerWatch: async (sessionId_, body) => {
         const registered = await this.registerWatch(sessionId_, body as { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean });
         return { watchId: registered.watchId, status: registered.status };
@@ -222,16 +270,6 @@ export class PiOrchClient {
       sleep: (ms) => new Promise<void>((resolvePromise) => setTimeout(resolvePromise, ms)),
       now: Date.now,
     };
-    return waitOnChild({
-      sessionId: options.sessionId,
-      runId: options.runId,
-      conditions,
-      objective: options.objective,
-      deadlineMs: options.deadlineMs ?? this.waitDeadlineMs,
-      sliceMs: this.waitSliceMs,
-      label: options.label,
-      deps,
-    });
   }
 
   async result(runId: string, options: { includeTranscript?: boolean } = {}): Promise<{
@@ -368,25 +406,6 @@ export class PiOrchClient {
       lastRun: last ? { runId: last.runId, status: last.status, errorCode: last.errorCode } : undefined,
     };
   }
-}
-
-/**
- * Default conditions. Plain child: agent_end + a server-side deadline backstop.
- * Goal-armed child (objective given): goal_end + paused, matched on the EXACT
- * objective, plus the deadline — and deliberately NO per-turn agent_end
- * (goals.md: on a goal child it fires at every turn boundary, producing false
- * wakes that read like completion and burn the wake budget; the first
- * agent_end of a goal-start turn would otherwise end the wait early).
- */
-export function defaultConditions(objective: string | undefined, deadlineMs: number): WatchConditionSpec[] {
-  const conditions: WatchConditionSpec[] = objective
-    ? [goalEnd(objective), goalPaused(objective)]
-    : [agentEnd()];
-  const deadlineSeconds = Math.floor(deadlineMs / 1000);
-  if (deadlineSeconds >= 1 && deadlineSeconds <= 86_400) {
-    conditions.push(deadlineCondition(deadlineSeconds));
-  }
-  return conditions;
 }
 
 function defaultRandomId(): string {
