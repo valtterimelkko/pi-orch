@@ -4,6 +4,22 @@
   "description": "Thin parent client for the Pi Web UI Internal API (plan C1). Local only until the owner approves publishing.",
   "type": "module",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/valtterimelkko/pi-orch.git"
+  },
+  "homepage": "https://github.com/valtterimelkko/pi-orch#readme",
+  "bugs": {
+    "url": "https://github.com/valtterimelkko/pi-orch/issues"
+  },
+  "keywords": [
+    "pi-web-ui",
+    "orchestration",
+    "agents",
+    "internal-api",
+    "cli"
+  ],
   "engines": {
     "node": ">=22.18"
   },
@@ -12,9 +28,10 @@
   },
   "scripts": {
     "test": "node --test 'test/*.test.ts'",
-    "typecheck": "node /root/pi-web-ui/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+    "typecheck": "node scripts/typecheck.mjs"
   },
   "devDependencies": {
-    "typescript": "^5.5.0"
+    "@types/node": "^20.19.0",
+    "typescript": "^5.9.0"
   }
 }
