@@ -116,7 +116,42 @@ async function preflightWait(
   }
 }
 
+/**
+ * C1 carried-over item: when a caller gives neither conditions nor objective,
+ * read the goal projection ONCE; an ACTIVE or RUNNING goal adopts the goal
+ * conditions and settlement automatically (a forgotten --objective on a goal
+ * child must not produce an early false `completed` from a per-turn agent_end).
+ * An unreadable projection or a settled/idle goal leaves the plain path.
+ */
+async function detectActiveGoal(sessionId: string, deps: WaitDeps): Promise<string | null> {
+  try {
+    const goal = await deps.getGoal(sessionId);
+    if ((goal.status === 'running' || goal.status === 'wrapping_up') && goal.objective) return goal.objective;
+  } catch {
+    // no readable projection: plain wait
+  }
+  return null;
+}
+
+const AUTO_GOAL_NOTE = 'goal auto-detected on the child (no --objective given): goal conditions and settlement used';
+
+function withAutoGoalNote(outcome: WaitOutcome): WaitOutcome {
+  if ('note' in outcome && outcome.note) return { ...outcome, note: `${outcome.note}; ${AUTO_GOAL_NOTE}` };
+  return { ...outcome, note: AUTO_GOAL_NOTE } as WaitOutcome;
+}
+
 export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
+  if (!options.conditions && !options.objective) {
+    const detected = await detectActiveGoal(options.sessionId, options.deps);
+    if (detected) {
+      const outcome = await waitOnChildCore({ ...options, objective: detected });
+      return withAutoGoalNote(outcome);
+    }
+  }
+  return waitOnChildCore(options);
+}
+
+async function waitOnChildCore(options: WaitOptions): Promise<WaitOutcome> {
   const { deps } = options;
   const fast = await preflightWait({ sessionId: options.sessionId, runId: options.runId, objective: options.objective }, deps);
   if (fast) return fast;
@@ -421,6 +456,18 @@ export async function waitOnChildren(options: {
   const sliceMs = Math.min(options.sliceMs ?? 45_000, MAX_SLICE_MS);
   const results = new Map<number, WaitOutcome>();
 
+  // C1 carried-over item: per-child goal detection when no objective/conditions
+  // were given — a goal child in the set settles via its projection, a plain
+  // child keeps the agent_end path.
+  const detectedByChild = new Map<number, string>();
+  if (!options.conditions && !options.objective) {
+    for (const [index, child] of options.children.entries()) {
+      const detected = await detectActiveGoal(child.sessionId, deps);
+      if (detected) detectedByChild.set(index, detected);
+    }
+  }
+  const objectiveFor = (index: number): string | undefined => detectedByChild.get(index) ?? options.objective;
+
   // Fast-fail preflight per child.
   for (const [index, child] of options.children.entries()) {
     const fast = await preflightWait({ ...child, objective: options.objective }, deps);
@@ -445,7 +492,7 @@ export async function waitOnChildren(options: {
   const unsettled = new Map<number, { watchId: string }>();
   for (const [index, child] of options.children.entries()) {
     if (results.has(index)) continue;
-    const registered = await registerOrReuse(child.sessionId, childConditions(options, child), options.label, deps);
+    const registered = await registerOrReuse(child.sessionId, childConditions(options, child, detectedByChild.get(index)), options.label, deps);
     if (registered.conflict) {
       results.set(index, { kind: 'watch_conflict', note: registered.conflict });
       continue;
@@ -479,7 +526,7 @@ export async function waitOnChildren(options: {
         if (!child) continue;
         const existing = await deps.getWatch(child.sessionId).catch(() => null);
         if (!existing || existing.status === 'detached') {
-          const registered = await registerOrReuse(child.sessionId, childConditions(options, child), options.label, deps, true);
+          const registered = await registerOrReuse(child.sessionId, childConditions(options, child, detectedByChild.get(index)), options.label, deps, true);
           if (registered.conflict) {
             results.set(index, { kind: 'watch_conflict', note: registered.conflict });
             unsettled.delete(index);
@@ -501,9 +548,9 @@ export async function waitOnChildren(options: {
         const index = byWatchId.get(watch.watchId);
         const child = index === undefined ? undefined : options.children[index];
         if (index === undefined || !child) continue;
-        const conditionsById = new Map(childConditions(options, child).flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
+        const conditionsById = new Map(childConditions(options, child, detectedByChild.get(index)).flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
         for (const firing of watch.firings) {
-          const outcome = await firingOutcome(firing, child, deps, conditionsById);
+          const outcome = await firingOutcome(firing, child, deps, conditionsById, objectiveFor(index));
           if (outcome) {
             results.set(index, outcome);
             unsettled.delete(index);
@@ -516,7 +563,7 @@ export async function waitOnChildren(options: {
       for (const [index] of [...unsettled.entries()]) {
         const child = options.children[index];
         if (!child) continue;
-        const outcome = await reconcileChildReceipt(child, deps, options.objective);
+        const outcome = await reconcileChildReceipt(child, deps, objectiveFor(index));
         if (outcome) {
           results.set(index, outcome);
           unsettled.delete(index);
@@ -530,14 +577,22 @@ export async function waitOnChildren(options: {
     }
   }
 
-  const children = options.children.map((_, index) => resultFor(index));
+  const children = options.children.map((_, index) => {
+    const entry = resultFor(index);
+    if (entry.outcome && detectedByChild.has(index)) {
+      return { ...entry, outcome: withAutoGoalNote(entry.outcome) };
+    }
+    return entry;
+  });
   return { mode: options.mode, children, exitCode: allExitCode(children) };
 }
 
 function childConditions(
   options: { conditions?: WatchConditionSpec[]; objective?: string; deadlineMs: number },
   _child: WaitChild,
+  detectedObjective?: string,
 ): WatchConditionSpec[] {
+  if (detectedObjective !== undefined) return defaultConditions(detectedObjective, options.deadlineMs);
   return options.conditions ?? defaultConditions(options.objective, options.deadlineMs);
 }
 
@@ -554,6 +609,7 @@ async function firingOutcome(
   child: WaitChild,
   deps: WaitDeps,
   conditionsById: Map<string, WatchConditionSpec> = new Map(),
+  objective?: string,
 ): Promise<WaitOutcome | null> {
   const condition = conditionsById.get(firing.conditionId);
   if (condition?.type === 'text') {
@@ -566,7 +622,7 @@ async function firingOutcome(
     return goalEndOutcome(child.sessionId, firing.evidence ?? '', deps);
   }
   if (firing.eventType === 'agent_end' || firing.eventType === 'deadline') {
-    const outcome = await reconcileChildReceipt(child, deps);
+    const outcome = await reconcileChildReceipt(child, deps, objective);
     if (outcome) return outcome;
     if (firing.eventType === 'deadline') return { kind: 'deadline', note: 'server-side deadline condition fired; child still not terminal' };
     if (!child.runId) {
