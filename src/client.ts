@@ -19,11 +19,14 @@ import {
   type CreateInput,
   type PromptInput,
 } from './builders.ts';
-import { parseReceipt, type Receipt, type WatchConditionSpec } from './parsers.ts';
+import { parseReceipt, ApiError, type Receipt, type WatchConditionSpec } from './parsers.ts';
 import { waitOnChild, type WaitOutcome, type WaitDeps } from './wait.ts';
 
 export interface ClientConfig {
-  transport: TransportConfig;
+  /** Socket/http transport options; omit when `transportInstance` is given. */
+  transport?: TransportConfig;
+  /** Pre-built transport (tests); overrides `transport`. */
+  transportInstance?: Transport;
   parentSessionId?: string;
   /** Default idempotency-key factory; injectable for tests. */
   randomId?: () => string;
@@ -39,7 +42,10 @@ export class PiOrchClient {
   private readonly waitSliceMs: number;
 
   constructor(config: ClientConfig) {
-    this.transport = new Transport(config.transport);
+    if (config.transportInstance === undefined && config.transport === undefined) {
+      throw new Error('pi-orch: client needs transport options or a transportInstance');
+    }
+    this.transport = config.transportInstance ?? new Transport(config.transport as TransportConfig);
     this.parentSessionId = config.parentSessionId;
     this.randomId = config.randomId ?? defaultRandomId;
     this.waitDeadlineMs = config.waitDeadlineMs ?? 30 * 60_000;
@@ -103,7 +109,7 @@ export class PiOrchClient {
     };
   }
 
-  async prompt(sessionId: string, input: PromptInput): Promise<{
+  async prompt(sessionId: string, input: PromptInput & { followUpOnBusy?: boolean }): Promise<{
     runId: string;
     sessionId: string;
     detached: boolean;
@@ -112,10 +118,24 @@ export class PiOrchClient {
     raw: unknown;
   }> {
     const body = buildPromptBody(input, this.randomId);
-    const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompt`, {
-      body,
-      headers: this.headers(),
-    });
+    const path = `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompt`;
+    let response: Awaited<ReturnType<Transport['request']>>;
+    try {
+      response = await this.transport.request('POST', path, { body, headers: this.headers() });
+    } catch (error) {
+      // Live-found race: a create-time goal arms a detached goal-start turn, so
+      // the first prompt to a fresh goal-armed child can hit 409 SESSION_BUSY.
+      // followUpOnBusy retries ONCE in follow_up mode (queues on a busy Pi
+      // session, delivers after the current turn). Exactly one retry; other
+      // 409 codes propagate.
+      const apiError = error as ApiError;
+      const busyRefusal = apiError instanceof ApiError && apiError.status === 409 && apiError.code === 'SESSION_BUSY';
+      if (!(input.followUpOnBusy === true && busyRefusal)) throw error;
+      response = await this.transport.request('POST', path, {
+        body: { ...body, mode: 'follow_up' },
+        headers: this.headers(),
+      });
+    }
     const raw = response.body as Record<string, unknown>;
     const duplicate = raw.duplicate === true;
     const runId = String(raw.runId ?? (raw.receipt as Record<string, unknown> | undefined)?.runId ?? '');
