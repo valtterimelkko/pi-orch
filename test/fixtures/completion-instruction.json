@@ -1,0 +1,4 @@
+{
+  "source": "C3a.md correction 01 §1, verbatim (live-proved 16/16); extracted 2026-09-30",
+  "paragraph": "END-OF-TASK REPORT (required): the LAST thing in your final answer must be exactly this kind of fenced block (info string `completion`, JSON body):\n\n```completion\n{\"schema\":\"pi-completion/v1\",\"status\":\"done\",\"summary\":\"<one line>\",\"commands\":[{\"command\":\"<a command you ran>\",\"exitCode\":0}],\"filesChanged\":[\"<path>\"]}\n```\n\nFill in the real values; add \"tests\", \"commits\", \"openIssues\" or \"blockedReason\" fields only if they apply. Do not end your turn with only a tool call: after your final tool call, always write a short final answer that ends with the report block. Nothing after the closing fence."
+}

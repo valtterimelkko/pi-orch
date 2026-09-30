@@ -9,20 +9,21 @@ import { loadSnapshot, SNAPSHOT_SEARCH_PATHS } from '../src/snapshot.ts';
  * Snapshot loading: the client validates its builders and parsers against the
  * server-derived contract snapshot. Resolution order is explicit and testable:
  *   1. PI_ORCH_SNAPSHOT_PATH (explicit override)
- *   2. the server main checkout (/root/pi-web-ui/docs/contract/…)
- *   3. the bundled copy in this repo (contract/), which keeps the client usable
+ *   2. PI_WEB_UI_REPO, when set — it must carry the snapshot (loud error if not)
+ *   3. ~/pi-web-ui, when that checkout carries the snapshot (adopter default)
+ *   4. the bundled copy in this repo (contract/), which keeps the client usable
  *      (and its tests green) before a server checkout carries the file.
  * The loader reports WHICH source served the snapshot, so tests and operators
- * can always tell how fresh the contract view is.
+ * can always tell how fresh the contract view is. No host-specific path is
+ * hard-coded: adopters set PI_WEB_UI_REPO, or keep a checkout at ~/pi-web-ui.
  */
 
 test('loads the bundled snapshot by default', () => {
-  // Hermetic: point the server-checkout layer at an empty dir so the host's
-  // /root/pi-web-ui checkout (which carries a committed snapshot since the
-  // C1/C3a merge) cannot shadow the bundled copy this test pins.
+  // Hermetic: an empty HOME has no ~/pi-web-ui, so the bundled copy is the
+  // only source left (item 3: `npm test` must pass with no Pi Web UI checkout).
   const empty = mkdtempSync(join(tmpdir(), 'piorch-empty-'));
   try {
-    const loaded = loadSnapshot({ env: {}, serverCheckoutRoot: empty });
+    const loaded = loadSnapshot({ env: {}, home: empty });
     assert.equal(loaded.source, 'bundled');
     assert.ok(loaded.snapshot.contractVersion.match(/^\d+\.\d+\.\d+$/));
     assert.equal(loaded.snapshot.$schema, 'pi-orch-contract-snapshot/v1');
@@ -30,6 +31,45 @@ test('loads the bundled snapshot by default', () => {
     assert.ok(Object.keys(loaded.snapshot.types).length >= 20);
   } finally {
     rmSync(empty, { recursive: true, force: true });
+  }
+});
+
+test('prefers PI_WEB_UI_REPO when it carries the snapshot', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'piorch-repo-env-'));
+  try {
+    const contractDir = join(dir, 'docs', 'contract');
+    mkdirSync(contractDir, { recursive: true });
+    const base = loadSnapshot({ env: {}, home: join(dir, 'no-home') }).snapshot;
+    writeFileSync(join(contractDir, 'internal-api-client-snapshot.json'), JSON.stringify({ ...base, contractVersion: '8.8.8' }));
+    const loaded = loadSnapshot({ env: { PI_WEB_UI_REPO: dir }, home: join(dir, 'no-home') });
+    assert.equal(loaded.source, 'repo-env');
+    assert.equal(loaded.snapshot.contractVersion, '8.8.8');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a set PI_WEB_UI_REPO without a snapshot is a loud error, not a silent fallback', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'piorch-repo-bad-'));
+  try {
+    assert.throws(() => loadSnapshot({ env: { PI_WEB_UI_REPO: dir }, home: dir }), /PI_WEB_UI_REPO/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('falls back to ~/pi-web-ui when it carries the snapshot', () => {
+  const home = mkdtempSync(join(tmpdir(), 'piorch-home-'));
+  try {
+    const contractDir = join(home, 'pi-web-ui', 'docs', 'contract');
+    mkdirSync(contractDir, { recursive: true });
+    const base = loadSnapshot({ env: {}, home: join(home, 'empty') }).snapshot;
+    writeFileSync(join(contractDir, 'internal-api-client-snapshot.json'), JSON.stringify({ ...base, contractVersion: '7.7.7' }));
+    const loaded = loadSnapshot({ env: {}, home });
+    assert.equal(loaded.source, 'home-checkout');
+    assert.equal(loaded.snapshot.contractVersion, '7.7.7');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -83,4 +123,7 @@ test('search paths are exported so operators can see the resolution order', () =
   assert.ok(Array.isArray(SNAPSHOT_SEARCH_PATHS));
   assert.ok(SNAPSHOT_SEARCH_PATHS.length >= 2);
   assert.ok(SNAPSHOT_SEARCH_PATHS[0].includes('PI_ORCH_SNAPSHOT_PATH'));
+  assert.ok(SNAPSHOT_SEARCH_PATHS.some((entry) => entry.includes('PI_WEB_UI_REPO')), 'names the env repo override');
+  assert.ok(SNAPSHOT_SEARCH_PATHS.some((entry) => entry.includes('~/pi-web-ui')), 'names the adopter home fallback');
+  assert.ok(!SNAPSHOT_SEARCH_PATHS.some((entry) => entry.includes('/root/')), 'no host-specific path');
 });

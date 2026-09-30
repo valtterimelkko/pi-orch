@@ -131,7 +131,8 @@ so parent lineage (C5) is recorded automatically.
 | `PI_WEB_UI_TOKEN_PATH` | Bearer token file (default `~/.pi-web-ui/internal-api-token`) |
 | `PI_WEB_UI_API_BASE` | http base instead of the socket (tests/odd deployments) |
 | `PI_ORCH_PARENT_SESSION` | Explicit parent id for bare-CLI parents |
-| `PI_ORCH_SNAPSHOT_PATH` | Contract snapshot override (see below) |
+| `PI_WEB_UI_REPO` | Pi Web UI checkout root whose `docs/contract/` snapshot should be used (see below) |
+| `PI_ORCH_SNAPSHOT_PATH` | Contract snapshot file override (wins over everything; see below) |
 
 ## Contract snapshot (drift guard)
 
@@ -139,11 +140,15 @@ The server repo generates `docs/contract/internal-api-client-snapshot.json`
 from its zod schemas and types (`npx tsx scripts/generate-client-snapshot.ts`);
 its drift test fails CI when a server schema changes without regeneration.
 This client's tests validate the request builders and response parsers against
-that snapshot. Resolution order: `PI_ORCH_SNAPSHOT_PATH`, then the server main
-checkout (`/root/pi-web-ui/docs/contract/...`), then the bundled copy in
-`contract/`. At runtime the client compares the snapshot's `contractVersion`
-with live `/capabilities`; a mismatch means the snapshot is stale relative to
-the server being talked to. Regenerate the bundled copy with:
+that snapshot. Resolution order, in code, tests and here: (1)
+`PI_ORCH_SNAPSHOT_PATH`; (2) `$PI_WEB_UI_REPO/docs/contract/internal-api-client-snapshot.json`
+when the variable is set (a set-but-unusable repo is a loud error); (3)
+`~/pi-web-ui/docs/contract/internal-api-client-snapshot.json` when that checkout
+is present; (4) the bundled copy in `contract/` — so the client's tests pass on
+a machine with no Pi Web UI checkout at all. At runtime the client compares the
+snapshot's `contractVersion` with live `/capabilities`; a mismatch means the
+snapshot is stale relative to the server being talked to. Regenerate the
+bundled copy with:
 
 ```
 cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/

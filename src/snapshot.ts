@@ -6,13 +6,15 @@
  * committed there as docs/contract/internal-api-client-snapshot.json. The
  * client validates its builders and parsers against it.
  *
- * How the client learns of a NEWER snapshot:
- *   1. PI_ORCH_SNAPSHOT_PATH — explicit override (tests, pinned validation).
- *   2. The server main checkout's committed snapshot
- *      (/root/pi-web-ui/docs/contract/…) — regenerated whenever a server schema
- *      or type changes; the server repo's drift test fails CI otherwise.
- *   3. The bundled copy in this repo (contract/) — a fallback so the client
- *      works (and its tests pass) before a checkout carries the file.
+ * Resolution order (no host-specific path is hard-coded; adopters either set
+ * PI_WEB_UI_REPO or keep a checkout at ~/pi-web-ui):
+ *   1. PI_ORCH_SNAPSHOT_PATH — explicit file override (tests, pinned validation).
+ *   2. PI_WEB_UI_REPO — the server checkout root, when set. It must carry the
+ *      snapshot: a set-but-unusable repo is an operator error, not a reason to
+ *      validate silently against a different copy.
+ *   3. ~/pi-web-ui — a checkout at the conventional location, when present.
+ *   4. The bundled copy in this repo (contract/) — so the client works (and its
+ *      tests pass) on a machine with no Pi Web UI checkout.
  * Additionally at RUNTIME the client compares the snapshot's contractVersion
  * with the live GET /capabilities contract.contractVersion and surfaces
  * SNAPSHOT_STALE when they differ, so a parent knows its shape view may lag the
@@ -38,7 +40,7 @@ export interface ClientContractSnapshot {
   types: Record<string, ExtractedType>;
 }
 
-export type SnapshotSource = 'env' | 'server-checkout' | 'bundled';
+export type SnapshotSource = 'env' | 'repo-env' | 'server-checkout' | 'home-checkout' | 'bundled';
 
 export interface LoadedSnapshot {
   snapshot: ClientContractSnapshot;
@@ -46,13 +48,13 @@ export interface LoadedSnapshot {
   path: string;
 }
 
-const DEFAULT_SERVER_CHECKOUT = '/root/pi-web-ui';
 const SNAPSHOT_RELATIVE = 'docs/contract/internal-api-client-snapshot.json';
 
 /** Human-visible resolution order (also asserted by tests). */
 export const SNAPSHOT_SEARCH_PATHS: readonly string[] = [
   '$PI_ORCH_SNAPSHOT_PATH',
-  `${DEFAULT_SERVER_CHECKOUT}/${SNAPSHOT_RELATIVE}`,
+  `$PI_WEB_UI_REPO/${SNAPSHOT_RELATIVE}`,
+  `~/pi-web-ui/${SNAPSHOT_RELATIVE}`,
   '<pi-orch repo>/contract/internal-api-client-snapshot.json',
 ];
 
@@ -65,6 +67,8 @@ function dirnameOfImportMeta(): string {
 export function loadSnapshot(options: {
   env?: Record<string, string | undefined>;
   serverCheckoutRoot?: string;
+  /** HOME override for tests; defaults to the real home directory. */
+  home?: string;
   repoRoot?: string;
 } = {}): LoadedSnapshot {
   const env = options.env ?? process.env;
@@ -74,10 +78,26 @@ export function loadSnapshot(options: {
     return { ...readAndValidate(override), source: 'env' };
   }
 
-  const serverRoot = options.serverCheckoutRoot ?? DEFAULT_SERVER_CHECKOUT;
-  const serverPath = join(serverRoot, SNAPSHOT_RELATIVE);
-  if (existsSync(serverPath)) {
-    return { ...readAndValidate(serverPath), source: 'server-checkout' };
+  // Explicit repo roots (a test seam, or PI_WEB_UI_REPO): the checkout must
+  // carry the snapshot. Falling through to another copy would hide the very
+  // skew the operator set the variable to avoid.
+  const explicitRoot = options.serverCheckoutRoot ?? env.PI_WEB_UI_REPO;
+  if (explicitRoot) {
+    const source: SnapshotSource = options.serverCheckoutRoot ? 'server-checkout' : 'repo-env';
+    const namedBy = options.serverCheckoutRoot ? 'the serverCheckoutRoot option' : 'PI_WEB_UI_REPO';
+    const serverPath = join(explicitRoot, SNAPSHOT_RELATIVE);
+    if (!existsSync(serverPath) && !options.serverCheckoutRoot) {
+      throw new Error(
+        `pi-orch: ${namedBy} is set to ${explicitRoot} but ${serverPath} does not exist — point it at a Pi Web UI checkout ` +
+          `(the snapshot is generated there with scripts/generate-client-snapshot.ts) or unset it to use the bundled copy`,
+      );
+    }
+    return { ...readAndValidate(serverPath), source };
+  }
+
+  const homePath = join(options.home ?? homedir(), 'pi-web-ui', SNAPSHOT_RELATIVE);
+  if (existsSync(homePath)) {
+    return { ...readAndValidate(homePath), source: 'home-checkout' };
   }
 
   const fallback = options.repoRoot

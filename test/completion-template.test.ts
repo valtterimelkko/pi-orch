@@ -1,14 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { COMPLETION_REPORT_INSTRUCTION, applyCompletionTemplate } from '../src/completion-template.ts';
 
 /**
  * C3b item 1: the dispatch template is ONE module constant, and the test pins
  * it to the paragraph C3a recorded verbatim (C3a.md correction 01 §1) — the
  * exact instruction live-proven at 16/16 parse rate on the server side. Two
- * pins: a verbatim in-test copy (portable) and, when the C3a evidence bundle
- * is reachable at its canonical lane path, the file itself (drift-proof).
+ * pins: a verbatim in-test copy (readable) and a committed fixture that keeps
+ * the byte-pin after the C3a worktree is deleted (item 3: no host paths in
+ * tests). The fixture carries its provenance in its own `source` field.
  */
 
 const VERBATIM_FROM_C3A = [
@@ -21,23 +22,16 @@ const VERBATIM_FROM_C3A = [
   'Fill in the real values; add "tests", "commits", "openIssues" or "blockedReason" fields only if they apply. Do not end your turn with only a tool call: after your final tool call, always write a short final answer that ends with the report block. Nothing after the closing fence.',
 ].join('\n');
 
-const C3A_MD = '/root/.worktrees/orch-scaling/c3b-pi-web-ui/docs/plans/execution-reports/orchestration-scaling/C3a.md';
+const FIXTURE = new URL('./fixtures/completion-instruction.json', import.meta.url);
 
 test('the template constant is the paragraph C3a recorded verbatim', () => {
   assert.equal(COMPLETION_REPORT_INSTRUCTION, VERBATIM_FROM_C3A);
 });
 
-test('when the C3a evidence bundle is reachable, the constant matches the FILE, not just the copy', () => {
-  if (!existsSync(C3A_MD)) return; // portable pin above still holds
-  const text = readFileSync(C3A_MD, 'utf8');
-  const start = text.indexOf('```text\nEND-OF-TASK REPORT');
-  assert.ok(start !== -1, 'C3a.md correction 01 carries the verbatim paragraph');
-  const bodyStart = start + '```text\n'.length;
-  const endSentinel = 'Nothing after the closing fence.';
-  const end = text.indexOf(endSentinel, bodyStart);
-  assert.ok(end !== -1);
-  const fromFile = text.slice(bodyStart, end + endSentinel.length);
-  assert.equal(COMPLETION_REPORT_INSTRUCTION, fromFile);
+test('the constant matches the committed fixture byte for byte (drift-proof after the C3a worktree is gone)', () => {
+  const fixture = JSON.parse(readFileSync(FIXTURE, 'utf8')) as { source: string; paragraph: string };
+  assert.ok(fixture.source.length > 0, 'the fixture carries its provenance');
+  assert.equal(COMPLETION_REPORT_INSTRUCTION, fixture.paragraph);
 });
 
 test('the template names the schema, the fence info string and the last-thing rule', () => {

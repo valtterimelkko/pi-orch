@@ -364,7 +364,7 @@ test('correction04/7: a stale snapshot warns on stderr and flags the JSON, witho
 
 test('correction04/7: a matching snapshot produces no warning and stale:false', async () => {
   // Hermetic: pin the snapshot to the BUNDLED copy and compare against its own
-  // version, so the host's /root/pi-web-ui checkout (which may be newer or
+  // version, so the host's own Pi Web UI checkout (which may be newer or
   // older than the bundle) cannot flip this test either way.
   const bundledPath = join(process.cwd(), 'contract', 'internal-api-client-snapshot.json');
   const bundledVersion = (JSON.parse(readFileSyncStr(bundledPath, 'utf8')) as { contractVersion: string }).contractVersion;
