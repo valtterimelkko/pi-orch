@@ -12,7 +12,6 @@ import {
   questionSentinel,
   deadlineCondition,
   buildPreflightSpec,
-  defaultConditions,
 } from './builders.ts';
 import type { WatchConditionSpec } from './parsers.ts';
 import { ApiError } from './parsers.ts';
@@ -141,11 +140,12 @@ Verbs:
        [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
   result <runId> [--transcript]        receipt final text + evidence pointers
   verify <sessionId> [--run-id id]     re-check completion claims (read-only git):
-       [--since ref] [--rerun "cmd"]   commits exist in their repos (reachable
-       [--cwd dir] [--repo dir]        from --since), filesChanged evidence, blocked
-       [--rerun-timeout S]             needs a reason; --rerun runs ONLY the command
-                                       you name, in the child's cwd. Verdicts:
-                                       verified (0) / contradicted (20) / unverifiable (21)
+       [--since ref] [--rerun "cmd"]   commits exist in their repos (reachability
+       [--cwd dir] [--repo dir]        checked against --since), filesChanged
+       [--rerun-timeout S]             CHANGE evidence, blocked needs a reason;
+                                       --rerun runs ONLY the command you name, in
+                                       the child's cwd. Verdicts: verified (0) /
+                                       contradicted (20) / unverifiable (21)
   cleanup <sessionId> [--lease id --owner id] [--watch id]
                                        release the owned lease, then delete
   status [--parent id] | [sessionId]   children by parent: busy, goal, last run
@@ -176,8 +176,10 @@ Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end+paused matc
 
 Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interrupted
   6 never started · 7 budget exceeded · 8 cancelled · 9 transport lost
-  10 admission refused · 11 preflight failed · 12 refused busy · 13 verify stub
-  14 prompt not executed · 15 turn stalled. Full table: README.md
+  10 admission refused · 11 preflight failed · 12 refused busy · 14 prompt not
+  executed · 15 turn stalled · 16 wait target not found · 17 goal cleared
+  18 create unknown · 19 watch conflict · 20 verify contradicted
+  21 verify unverifiable · 22 template not delivered. Full table: README.md
 `;
 
 export async function runCli(argv: string[], deps: CliDeps): Promise<CliResult> {
@@ -307,7 +309,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         agentOsCapture: flagString(args, 'agent-os-capture'),
         completionTemplate: args.flags.has('no-completion-template') ? false : undefined,
       });
-      return output(json, body, (value) => {
+      const rendered = output(json, body, (value) => {
         const spawned = value as { sessionId: string; leaseId?: string; parentId?: string; resolvedModel?: string };
         if (args.flags.has('id-only')) return spawned.sessionId;
         return [
@@ -319,6 +321,16 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
           .filter(Boolean)
           .join('\n');
       });
+      // Correction 01 item 5: a template that could NOT be delivered (both
+      // follow-up attempts failed) is a real failure the parent must see —
+      // distinct exit 22 + a clear warning; --json keeps the raw fields.
+      const templateError = ((body as { raw?: { __templateFollowUpError?: unknown } }).raw)?.__templateFollowUpError;
+      if (templateError === undefined) return rendered;
+      return {
+        ...rendered,
+        exitCode: 22,
+        stderr: `pi-orch: TEMPLATE_NOT_DELIVERED — the completion template could not be delivered to ${(body as { sessionId?: string }).sessionId ?? 'the child'}: ${String(templateError)}. The child holds only the pointer objective, not the full report instructions; re-send the template with 'prompt <sessionId> --message <instructions>' or re-dispatch.`,
+      };
     }
     case 'prompt': {
       const sessionId = args.positional[0];
@@ -366,9 +378,10 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       }
       const sessionId = args.positional[0];
       if (!sessionId) throw new UsageError('wait needs <sessionId>');
-      const conditions = conditionsFlag
-        ? parseConditionList(conditionsFlag, objective)
-        : defaultConditions(objective, deadlineSeconds * 1000);
+      // C3b correction 01 item 1: no pre-baked default conditions — the client
+      // detects an active goal when neither --conditions nor --objective is
+      // given and applies goal or plain conditions AFTER detection.
+      const conditions = conditionsFlag ? parseConditionList(conditionsFlag, objective) : undefined;
       const outcome = await getClient().wait({
         sessionId,
         runId: flagString(args, 'run-id'),

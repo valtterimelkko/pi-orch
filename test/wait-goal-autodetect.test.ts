@@ -232,3 +232,22 @@ test('agent_end firing on a run-less wait does NOT declare completed while a goa
   assert.equal(outcome.kind, 'goal_achieved', `got ${outcome.kind}`);
   assert.ok(outcome.note?.includes('auto-detected'));
 });
+
+test('waitMany preflight uses each child\'s DETECTED objective: a completed brief-run receipt + running goal is not an early completed', async () => {
+  const { deps, state } = makeDeps();
+  // Probe: running. Preflight settlement read (with the detected objective):
+  // running (keep waiting). Slice reconcile settlement read: achieved.
+  state.goalScripts.set('goalchild', [running('Late goal'), running('Late goal'), achieved('Late goal')]);
+  state.receipts.set('r1', { runId: 'r1', sessionId: 'goalchild', runtime: 'pi', status: 'completed', acceptedAt: 't' });
+
+  const result = await waitOnChildren({
+    mode: 'all',
+    children: [{ sessionId: 'goalchild', runId: 'r1' }],
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps,
+  });
+  const outcome = result.children[0]?.outcome;
+  assert.equal(outcome?.kind, 'goal_achieved', `no early completed: got ${outcome?.kind}`);
+  assert.ok((outcome as Extract<WaitOutcome, { kind: 'goal_achieved' }>).note?.includes('auto-detected'));
+});

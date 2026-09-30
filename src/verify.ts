@@ -3,7 +3,8 @@
  * block against the filesystem. READ-ONLY by construction:
  *   - git runs through an allow-list of read-only subcommands, spawned with
  *     argv arrays (never a shell), so block content can never inject anything;
- *   - claimed files are only ever probed (existence/tree/log), never written;
+ *   - claimed files are only ever probed (change evidence from claimed-commit
+ *     diffs and the working tree), never written;
  *   - the ONLY command ever executed is the one the PARENT names explicitly
  *     with `--rerun "<cmd>"` (run in the child's cwd, bounded by a timeout) —
  *     commands claimed by the child are recorded, never re-run automatically;
@@ -23,7 +24,7 @@ import type { CompletionBlock, CompletionParseError } from './completion.ts';
 export interface VerifyInput {
   sessionId: string;
   runId?: string;
-  /** Claimed commits must be reachable from this base (branch/sha). */
+  /** Claimed commits must be reachable from this base (a ref/sha the parent names; the schema has no branch field). */
   since?: string;
   /** The ONE command verify may execute — the parent names it, verbatim. */
   rerun?: string;
@@ -233,38 +234,38 @@ export async function verifyChild(
       claims.push(claimRow('file', file, 'path safety (relative, inside the repo)', 'unverifiable', 'unsafe path: not a relative path inside the repo'));
       continue;
     }
-    if (deps.fileExists(join(filesRepo, file))) {
-      claims.push(claimRow('file', file, `exists in the working tree of ${filesRepo}`, 'verified'));
-      continue;
-    }
+    // Correction 01 item 4 (parent decision): filesChanged means CHANGED.
+    // Evidence is (a) the path appears in a claimed commit's diff, or (b) the
+    // working tree shows it modified/added/deleted/untracked. A path that
+    // exists but is clean and absent from every claimed commit is contradicted.
     let evidence: string | undefined;
     for (const commit of block.commits ?? []) {
       if (commit.repo !== filesRepo) continue;
-      const tree = await deps.git(['cat-file', '-e', `${commit.sha}:${file}`], { repo: filesRepo });
-      if (tree.exitCode === 0) {
-        evidence = `present in the tree of ${commit.sha.slice(0, 12)}`;
-        break;
-      }
       const nameStatus = await deps.git(['diff-tree', '--root', '--no-commit-id', '--name-status', '-r', commit.sha], { repo: filesRepo });
-      const deleted = nameStatus.stdout.split('\n').some((line) => {
-        const [status, ...pathParts] = line.trim().split('\t');
-        return (status === 'D' || status?.startsWith('D')) && pathParts.join('\t') === file;
-      });
-      if (deleted) {
-        evidence = `deleted in ${commit.sha.slice(0, 12)}`;
-        break;
+      if (nameStatus.exitCode === 0) {
+        const changed = nameStatus.stdout.split('\n').some((line) => {
+          const [status, ...pathParts] = line.trim().split('\t');
+          return status !== undefined && status.length > 0 && pathParts.join('\t') === file;
+        });
+        if (changed) {
+          evidence = `changed in ${commit.sha.slice(0, 12)}`;
+          break;
+        }
       }
     }
     if (evidence === undefined) {
-      const log = await deps.git(['log', '--format=%H', '-n', '1', '--', file], { repo: filesRepo });
-      if (log.stdout.trim().length > 0) {
-        evidence = `touched by ${log.stdout.trim().slice(0, 12)}`;
+      const status = await deps.git(['status', '--porcelain', '--', file], { repo: filesRepo });
+      const line = status.stdout.split('\n').map((entry) => entry.trim()).filter((entry) => entry.length > 0)[0];
+      if (line !== undefined) {
+        evidence = `working tree: ${line}`;
       }
     }
     if (evidence !== undefined) {
       claims.push(claimRow('file', file, `change evidence in ${filesRepo}`, 'verified', evidence));
+    } else if (deps.fileExists(join(filesRepo, file))) {
+      claims.push(claimRow('file', file, `change evidence in ${filesRepo}`, 'contradicted', 'exists but unchanged: clean in the working tree and absent from every claimed commit diff'));
     } else {
-      claims.push(claimRow('file', file, `change evidence in ${filesRepo}`, 'contradicted', 'file absent, not in any named commit tree, and no commit in the repo ever touched it'));
+      claims.push(claimRow('file', file, `change evidence in ${filesRepo}`, 'contradicted', 'no change evidence: the file is absent and no claimed commit changed it'));
     }
   }
 

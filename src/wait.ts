@@ -505,9 +505,11 @@ export async function waitOnChildren(options: {
   }
   const objectiveFor = (index: number): string | undefined => detectedByChild.get(index) ?? options.objective;
 
-  // Fast-fail preflight per child.
+  // Fast-fail preflight per child (C3b correction 01 item 2: the preflight
+  // must see each child's DETECTED objective, or an objective-armed settlement
+  // read cannot keep a goal child alive through a completed brief-run receipt).
   for (const [index, child] of options.children.entries()) {
-    const fast = await preflightWait({ ...child, objective: options.objective }, deps);
+    const fast = await preflightWait({ ...child, objective: detectedByChild.get(index) ?? options.objective }, deps);
     if (fast) results.set(index, fast);
   }
   const exitCodeForChild = (outcome: WaitOutcome | undefined): number =>

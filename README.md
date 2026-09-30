@@ -91,11 +91,15 @@ capture) and re-checks its cheap facts against the filesystem with READ-ONLY
 git:
 
 - every claimed commit exists in its claimed repo
-  (`git cat-file -e <sha>^{commit}`), and with `--since <base>` (or when the
-  block names a branch) is reachable from it;
-- every `filesChanged` entry shows evidence of change: present in the working
-  tree, present in a named commit tree, deleted in a named commit, or touched
-  by some commit — else contradicted;
+  (`git cat-file -e <sha>^{commit}`); pass `--since <base>` to additionally
+  require that each claimed commit is reachable from that base (the
+  `pi-completion/v1` schema has no branch field, so reachability is always
+  checked against the base the parent names);
+- every `filesChanged` entry shows CHANGE evidence: the path appears in a
+  claimed commit's diff (`git diff-tree`), or the working tree shows it
+  modified, added, deleted or untracked (`git status --porcelain`). A path
+  that exists but is clean and absent from every claimed commit is
+  contradicted ("exists but unchanged");
 - claimed commands with exit codes are recorded (never re-run automatically);
 - a claimed test is re-run ONLY when the parent names the exact command:
   `--rerun "npm test"` runs it once in the child's cwd (`--cwd`, bounded by
@@ -170,7 +174,8 @@ cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 | 18 | `CREATE_UNKNOWN` | A create lost its connection/response; the session may exist — reconcile with `status --parent` (never blindly re-spawn) |
 | 19 | `WATCH_CONFLICT` | An incompatible foreign watch is active on the child; the client never replaces foreign watches |
 | 20 | `VERIFY_CONTRADICTED` | verify found at least one claim contradicted by the filesystem (missing sha, wrong repo, file with no evidence of change, failed parent-named rerun, blocked without a reason) — the block lies somewhere |
-| 21 | `VERIFY_UNVERIFIABLE` | verify could not establish the claims: no completion captured, a typed parse error, an unsafe path, no repo to check against, or nothing independently checkable |
+| 21 | `VERIFY_UNVERIFIABLE` | verify could not establish the claims: no completion captured, a typed parse error, an unsafe path, no repo to check against, nothing independently checkable, or the named run belongs to another session |
+| 22 | `TEMPLATE_NOT_DELIVERED` | spawn: the goal completion-template follow-up failed both delivery attempts — the child holds only the pointer objective; re-send the template or re-dispatch |
 
 ## Development
 

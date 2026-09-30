@@ -16,7 +16,6 @@ import {
   goalEnd,
   goalPaused,
   questionSentinel,
-  defaultConditions,
   type CreateInput,
   type PromptInput,
 } from './builders.ts';
@@ -281,12 +280,16 @@ export class PiOrchClient {
     deadlineMs?: number;
     label?: string;
   }): Promise<WaitOutcome> {
-    const conditions = options.conditions ?? defaultConditions(options.objective, options.deadlineMs ?? this.waitDeadlineMs);
+    // C3b correction 01 item 1: do NOT pre-fill default conditions here.
+    // waitOnChild detects an active goal when neither conditions nor objective
+    // were supplied and applies the right defaults AFTER detection; an early
+    // defaultConditions() call here would bake in per-turn agent_end and
+    // bypass the detection entirely.
     const deps = this.waitDeps();
     return waitOnChild({
       sessionId: options.sessionId,
       runId: options.runId,
-      conditions,
+      conditions: options.conditions,
       objective: options.objective,
       deadlineMs: options.deadlineMs ?? this.waitDeadlineMs,
       sliceMs: this.waitSliceMs,
@@ -447,12 +450,30 @@ export class PiOrchClient {
    */
   async verify(input: VerifyInput): Promise<VerifyResult> {
     const deps = makeNodeVerifyDeps();
+    // C3b correction 01 item 3: a named run must belong to the requested
+    // session. A mismatched receipt is a caller mistake (typo, stale id) —
+    // never cheque someone else's claims against this child's filesystem.
+    // Mirrors wait's correction-04 fast-fail, but as an unverifiable verdict
+    // (exit 21), not a wait outcome.
+    let prefetched: (Receipt & ReceiptWithCompletion) | undefined;
+    if (input.runId) {
+      const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(input.runId)}`, { headers: this.headers() });
+      const receipt = parseReceipt(response.body) as Receipt & ReceiptWithCompletion;
+      if (receipt.sessionId !== input.sessionId) {
+        return {
+          sessionId: input.sessionId,
+          runId: input.runId,
+          verdict: 'unverifiable',
+          claims: [],
+          summary: `unverifiable: receipt belongs to another session (run ${input.runId} belongs to ${receipt.sessionId}, not ${input.sessionId})`,
+        };
+      }
+      prefetched = receipt;
+    }
     const loadCompletion = async (verifyInput: VerifyInput): Promise<CompletionLoad> => {
-      if (verifyInput.runId) {
-        const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(verifyInput.runId)}`, { headers: this.headers() });
-        const receipt = parseReceipt(response.body) as ReceiptWithCompletion;
-        if (receipt.completion || receipt.completionError) {
-          const resolved = resolveCompletion(receipt, undefined);
+      if (verifyInput.runId && prefetched) {
+        if (prefetched.completion || prefetched.completionError) {
+          const resolved = resolveCompletion(prefetched, undefined);
           return resolved ? { ...(resolved.completion !== undefined ? { block: resolved.completion } : {}), ...(resolved.error !== undefined ? { error: resolved.error } : {}), source: resolved.source } : {};
         }
       }

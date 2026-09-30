@@ -294,3 +294,67 @@ process.on('exit', () => {
 
 // Keep the unused-var lint honest: COMPLETION_OK is a shape reference.
 void COMPLETION_OK;
+
+// ─── Correction 01 item 3: verify --run-id must pin the receipt's session ───
+
+test('verify --run-id rejects a receipt that belongs to another session (unverifiable, reason named)', async () => {
+  const paths: string[] = [];
+  const transport = {
+    request: async (_method: string, path: string) => {
+      paths.push(path);
+      if (path === '/api/v1/runs/r1') {
+        return { status: 200, headers: {}, body: { runId: 'r1', sessionId: 'other-session', status: 'completed' }, raw: '{}' };
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  } as never;
+  const client = new (await import('../src/client.ts')).PiOrchClient({ transportInstance: transport });
+  const result = await client.verify({ sessionId: 's1', runId: 'r1' });
+  assert.equal(result.verdict, 'unverifiable', JSON.stringify(result));
+  assert.ok(result.summary.includes('another session'), `summary: ${result.summary}`);
+  assert.ok(result.summary.includes('other-session'));
+  assert.equal(result.claims.length, 0);
+  assert.ok(!paths.some((path) => path.includes('/sessions/')), 'no session-detail fallback on a mismatched run');
+});
+
+// ─── Correction 01 item 4: filesChanged means CHANGED (parent decision) ──────
+
+test('filesChanged: an unchanged tracked path is contradicted ("exists but unchanged")', async () => {
+  const repo = fixtureRepo('unchanged-path');
+  // a.txt exists and is CLEAN; the claimed commit (shaB) changed b.txt only.
+  const result = await verifyChild(
+    input({ cwd: repo.root }),
+    deps(),
+    async () => ({ block: block({ commits: [{ sha: repo.shaB, repo: repo.root }], filesChanged: ['a.txt'] }), source: 'receipt' as const }),
+  );
+  const row = result.claims.find((claim) => claim.kind === 'file');
+  assert.equal(row?.result, 'contradicted', JSON.stringify(row));
+  assert.ok(row?.detail?.includes('unchanged'), `detail: ${row?.detail}`);
+  assert.equal(result.verdict, 'contradicted');
+});
+
+test('filesChanged: a newly untracked file is verified as change evidence', async () => {
+  const repo = fixtureRepo('untracked-file');
+  writeFileSync(join(repo.root, 'new.txt'), 'new\n'); // untracked, not committed
+  const result = await verifyChild(
+    input({ cwd: repo.root }),
+    deps(),
+    async () => ({ block: block({ commits: [{ sha: repo.shaB, repo: repo.root }], filesChanged: ['new.txt'] }), source: 'receipt' as const }),
+  );
+  const row = result.claims.find((claim) => claim.kind === 'file');
+  assert.equal(row?.result, 'verified', JSON.stringify(row));
+  assert.ok(row?.detail?.includes('??') || row?.check?.includes('working tree'), `detail/check: ${row?.detail} / ${row?.check}`);
+  assert.equal(result.verdict, 'verified');
+});
+
+test('filesChanged: a modified tracked file is verified as change evidence', async () => {
+  const repo = fixtureRepo('modified-file');
+  writeFileSync(join(repo.root, 'a.txt'), 'alpha MODIFIED\n'); // tracked, modified, not committed
+  const result = await verifyChild(
+    input({ cwd: repo.root }),
+    deps(),
+    async () => ({ block: block({ commits: [{ sha: repo.shaB, repo: repo.root }], filesChanged: ['a.txt'] }), source: 'receipt' as const }),
+  );
+  const row = result.claims.find((claim) => claim.kind === 'file');
+  assert.equal(row?.result, 'verified', JSON.stringify(row));
+});

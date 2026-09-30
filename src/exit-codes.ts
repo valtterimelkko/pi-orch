@@ -37,7 +37,8 @@ export const EXIT_CODES: readonly ExitCodeEntry[] = [
   { code: 18, name: 'CREATE_UNKNOWN', meaning: 'A create (POST /sessions) lost its connection or response; the server may or may not have created the session — reconcile with status --parent (the client never blindly re-spawns)' },
   { code: 19, name: 'WATCH_CONFLICT', meaning: 'An incompatible watch owned by someone else is active on the child; the client never replaces foreign watches — use a different label or remove the watch' },
   { code: 20, name: 'VERIFY_CONTRADICTED', meaning: 'verify found at least one claim contradicted by the filesystem (missing sha, wrong repo, file with no evidence, failed parent-named rerun) — the block lies somewhere' },
-  { code: 21, name: 'VERIFY_UNVERIFIABLE', meaning: 'verify could not establish the claims: no completion captured, a typed parse error, an unsafe/absolute path, or nothing independently checkable' },
+  { code: 21, name: 'VERIFY_UNVERIFIABLE', meaning: 'verify could not establish the claims: no completion captured, a typed parse error, an unsafe/absolute path, nothing independently checkable, or the named run belongs to another session' },
+  { code: 22, name: 'TEMPLATE_NOT_DELIVERED', meaning: 'spawn: the goal completion-template follow-up failed both delivery attempts — the child holds only the pointer objective, not the full report instructions. Re-send the template or re-dispatch' },
 ];
 
 export const OUTCOME_EXIT_CODES: Record<string, number> = {
