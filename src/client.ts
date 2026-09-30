@@ -22,6 +22,7 @@ import {
 } from './builders.ts';
 import { parseReceipt, ApiError, type Receipt, type WatchConditionSpec } from './parsers.ts';
 import { resolveCompletion, type CompletionBlock, type CompletionParseError, type CompletionDelimiter, type CompletionCaptureSource, type ReceiptWithCompletion, type SessionDetailWithCompletion } from './completion.ts';
+import { COMPLETION_REPORT_INSTRUCTION } from './completion-template.ts';
 import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, type CompletionLoad } from './verify.ts';
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
 
@@ -119,11 +120,33 @@ export class PiOrchClient {
     }
     const raw = response.body as Record<string, unknown>;
     const retention = raw.retention as { leaseId?: string } | undefined;
+    const sessionId = String(raw.sessionId);
+    // C3b: a templated GOAL child gets the verbatim instruction paragraph as a
+    // queued follow_up (the server keeps objectives single-line, so the
+    // objective carries only the flattened pointer). follow_up queues on the
+    // busy arm turn and delivers after it — the C3a live-proven sequencing.
+    let templateFollowUpRunId: string | undefined;
+    if (input.goal && input.completionTemplate !== false) {
+      try {
+        const followUp = await this.prompt(sessionId, {
+          message: `Report instructions for your active goal (${input.goal.objective}):\n\n${COMPLETION_REPORT_INSTRUCTION}\n\nIf your goal is already complete, reply with the report block now. Otherwise keep working toward the goal and end your FINAL answer with the report block.`,
+          mode: 'follow_up',
+          idempotencyKey: `${this.randomId()}-tpl`,
+        });
+        templateFollowUpRunId = followUp.runId;
+      } catch (error) {
+        // The create stands; the parent can re-send the template itself. Named,
+        // never silent: the flag rides on the return value.
+        templateFollowUpRunId = undefined;
+        (raw as Record<string, unknown>).__templateFollowUpError = (error as Error).message;
+      }
+    }
     return {
-      sessionId: String(raw.sessionId),
+      sessionId,
       leaseId: retention?.leaseId,
       parentId: typeof raw.parentSessionId === 'string' ? raw.parentSessionId : undefined,
       resolvedModel: typeof raw.resolvedModel === 'string' ? raw.resolvedModel : undefined,
+      ...(templateFollowUpRunId !== undefined ? { templateFollowUpRunId } : {}),
       raw,
     };
   }

@@ -33,3 +33,18 @@ export function applyCompletionTemplate(task: string): string {
   if (task.includes(COMPLETION_REPORT_INSTRUCTION)) return task;
   return `${task}\n\n${COMPLETION_REPORT_INSTRUCTION}`;
 }
+
+/**
+ * Goal objectives are SINGLE-LINE on the server (createSessionBody refine),
+ * so the verbatim multi-line paragraph cannot ride in the objective itself.
+ * The goal injection instead appends this flattened, single-line POINTER
+ * (derived from the constant — same schema name, same follow-up promise) and
+ * the client delivers the verbatim paragraph as a follow_up prompt right
+ * after the create (the C3a live-proven shape, 16/16 parse rate).
+ */
+export function applyGoalObjectiveTemplate(objective: string): string {
+  if (!objective || objective.length === 0) throw new Error('pi-orch: completion template needs a non-empty task');
+  if (objective.includes('pi-completion/v1')) return objective;
+  const flat = COMPLETION_REPORT_INSTRUCTION.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
+  return `${objective} [When you finish: ${flat} (the full report instructions arrive as a follow-up message.)]`;
+}

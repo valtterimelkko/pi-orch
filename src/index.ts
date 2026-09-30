@@ -35,7 +35,7 @@ export { waitOnChild, type WaitOutcome, type WaitDeps } from './wait.ts';
 export { loadSnapshot, liveContractVersion, SNAPSHOT_SEARCH_PATHS, type ClientContractSnapshot, type LoadedSnapshot } from './snapshot.ts';
 export { ZodSpec, type ZodField } from './zod-spec.ts';
 export { EXIT_CODES, OUTCOME_EXIT_CODES, ERROR_CODE_EXIT_CODES, VERIFY_EXIT_CODES, exitCodeFor, nameFor } from './exit-codes.ts';
-export { COMPLETION_REPORT_INSTRUCTION, applyCompletionTemplate } from './completion-template.ts';
+export { COMPLETION_REPORT_INSTRUCTION, applyCompletionTemplate, applyGoalObjectiveTemplate } from './completion-template.ts';
 export {
   resolveCompletion,
   type CompletionBlock,

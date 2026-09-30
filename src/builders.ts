@@ -6,7 +6,7 @@
  */
 
 import type { WatchConditionSpec } from './parsers.ts';
-import { applyCompletionTemplate } from './completion-template.ts';
+import { applyCompletionTemplate, applyGoalObjectiveTemplate, COMPLETION_REPORT_INSTRUCTION } from './completion-template.ts';
 
 const RUNTIMES = ['pi', 'claude', 'opencode', 'antigravity', 'commandcode'] as const;
 export type Runtime = (typeof RUNTIMES)[number];
@@ -63,16 +63,20 @@ export function buildCreateBody(input: CreateInput): Record<string, unknown> {
       throw new Error('pi-orch: goal.maxTurns must be an integer in 1..100');
     }
     // C3b: goal children are the receipt-less class — the completion template
-    // rides on the objective by default so the block is captured on the
-    // session surface. The server caps the objective at 4000 chars AFTER our
-    // injection, so validate the final string and point at the opt-out.
+    // must reach them, but the server caps the objective at 4000 chars and
+    // requires it SINGLE-LINE, so the objective carries a flattened pointer
+    // (applyGoalObjectiveTemplate) and the client delivers the verbatim
+    // paragraph as a follow_up prompt after the create (C3a-proven shape).
     const templated = input.completionTemplate === false
       ? input.goal.objective
-      : applyCompletionTemplate(input.goal.objective);
+      : applyGoalObjectiveTemplate(input.goal.objective);
     if (templated.length > 4000) {
       throw new Error(
         `pi-orch: goal.objective with the completion template is ${templated.length} chars (server limit 4000); shorten the objective or pass completionTemplate: false / --no-completion-template`,
       );
+    }
+    if (templated.includes('\n')) {
+      throw new Error('pi-orch: goal.objective must be a single line (server rule)');
     }
     body.goal = { ...input.goal, objective: templated };
   }
