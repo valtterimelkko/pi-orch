@@ -69,6 +69,16 @@ export class Transport {
   private readonly requestTimeoutMs: number;
   private readonly retry: { maxAttempts: number; maxTotalWaitMs: number; capPerWaitMs: number; sleep?: (ms: number) => Promise<void> };
 
+  /**
+   * G1 correction 03: the longest duration a single guarded request can
+   * legitimately take — one request timeout plus the full Retry-After wait
+   * budget. Consumers that guard request spans with local locks derive their
+   * staleness ceiling from this instead of hard-coding one.
+   */
+  get guardedRequestCeilingMs(): number {
+    return this.requestTimeoutMs + this.retry.maxTotalWaitMs;
+  }
+
   constructor(config: TransportConfig) {
     if (!config.apiBase && !config.socketPath) {
       throw new Error('pi-orch: transport needs a socket path or an api base');

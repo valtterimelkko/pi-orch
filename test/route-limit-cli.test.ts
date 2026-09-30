@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { runCli, routeLimitOverrides, mergeRouteLimits, type CliDeps } from '../src/cli.ts';
 import { nameFor } from '../src/exit-codes.ts';
 
@@ -183,4 +184,18 @@ test('prompt accepts --owner for route counting (correction01/4 CLI surface)', a
   );
   assert.equal(result.exitCode, 0);
   assert.equal(seen?.routeOwner, 'o1');
+});
+
+test('correction03/4: the REAL binary maps --route-limit bad to exit 2 with a usage message and no stack', () => {
+  
+  const bin = new URL('../bin/pi-orch', import.meta.url).pathname;
+  const run = spawnSync(process.execPath, [bin, 'spawn', '--runtime', 'pi', '--cwd', '/tmp', '--model-selector', 'zai/glm-5.3-flash', '--route-limit', 'bad'], {
+    encoding: 'utf8',
+    env: { ...process.env, NODE_ENV: 'test' },
+    timeout: 30_000,
+  });
+  assert.equal(run.status, 2, `expected usage exit 2, got ${run.status}; stderr head: ${(run.stderr ?? '').slice(0, 200)}`);
+  assert.match(run.stderr ?? '', /--route-limit/);
+  assert.match(run.stderr ?? '', /usage:/);
+  assert.doesNotMatch(run.stderr ?? '', /^\s+at /m, 'no stack frames on stderr');
 });

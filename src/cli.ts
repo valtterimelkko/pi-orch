@@ -579,8 +579,13 @@ export function makeClientFactory(argv: string[]): (config: { parentSessionId?: 
   const socket = flagString(args, 'socket') ?? process.env.PI_WEB_UI_SOCKET ?? defaultSocketPath(process.env);
   const tokenPath = flagString(args, 'token-path') ?? process.env.PI_WEB_UI_TOKEN_PATH ?? defaultTokenPath(process.env);
   const apiBase = flagString(args, 'api-base') ?? process.env.PI_WEB_UI_API_BASE;
-  const routeLimits = mergeRouteLimits(process.env, routeLimitOverrides(args.repeatable.get('route-limit') ?? []));
+  // Correction 03 item 4: the route-limit flags are parsed LAZILY, inside the
+  // closure — runCli calls the factory within its own try, so a junk value
+  // surfaces as a UsageError → exit 2 with the usage text, never an uncaught
+  // stack from main() before runCli can map it.
+  let routeLimits: Record<string, number> | undefined;
   return ({ parentSessionId }) => {
+    routeLimits ??= mergeRouteLimits(process.env, routeLimitOverrides(args.repeatable.get('route-limit') ?? []));
     const token = readToken(tokenPath);
     return new PiOrchClient({
       transport: { socketPath: apiBase ? undefined : socket, apiBase, token },

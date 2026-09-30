@@ -753,3 +753,72 @@ test('correction01/8: caps configured + a selector-less spawn warns once that it
   assert.match(warnings[0] ?? '', /--model-selector/);
   assert.match(warnings[0] ?? '', /not counted/);
 });
+
+// ── correction 03 ──────────────────────────────────────────────────────────
+
+test('correction03/2: repeated sequential spawns after the 404 fallback at cap 1 create exactly one (owner ledger records + owner-scope lock)', async () => {
+  const ledger = tmpLedger();
+  const inner = fakeTransport({ children: [] });
+  const created: FakeChild[] = [];
+  const transport = {
+    request: async (method: string, path: string, options_: { body?: Record<string, unknown> } = {}): Promise<TransportResponse> => {
+      if (method === 'GET' && path.startsWith('/api/v1/sessions?')) {
+        throw new ApiError(404, 'SESSION_NOT_FOUND', 'Parent session not found: stale-id');
+      }
+      if (method === 'POST' && path === '/api/v1/sessions') {
+        const sessionId = `c-${created.length + 1}`;
+        created.push({ sessionId, model: ZAI, busy: true });
+        return ok({ sessionId });
+      }
+      if (method === 'GET' && (path === '/api/v1/sessions' || path.startsWith('/api/v1/sessions?'))) {
+        return ok({ sessions: created.map((entry) => ({ sessionId: entry.sessionId, model: entry.model, busy: true })) });
+      }
+      return (inner.transport as { request: (m: string, p: string, o?: { body?: Record<string, unknown> }) => Promise<TransportResponse> }).request(method, path, options_);
+    },
+  } as never;
+  const client = gateClient(transport, {
+    parentSessionId: 'stale-id',
+    routeLimits: { [ZAI]: 1 },
+    spawnLedgerPath: ledger,
+    spawnLockDir: join(ledger, '..', 'locks'),
+  });
+  const first = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, retention: { mode: 'durable', ownerId: 'o1' } });
+  assert.ok(first.sessionId.startsWith('c-'));
+  // The create must be recorded in the owner's ledger (the effective counting domain).
+  const onDisk = JSON.parse(readFileSync(ledger, 'utf8')) as Array<{ sessionId: string; ownerId?: string }>;
+  assert.equal(onDisk.length, 1, 'the fallback create is recorded in the owner ledger');
+  assert.equal(onDisk[0]?.ownerId, 'o1');
+  // Second sequential spawn: the owner count now sees the first child → refused.
+  await assert.rejects(
+    client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, retention: { mode: 'durable', ownerId: 'o1' } }),
+    (error: unknown) => error instanceof RouteLimitError,
+  );
+  assert.equal(created.length, 1, 'exactly one create across the repeated fallback spawns');
+});
+
+test('correction03/3: the prompt gate fails closed on unknown target liveness (counts siblings, refuses over the cap)', async () => {
+  const inner = fakeTransport({
+    children: [{ sessionId: 'busy1', model: ZAI, busy: true }],
+    all: [
+      { sessionId: 'busy1', model: ZAI, busy: true },
+      { sessionId: 'target', model: ZAI, busy: false },
+    ],
+  });
+  const transport = {
+    request: async (method: string, path: string, options_: { body?: Record<string, unknown> } = {}): Promise<TransportResponse> => {
+      if (path === '/api/v1/sessions/target/goal' || path === '/api/v1/sessions/target/evidence') {
+        throw new ApiError(503, 'SERVER_BUSY', 'projection read failing');
+      }
+      return (inner.transport as { request: (m: string, p: string, o?: { body?: Record<string, unknown> }) => Promise<TransportResponse> }).request(method, path, options_);
+    },
+  } as never;
+  const client = gateClient(transport, { parentSessionId: 'parent-1', routeLimits: { [ZAI]: 1 } });
+  await assert.rejects(
+    client.prompt('target', { message: 'go' }),
+    (error: unknown) => {
+      assert.ok(error instanceof RouteLimitError);
+      assert.deepEqual(error.live.map((entry) => entry.sessionId), ['busy1']);
+      return true;
+    },
+  );
+});

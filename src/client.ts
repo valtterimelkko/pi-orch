@@ -26,7 +26,7 @@ import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, t
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
 import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError } from './route-limits.ts';
 import { SpawnLedger, defaultLedgerPath } from './spawn-ledger.ts';
-import { withRouteLock } from './route-lock.ts';
+import { withRouteLock, ROUTE_LOCK_STALE_MARGIN_MS } from './route-lock.ts';
 import { dirname } from 'node:path';
 
 export interface ClientConfig {
@@ -68,6 +68,8 @@ export class PiOrchClient {
   private readonly routeLockTimeoutMs: number;
   private readonly onWarn: (line: string) => void;
   private readonly warned = new Set<string>();
+  /** Correction 03 item 2: parent ids discovered stale (404 on the ?parent= lookup). */
+  private readonly staleParentIds = new Set<string>();
 
   constructor(config: ClientConfig) {
     if (config.transportInstance === undefined && config.transport === undefined) {
@@ -92,6 +94,17 @@ export class PiOrchClient {
     if (this.warned.has(key)) return;
     this.warned.add(key);
     this.onWarn(line);
+  }
+
+  /**
+   * Correction 03 item 1: how long an unattended lock file may sit before it
+   * is considered wedged — the transport's guarded-request ceiling (request
+   * timeout + Retry-After budget) plus a margin. Stealing still requires the
+   * recorded holder PID to be dead first.
+   */
+  private get routeLockStaleMs(): number {
+    const ceiling = (this.transport as { guardedRequestCeilingMs?: number }).guardedRequestCeilingMs;
+    return (typeof ceiling === 'number' ? ceiling : 30_000 + 120_000) + ROUTE_LOCK_STALE_MARGIN_MS;
   }
 
   /** The cap for one spawn/prompt call: the per-call value wins; 0 lifts the cap.
@@ -187,6 +200,9 @@ export class PiOrchClient {
         return { count: live.length, live, countedBy: 'parent' };
       } catch (error) {
         if ((error as { status?: number }).status !== 404) throw error;
+        // Correction 03 item 2: remember the stale identity so the gate locks
+        // and records in the OWNER scope from the next attempt on.
+        this.staleParentIds.add(this.parentSessionId);
         if (!owner) {
           this.warnOnce(`pi-orch: ROUTE_LIMIT_UNCOUNTED — parent session ${this.parentSessionId} is not known to this server; cannot count live children on route '${route}'; proceeding without the limit`);
           return { count: 0, live: [], countedBy: 'none' };
@@ -296,7 +312,7 @@ export class PiOrchClient {
     // The create itself, so the gate can hold the route lock ACROSS the
     // count and the create POST (correction 01 item 1: two concurrent spawns
     // at the cap must not both create).
-    const runCreate = async (): Promise<{
+    const runCreate = async (recordLedger: boolean): Promise<{
       raw: Record<string, unknown>;
       retention: { leaseId?: string } | undefined;
       sessionId: string;
@@ -323,9 +339,12 @@ export class PiOrchClient {
       const sessionId = String(raw.sessionId);
       // G1: bare-CLI bookkeeping — the spawn ledger is how a caller with no
       // session identity counts its own children by retention owner later.
-      // Written only without an identity: with one, ?parent= counting is
+      // Written when the caller has no identity, or when counting ran in the
+      // OWNER scope (correction 03 item 2: a stale parent that falls back to
+      // the owner ledger must also record there, or the cap never sees the
+      // new child). With a healthy identity, ?parent= counting is
       // server-authoritative and the ledger would be a second, weaker copy.
-      if (!this.parentSessionId) {
+      if (recordLedger) {
         const recorded = this.spawnLedger.record({
           sessionId,
           route: modelSelector,
@@ -344,7 +363,7 @@ export class PiOrchClient {
     // count and the create POST — a --wait-for-slot wait happens OUTSIDE it.
     const created = routeLimit !== undefined && modelSelector
       ? await this.spawnUnderRouteGate(modelSelector, owner, routeLimit, input.waitForSlotMs, runCreate)
-      : await runCreate();
+      : await runCreate(!this.parentSessionId);
     const { raw, retention, sessionId } = created;
     // C3b: a templated GOAL child gets the verbatim instruction paragraph as a
     // queued follow_up (the server keeps objectives single-line, so the
@@ -377,15 +396,21 @@ export class PiOrchClient {
     owner: string | undefined,
     limit: number,
     waitForSlotMs: number | undefined,
-    create: () => Promise<{ raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string }>,
+    create: (recordLedger: boolean) => Promise<{ raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string }>,
   ): Promise<{ raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string }> {
-    const key = `${this.parentSessionId ?? (owner ? `owner:${owner}` : 'no-identity')}|${route}`;
+    // Correction 03 item 2: lock in the EFFECTIVE counting scope — the owner
+    // ledger once the parent identity is known stale (or absent), the parent
+    // identity otherwise.
+    const useOwnerScope = owner !== undefined && (!this.parentSessionId || this.staleParentIds.has(this.parentSessionId));
+    const key = `${useOwnerScope ? `owner:${owner}` : this.parentSessionId ?? 'no-identity'}|${route}`;
     const deadline = waitForSlotMs !== undefined ? Date.now() + waitForSlotMs : undefined;
     for (;;) {
-      const outcome = await withRouteLock({ dir: this.spawnLockDir, key, timeoutMs: this.routeLockTimeoutMs }, async (): Promise<{ action: 'wait'; live: Array<{ sessionId: string; reason: string }> } | { action: 'create'; response: { raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string } }> => {
+      const outcome = await withRouteLock({ dir: this.spawnLockDir, key, timeoutMs: this.routeLockTimeoutMs, staleMs: this.routeLockStaleMs }, async (): Promise<{ action: 'wait'; live: Array<{ sessionId: string; reason: string }> } | { action: 'create'; response: { raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string } }> => {
         const { count, live, countedBy } = await this.countLiveOnRoute(route, owner);
         if (countedBy !== 'none' && count >= limit) return { action: 'wait', live };
-        return { action: 'create', response: await create() };
+        // Record in the ledger whenever the owner ledger is the effective
+        // counting domain (bare CLI, or a stale parent falling back to it).
+        return { action: 'create', response: await create(countedBy === 'owner') };
       });
       if (outcome.action === 'create') return outcome.response;
       if (waitForSlotMs === undefined) throw new RouteLimitError(route, limit, outcome.live);
@@ -512,7 +537,10 @@ export class PiOrchClient {
     if (limit === undefined) return;
     const [goal, evidence] = await Promise.all([this.goalStatusOf(sessionId), this.lastRunStatusOf(sessionId)]);
     if (liveReason({ busy: detail.busy === true, goalStatus: goal.value, lastRunStatus: evidence.value })) return; // live: no new concurrency
-    if (goal.failed || evidence.failed) return; // liveness unknown → fail closed: never gate on an unknown child
+    // Correction 03 item 3: unknown target liveness must FAIL CLOSED — the
+    // target may be idle, and the prompt would start a new turn over the
+    // cap. Count the siblings and gate normally (an actually-live target is
+    // already in the route count; prompting it adds no new generation).
     // Correction 01 item 4: a bare-CLI caller counts the TARGET's owner (from
     // the local spawn ledger), or an explicitly passed routeOwner (--owner on
     // the CLI), so an idle child cannot start a new turn past its owner's cap.
