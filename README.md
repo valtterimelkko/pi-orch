@@ -85,7 +85,8 @@ By default every dispatched `prompt` message and every `spawn --goal-objective` 
 |---|---|
 | `PI_WEB_UI_SOCKET` | Unix socket path (default `~/.pi-web-ui/internal-api.sock`) |
 | `PI_WEB_UI_TOKEN_PATH` | Bearer token file (default `~/.pi-web-ui/internal-api-token`) |
-| `PI_WEB_UI_API_BASE` | http base instead of the socket (tests/odd deployments) |
+| `PI_WEB_UI_API_BASE` | http(s) base instead of the socket (tests/odd deployments); **loopback hosts only** unless `PI_ORCH_ALLOW_REMOTE_API_BASE=1` is set, and a remote base must be `https:` |
+| `PI_ORCH_ALLOW_REMOTE_API_BASE` | Explicit opt-in (`1`) to a non-loopback `https:` API base; remote `http:` is never allowed |
 | `PI_WEB_UI_REPO` | Pi Web UI checkout root whose `docs/contract/` snapshot should be used (see below) |
 | `PI_ORCH_SNAPSHOT_PATH` | Contract snapshot file override (wins over everything; see below) |
 | `PI_ORCH_PARENT_SESSION` | Explicit parent id for bare-CLI parents |
@@ -95,9 +96,10 @@ CLI flags `--socket`, `--token-path`, `--api-base` and `--parent-session` overri
 
 ## Security model
 
-- The client talks to a **same-host Unix socket**; the bearer token is read from a file. Neither is sent over a network.
+- The client talks to a **same-host Unix socket** by default; the bearer token is read from a file and never crosses the network.
 - **The token must live outside this repository.** The code enforces it: resolving a credential path inside the package root — including through a symlink, and whether or not the file exists — is refused with a clear error and the distinct exit code **23 (`CREDENTIAL_IN_REPO`)**. A token that ends up in a checkout (or its history) is a leaked token; the guard stops the read before it happens.
-- `.gitignore` excludes `.env*`, token-shaped names and local artefacts, but **it is belt and braces, not the protection**. The guard is the protection.
+- **An HTTP API base must stay on this machine.** `PI_WEB_UI_API_BASE` (or `--api-base`) is accepted only when its host is loopback (`localhost`, `127.0.0.0/8`, `::1`). Any other host is refused with the distinct exit code **24 (`REMOTE_API_BASE_REFUSED`)** unless `PI_ORCH_ALLOW_REMOTE_API_BASE=1` is set explicitly — and even then only `https:` is accepted: plain `http:` to a remote host would send the bearer token in clear. The guard runs in the transport constructor, so it applies to the CLI and to the library alike.
+- `.gitignore` excludes `.env*`, token-shaped names and local artefacts, but **it is belt and braces, not the protection**. The guards are the protection.
 - `pi-orch` loads **no `.env` file of any kind**; the environment and the explicit flags are the only credential inputs. A test scans the sources to keep it that way.
 
 ## Contract snapshot (drift guard)
@@ -143,6 +145,7 @@ cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 | 21 | `VERIFY_UNVERIFIABLE` | verify could not establish the claims: no completion captured, a typed parse error, an unsafe path, no repo to check against, nothing independently checkable, or the named run belongs to another session |
 | 22 | `TEMPLATE_NOT_DELIVERED` | spawn: the goal completion-template follow-up failed both delivery attempts — the child holds only the pointer objective; re-send the template or re-dispatch |
 | 23 | `CREDENTIAL_IN_REPO` | a credential path (the Internal API token) resolves inside this repository; the token must come from outside the repo — point `PI_WEB_UI_TOKEN_PATH` at a path outside the package root |
+| 24 | `REMOTE_API_BASE_REFUSED` | `PI_WEB_UI_API_BASE` points at a non-loopback host (or a remote host over http); only a loopback API base or the Unix socket is allowed unless `PI_ORCH_ALLOW_REMOTE_API_BASE=1` is set, and even then a remote base must be `https:` |
 
 ## Skill pack
 

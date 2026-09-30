@@ -93,7 +93,8 @@ surfaces `SNAPSHOT_STALE` on stderr and in `--json`; it never blocks a command.
   number; a retired behaviour keeps its row (see `13 VERIFY_STUB`).
 - A new refusal class gets a **distinct** code and a matching row in the help
   text (`src/cli.ts`). The latest additions: `20/21` (verify verdicts), `22`
-  (template not delivered), `23` (`CREDENTIAL_IN_REPO`).
+  (template not delivered), `23` (`CREDENTIAL_IN_REPO`), `24`
+  (`REMOTE_API_BASE_REFUSED`).
 - Error mapping lives in `mapError` (`src/cli.ts`); server error codes map via
   `ERROR_CODE_EXIT_CODES`.
 
@@ -104,6 +105,13 @@ surfaces `SNAPSHOT_STALE` on stderr and in `--json`; it never blocks a command.
   `assertCredentialPathOutsideRepo` first: a path resolving inside the package
   root — through a symlink too, existing or not — is refused with
   `CredentialPathError` (`CREDENTIAL_IN_REPO`, exit 23).
+- **An http(s) API base must stay on the machine.** `assertApiBaseAllowed`
+  (called from the `Transport` constructor) accepts loopback hosts only
+  (`localhost`, `127.0.0.0/8`, `::1`); anything else is `ApiBaseRefusedError`
+  (`REMOTE_API_BASE_REFUSED`, exit 24) unless `PI_ORCH_ALLOW_REMOTE_API_BASE=1`
+  is set explicitly, and even then only `https:` — remote `http:` is always
+  refused. Keep the guard in the transport constructor and the README security
+  bullets exactly in step.
 - **No `.env` loading of any kind.** The environment and explicit CLI flags are
   the only credential inputs; `test/credentials-guard.test.ts` scans the
   sources to keep it that way.

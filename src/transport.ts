@@ -14,11 +14,18 @@ import { request } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { ApiError, parseApiError } from './parsers.ts';
 import { assertCredentialPathOutsideRepo } from './credentials.ts';
+import { assertApiBaseAllowed } from './api-base.ts';
 
 export interface TransportConfig {
   socketPath?: string;
-  /** Alternative to the socket, e.g. http://127.0.0.1:8080 (path prefix kept). */
+  /** Alternative to the socket, e.g. http://127.0.0.1:8080 (loopback only; see api-base.ts). */
   apiBase?: string;
+  /**
+   * Correction 01 item 2: explicitly opt in to a non-loopback https API base
+   * (the PI_ORCH_ALLOW_REMOTE_API_BASE=1 escape hatch; remote http is never
+   * allowed). Defaults to the environment variable's value.
+   */
+  allowRemoteApiBase?: boolean;
   token: string;
   /** Per-request timeout in ms (long-poll requests override this). */
   requestTimeoutMs?: number;
@@ -67,7 +74,11 @@ export class Transport {
       throw new Error('pi-orch: transport needs a socket path or an api base');
     }
     this.socketPath = config.socketPath;
-    this.apiBase = config.apiBase;
+    this.apiBase = config.apiBase === undefined
+      ? undefined
+      : assertApiBaseAllowed(config.apiBase, {
+          allowRemote: config.allowRemoteApiBase ?? process.env.PI_ORCH_ALLOW_REMOTE_API_BASE === '1',
+        });
     this.token = config.token;
     this.requestTimeoutMs = config.requestTimeoutMs ?? 30_000;
     this.retry = { maxAttempts: 3, maxTotalWaitMs: 120_000, capPerWaitMs: 30_000, ...config.retry };

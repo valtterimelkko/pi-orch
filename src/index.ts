@@ -59,6 +59,12 @@ export {
 } from './verify.ts';
 export { Transport, TransportError, readToken, parseRetryAfter } from './transport.ts';
 export {
+  ApiBaseRefusedError,
+  REMOTE_API_BASE_EXIT_CODE,
+  assertApiBaseAllowed,
+  isLoopbackHost,
+} from './api-base.ts';
+export {
   CredentialPathError,
   CREDENTIAL_IN_REPO_EXIT_CODE,
   assertCredentialPathOutsideRepo,
