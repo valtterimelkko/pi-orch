@@ -303,7 +303,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         const stdout = json ? `${JSON.stringify(body, null, 2)}` : body.children
           .map((child) => `${child.sessionId}: ${child.outcome?.kind ?? 'no outcome'}`)
           .join('\n');
-        return { exitCode: body.exitCode, stdout, ...(body.exitCode === 0 ? {} : { stderr: stdout }) };
+        return { exitCode: body.exitCode, stdout };
       }
       const sessionId = args.positional[0];
       if (!sessionId) throw new UsageError('wait needs <sessionId>');
