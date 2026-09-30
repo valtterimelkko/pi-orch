@@ -87,13 +87,16 @@ test('client.spawn with a goal: delivers the VERBATIM template as a follow_up pr
   const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
   const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
   assert.equal(calls[0]?.path, '/api/v1/sessions');
-  assert.equal(calls[1]?.path, '/api/v1/sessions/s-goal/prompt');
-  assert.equal(calls[1]?.body.mode, 'follow_up', 'the template rides as a queued follow-up (arm-turn safe)');
+  // G1: the prompt-side route gate reads the child's detail between create and
+  // dispatch; the template follow-up is still the first PROMPT after create.
+  const followUp = calls.find((call) => call.path === '/api/v1/sessions/s-goal/prompt');
+  assert.ok(followUp, 'a follow-up prompt followed the create');
+  assert.equal(followUp?.body.mode, 'follow_up', 'the template rides as a queued follow-up (arm-turn safe)');
   assert.ok(
-    String(calls[1]?.body.message).includes(COMPLETION_REPORT_INSTRUCTION),
+    String(followUp?.body.message).includes(COMPLETION_REPORT_INSTRUCTION),
     'the follow-up carries the VERBATIM paragraph',
   );
-  assert.ok(String(calls[1]?.body.message).includes('Ship the fix'), 'the follow-up names the goal task');
+  assert.ok(String(followUp?.body.message).includes('Ship the fix'), 'the follow-up names the goal task');
   assert.equal((spawned as { templateFollowUpRunId?: string }).templateFollowUpRunId, 'r-follow');
 });
 
@@ -145,8 +148,13 @@ test('client.spawn retries the template follow-up ONCE when the first delivery f
           : { runId, status: 'completed' };
         return ok({ runId, sessionId: 's-goal', detached: true, dispatchMode: 'follow_up' });
       }
-      const runId = path.split('/').pop() as string;
-      return ok(runReceipts[runId]);
+      if (path.startsWith('/api/v1/runs/')) {
+        const runId = path.split('/').pop() as string;
+        return ok(runReceipts[runId]);
+      }
+      // G1: the prompt-side route gate reads the child's detail first.
+      if (/^\/api\/v1\/sessions\/[^/]+$/.test(path)) return ok({ sessionId: 's-goal' });
+      return ok({});
     },
   } as never;
   const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });

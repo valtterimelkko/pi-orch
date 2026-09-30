@@ -71,4 +71,17 @@ export {
   isInsideRepo,
   packageRoot,
 } from './credentials.ts';
-export { runCli, main, type CliDeps, type CliResult, type ClientLike } from './cli.ts';
+export { runCli, main, routeLimitOverrides, mergeRouteLimits, type CliDeps, type CliResult, type ClientLike } from './cli.ts';
+export {
+  DEFAULT_ROUTE_LIMITS,
+  resolveRouteLimits,
+  limitFor,
+  routeOfSession,
+  liveReason,
+  RouteLimitError,
+  RouteLimitWaitDeadlineError,
+  RouteLimitsConfigError,
+  type LiveReason,
+} from './route-limits.ts';
+export { SpawnLedger, defaultLedgerPath, type LedgerEntry } from './spawn-ledger.ts';
+export { withRouteLock, routeLockPath, RouteLockTimeoutError } from './route-lock.ts';

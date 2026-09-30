@@ -38,23 +38,30 @@ function ok(body: unknown): TransportResponse {
 
 test('prompt with followUpOnBusy retries once in follow_up mode after 409 SESSION_BUSY', async () => {
   const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  let promptCalls = 0;
   const transport = {
     request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
       calls.push({ path, body: options.body ?? {} });
-      if (path.endsWith('/prompt') && calls.length === 1) {
-        throw new ApiError(409, 'SESSION_BUSY', 'Session is currently busy', { retryAfterSeconds: 2 });
+      // G1: the prompt-side route gate reads the child's detail first; the
+      // pinned behaviour below is about the PROMPT calls.
+      if (path.endsWith('/prompt')) {
+        promptCalls += 1;
+        if (promptCalls === 1) {
+          throw new ApiError(409, 'SESSION_BUSY', 'Session is currently busy', { retryAfterSeconds: 2 });
+        }
       }
-      return ok({ runId: 'r1', sessionId: 's1', detached: true, status: 'accepted', dispatchMode: calls.length > 1 ? 'follow_up' : 'prompt' });
+      return ok({ runId: 'r1', sessionId: 's1', detached: true, status: 'accepted', dispatchMode: promptCalls > 1 ? 'follow_up' : 'prompt' });
     },
   } as never;
   const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
   const result = await client.prompt('s1', { message: 'go', followUpOnBusy: true });
   assert.equal(result.runId, 'r1');
   assert.equal(result.dispatchMode, 'follow_up');
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1]?.body.mode, 'follow_up');
+  assert.equal(promptCalls, 2, 'exactly one retry');
+  assert.equal(calls.at(-1)?.path?.endsWith('/prompt'), true);
+  assert.equal(calls.at(-1)?.body.mode, 'follow_up');
   assert.ok(
-    typeof calls[1]?.body.message === 'string' && String(calls[1]?.body.message).startsWith('go\n\nEND-OF-TASK REPORT'),
+    typeof calls.at(-1)?.body.message === 'string' && String(calls.at(-1)?.body.message).startsWith('go\n\nEND-OF-TASK REPORT'),
     'C3b: the retried follow_up carries the same (templated) message',
   );
 });

@@ -234,7 +234,9 @@ test('correction04/3: prompt dispatch carries the idempotent marker (transport o
   const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k' });
   const result = await client.prompt('s1', { message: 'go' });
   assert.equal(result.runId, 'r9');
-  assert.equal(seenOptions[0]?._idempotent, true, 'prompt requests must be marked idempotent');
+  // G1: the prompt-side route gate's detail read is not idempotent-marked;
+  // the prompt POST itself must be.
+  assert.equal(seenOptions.at(-1)?._idempotent, true, 'prompt requests must be marked idempotent');
 });
 
 test('correction04/3: CLI maps CREATE_UNKNOWN to exit 18 with an outcome:unknown JSON body', async () => {

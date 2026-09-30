@@ -60,9 +60,10 @@ pi-orch models --runtime pi [--match sub]  # live selectors; exactly one match
 pi-orch spawn --runtime rt --cwd /dir [--model-selector SEL | --model-match SUB] \
   [--thinking LEVEL] [--owner ID --ttl S [--label L]] \
   [--goal-objective "..." --goal-max-turns N --goal-verify CMD] \
-  [--preflight-path P --preflight-tool T] [--agent-os-capture enabled|disabled]
+  [--preflight-path P --preflight-tool T] [--agent-os-capture enabled|disabled] \
+  [--route-limit 'SEL=N' ...] [--wait-for-slot S]
 pi-orch prompt <sessionId> --message "..."     # detached + idempotency key -> runId
-                                               # [--mode prompt|follow_up|steer]
+                                               # [--mode prompt|follow_up|steer] [--owner ID]
 pi-orch wait <sessionId> [--run-id <runId>] [--objective "..."] [--deadline S]
 pi-orch wait --all|--any <id>[@<runId>] ...    # several children, ONE long poll
 pi-orch result <runId> [--transcript]          # final text + completion + evidence
@@ -79,6 +80,27 @@ pi-orch help | --help | -h                     # usage on stdout, exit 0
 
 By default every dispatched `prompt` message and every `spawn --goal-objective` asks the child to end its final answer with a fenced `completion` block (schema `pi-completion/v1`: status, summary, commands with exit codes, tests, commits, filesChanged, openIssues, blockedReason). `result` parses it into `completion` / `completionError` fields; `verify` re-checks its cheap facts against the filesystem with read-only git (claimed commits exist, `filesChanged` shows change evidence, and a claimed test is re-run only when you name the exact command with `--rerun`). Use `--no-completion-template` for steering chatter that is not a task.
 
+### Per-route child concurrency
+
+One provider route can only serve so many children at once (measured 2026-09-30: zai GLM 5.3 Flash stops returning completions above roughly 5–8 concurrent children). `pi-orch` therefore caps the number of a caller's **live** children per model route:
+
+- The built-in default is `zai/glm-5.3-flash: 5`; every other route is unlimited until configured.
+- Configure with `PI_ORCH_ROUTE_LIMITS`, a JSON map of model selector → limit, and per call with repeatable `--route-limit 'SEL=N'` flags — the flag wins. `N=0` (or `unlimited`) lifts the cap for that route. A malformed limit map is a hard error, never a silent unlimited.
+- **Live** means the child can still be generating: busy, a nonterminal run receipt, or a goal `running`/`wrapping_up`. A finished idle child never counts.
+- `spawn` counts your live children on the route (by your session identity, or by your `--owner` retention owner for bare-CLI callers) and **refuses before creating anything** over the limit — exit **25 (`ROUTE_LIMIT`)**, naming the live children. With `--wait-for-slot S` it instead watches the live children and spawns when one settles; on timeout it exits **3 (`DEADLINE`)**. It never polls and never sleeps. The count→create span is serialised across processes with an exclusive lock file under the pi-orch state dir (held only across the count and the create POST; a wait for the lock is bounded and fails with a clear `ROUTE_LOCK_TIMEOUT` error).
+- `prompt` applies the same gate when it would START a new turn on an idle child of a limited route (a prompt to a live child queues after its current turn and cannot raise route concurrency; `steer` is never gated). A bare-CLI caller counts the target child's owner from the spawn ledger, or an explicitly passed `--owner`.
+- Counting uses the server's own views: `GET /sessions?parent=<your session>` when your identity is known; otherwise a local spawn ledger (`PI_ORCH_SPAWN_LEDGER`, default `~/.pi-orch/spawn-ledger.json`) keyed by your `--owner`. A stale identity falls back to the owner ledger when an owner is known. With neither an identity nor an owner the limit cannot be counted: the client warns once (`ROUTE_LIMIT_UNCOUNTED`) and proceeds.
+- **Caps apply only to spawns that name `--model-selector`** — a spawn with no selector on record is never counted against any cap, and the client warns once when caps are configured and such a spawn is made. If liveness reads fail for a child, it counts as live (fail closed).
+
+```bash
+PI_ORCH_ROUTE_LIMITS='{"zai/glm-5.3-flash": 2}' \
+  pi-orch spawn --runtime pi --cwd /task --model-selector zai/glm-5.3-flash --owner me
+# over the cap: exit 25 naming the live children
+# ... or wait for a slot instead:
+pi-orch spawn --runtime pi --cwd /task --model-selector zai/glm-5.3-flash \
+  --owner me --route-limit 'zai/glm-5.3-flash=2' --wait-for-slot 600
+```
+
 ## Environment
 
 | Variable | Meaning |
@@ -90,6 +112,8 @@ By default every dispatched `prompt` message and every `spawn --goal-objective` 
 | `PI_WEB_UI_REPO` | Pi Web UI checkout root whose `docs/contract/` snapshot should be used (see below) |
 | `PI_ORCH_SNAPSHOT_PATH` | Contract snapshot file override (wins over everything; see below) |
 | `PI_ORCH_PARENT_SESSION` | Explicit parent id for bare-CLI parents |
+| `PI_ORCH_ROUTE_LIMITS` | Per-route live-children cap, JSON map `{"model selector": limit}`; `0` = unlimited; a `--route-limit` flag wins |
+| `PI_ORCH_SPAWN_LEDGER` | Bare-CLI spawn ledger path (default `~/.pi-orch/spawn-ledger.json`) used to count live children by `--owner` |
 | `PI_ORCH_TSC` | Optional path to a TypeScript entry point for `npm run typecheck` |
 
 CLI flags `--socket`, `--token-path`, `--api-base` and `--parent-session` override the environment.
@@ -146,6 +170,7 @@ cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 | 22 | `TEMPLATE_NOT_DELIVERED` | spawn: the goal completion-template follow-up failed both delivery attempts — the child holds only the pointer objective; re-send the template or re-dispatch |
 | 23 | `CREDENTIAL_IN_REPO` | a credential path (the Internal API token) resolves inside this repository; the token must come from outside the repo — point `PI_WEB_UI_TOKEN_PATH` at a path outside the package root |
 | 24 | `REMOTE_API_BASE_REFUSED` | `PI_WEB_UI_API_BASE` points at a non-loopback host (or a remote host over http); only a loopback API base or the Unix socket is allowed unless `PI_ORCH_ALLOW_REMOTE_API_BASE=1` is set, and even then a remote base must be `https:` |
+| 25 | `ROUTE_LIMIT` | Refused BEFORE any child was created: you already have the limit's worth of live children on that model route (busy, nonterminal run, or goal running/wrapping_up). Use `--wait-for-slot`, wait manually, or spread across another route |
 
 ## Skill pack
 

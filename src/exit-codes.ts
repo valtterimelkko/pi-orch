@@ -41,6 +41,7 @@ export const EXIT_CODES: readonly ExitCodeEntry[] = [
   { code: 22, name: 'TEMPLATE_NOT_DELIVERED', meaning: 'spawn: the goal completion-template follow-up failed both delivery attempts — the child holds only the pointer objective, not the full report instructions. Re-send the template or re-dispatch' },
   { code: 23, name: 'CREDENTIAL_IN_REPO', meaning: 'A credential path (the Internal API token) resolves inside this repository; the token must come from outside the repo — point PI_WEB_UI_TOKEN_PATH at a path outside the package root' },
   { code: 24, name: 'REMOTE_API_BASE_REFUSED', meaning: 'PI_WEB_UI_API_BASE points at a non-loopback host (or a remote host over http); only a loopback API base or the Unix socket is allowed unless PI_ORCH_ALLOW_REMOTE_API_BASE=1 is set, and even then a remote base must be https:' },
+  { code: 25, name: 'ROUTE_LIMIT', meaning: 'G1: refused BEFORE any child was created — the caller already has the limit’s worth of live children on that model route (busy, nonterminal run, or goal running/wrapping_up). Use --wait-for-slot, wait manually, or spread across another route' },
 ];
 
 export const OUTCOME_EXIT_CODES: Record<string, number> = {
@@ -81,6 +82,8 @@ export const ERROR_CODE_EXIT_CODES: Record<string, number> = {
   TURN_STALLED: 15,
   ADMISSION_CAPACITY_EXHAUSTED: 10,
   SERVER_DRAINING: 10,
+  ROUTE_LIMIT_EXCEEDED: 25,
+  ROUTE_LIMIT_WAIT_DEADLINE: 3,
 };
 
 export function nameFor(code: number): string | undefined {
