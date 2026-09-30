@@ -228,5 +228,9 @@ test('correction05/2: without an objective, the completed last run still complet
     deps,
   });
   assert.equal(outcome.kind, 'completed');
-  assert.equal(state.projectionReads, 0, 'no projection read for plain children');
+  // C3b live-found race guard: the run-less reconcile reads the projection
+  // ONCE (bounded, per slice) so a goal the one-shot probe missed can settle
+  // the wait. A genuinely goal-less child (this test) still completes, with
+  // exactly that one extra read.
+  assert.equal(state.projectionReads, 1, 'one bounded guard read; outcome unchanged for plain children');
 });

@@ -370,12 +370,41 @@ async function reconcileReceipt(
       if (classified?.kind === 'completed' && options.objective) {
         return await settledGoalOutcome(options.sessionId, deps) ?? null;
       }
+      // C3b live-found race: the one-shot goal probe can run BEFORE the goal
+      // engine registers (fresh spawn), so a run-less wait without --objective
+      // may be on the plain path while a goal is actually active. A terminal
+      // last run then must NOT end the wait — re-check the goal here (bounded:
+      // once per long-poll slice) and let the goal settle it instead.
+      if (classified && !options.objective && !options.runId) {
+        const guard = await runlessGoalGuard(options.sessionId, deps);
+        if (guard === 'keep-waiting') return null;
+        if (guard) return withAutoGoalNote(guard);
+      }
       return classified;
     }
     return null;
   } catch {
     return null; // reconciliation is best-effort; the long poll remains the wake source
   }
+}
+
+/**
+ * C3b live-found race guard for the RUN-LESS path: reads the projection once
+ * per reconcile. 'keep-waiting' when a goal is active (a terminal receipt must
+ * not end the wait); a settled goal outcome when the projection has settled;
+ * null when there is genuinely no goal (plain children keep their path).
+ */
+async function runlessGoalGuard(sessionId: string, deps: WaitDeps): Promise<WaitOutcome | 'keep-waiting' | null> {
+  try {
+    const goal = await deps.getGoal(sessionId);
+    if (goal.status === 'running' || goal.status === 'wrapping_up') return 'keep-waiting';
+    if (['achieved', 'failed', 'cleared', 'paused'].includes(goal.status ?? '')) {
+      return goalEndOutcome(sessionId, '', deps);
+    }
+  } catch {
+    // unreadable projection: plain path
+  }
+  return null;
 }
 
 /** Read the live projection and classify it; null when the goal is still unsettled. */
@@ -653,6 +682,13 @@ async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps, objective
       // Correction 05 item 2: same settlement for the multi-child path.
       if (classified?.kind === 'completed' && objective) {
         return await settledGoalOutcome(child.sessionId, deps) ?? null;
+      }
+      // C3b live-found race guard (run-less, no explicit objective): a goal the
+      // probe missed must settle the child, not a receipt-only terminal.
+      if (classified && !objective && !child.runId) {
+        const guard = await runlessGoalGuard(child.sessionId, deps);
+        if (guard === 'keep-waiting') return null;
+        if (guard) return withAutoGoalNote(guard);
       }
       return classified;
     }

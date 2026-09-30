@@ -119,16 +119,16 @@ test('no --objective + no readable goal: plain agent_end path unchanged', async 
   const body = state.lastRegistrationBody as { conditions: WatchConditionSpec[] };
   assert.equal(body.conditions.some((condition) => condition.eventType === 'agent_end'), true, 'plain agent_end registered');
   assert.equal(body.conditions.some((condition) => condition.eventType === 'goal_end'), false);
-  assert.equal(state.goalReads, 1, 'exactly one goal probe (best-effort)');
+  assert.equal(state.goalReads, 2, 'one probe read + one guard read at the terminal reconcile (both best-effort)');
 });
 
-test('no --objective + a SETTLED goal projection: plain path (detection only adopts ACTIVE/RUNNING goals)', async () => {
+test('no --objective + a SETTLED goal projection: the guard settles the wait on the goal outcome', async () => {
   const { deps, state } = makeDeps();
-  state.goalScripts.set('child', [achieved('Already done')]);
+  state.goalScripts.set('child', [achieved('Already done'), achieved('Already done')]);
   state.evidenceBySession.set('child', { runs: [{ runId: 'r1', status: 'completed' }] });
   const outcome = await waitOnChild({ sessionId: 'child', deadlineMs: 60_000, sliceMs: 5_000, deps });
-  assert.equal(outcome.kind, 'completed');
-  assert.equal(outcome.note, undefined);
+  assert.equal(outcome.kind, 'goal_achieved', 'a settled goal is the honest outcome (not a bare receipt completed)');
+  assert.ok(outcome.note?.includes('auto-detected'));
   const body = state.lastRegistrationBody as { conditions: WatchConditionSpec[] };
   assert.equal(body.conditions.some((condition) => condition.eventType === 'agent_end'), true);
 });
@@ -160,4 +160,52 @@ test('waitMany --all without --objective: per-child detection (goal child settle
   assert.ok((bySession.get('goalchild') as Extract<WaitOutcome, { kind: 'goal_achieved' }>).note?.includes('auto-detected'));
   assert.equal(bySession.get('plainchild')?.kind, 'completed');
   assert.equal(result.exitCode, 0);
+});
+
+// ─── C3b live-found race: the probe can run BEFORE the goal registers ────────
+
+test('probe raced (goal idle at probe, active at reconcile): a terminal last run does NOT end a run-less wait; the goal settles it', async () => {
+  const { deps, state } = makeDeps();
+  // Probe read #1: idle (arm turn has not registered the goal yet).
+  // Guard reads: running (keep waiting), then achieved (settle).
+  state.goalScripts.set('child', [
+    { supported: true, status: 'idle' },
+    running('Late-armed goal'),
+    running('Late-armed goal'),
+    achieved('Late-armed goal'),
+  ]);
+  state.evidenceBySession.set('child', { runs: [{ runId: 'r-follow', status: 'completed' }] });
+
+  const outcome = await waitOnChild({ sessionId: 'child', deadlineMs: 60_000, sliceMs: 5_000, deps });
+  assert.equal(outcome.kind, 'goal_achieved', `the goal settles the wait, not the receipt: got ${outcome.kind}`);
+  assert.ok(outcome.note?.includes('auto-detected'), `outcome says auto-detected: ${outcome.note}`);
+});
+
+test('probe raced on the multi-child path: same guard applies per child', async () => {
+  const { deps, state } = makeDeps();
+  state.goalScripts.set('racer', [
+    { supported: true, status: 'idle' },
+    running('Multi race'),
+    achieved('Multi race'),
+  ]);
+  state.evidenceBySession.set('racer', { runs: [{ runId: 'r9', status: 'failed', errorCode: 'RUNTIME_ERROR' }] });
+
+  const result = await waitOnChildren({
+    mode: 'all',
+    children: [{ sessionId: 'racer' }],
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps,
+  });
+  const outcome = result.children[0]?.outcome;
+  assert.equal(outcome?.kind, 'goal_achieved', `got ${outcome?.kind}`);
+});
+
+test('a genuinely goal-less child is unaffected by the guard (terminal run completes)', async () => {
+  const { deps, state } = makeDeps();
+  state.goalScripts.set('plain', [{ supported: false, status: 'idle' }, { supported: false, status: 'idle' }, { supported: false, status: 'idle' }]);
+  state.evidenceBySession.set('plain', { runs: [{ runId: 'r1', status: 'completed' }] });
+  const outcome = await waitOnChild({ sessionId: 'plain', deadlineMs: 60_000, sliceMs: 5_000, deps });
+  assert.equal(outcome.kind, 'completed');
+  assert.equal(outcome.note, undefined);
 });
