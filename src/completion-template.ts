@@ -24,6 +24,65 @@ export const COMPLETION_REPORT_INSTRUCTION: string = [
 ].join('\n');
 
 /**
+ * I5 — the goal-marker instruction, for goal children ONLY (plain prompts keep
+ * COMPLETION_REPORT_INSTRUCTION byte-identical, pinned in
+ * test/completion-template.test.ts). Root cause (plan §R4 interim I5, from the
+ * production smoke): the goal engine's prompt says to state the status marker
+ * at the END of the turn, while this template says the report block must be the
+ * LAST thing — the model obeyed the template and dropped the marker, so the
+ * goal looped to its turn budget. The goal engine's verifier accepts the LAST
+ * `Status: …` line ANYWHERE in the message (it must start its own line), so the
+ * conflict disappears if the marker is written immediately BEFORE the block:
+ * the block stays last and the marker stays visible.
+ *
+ * The instruction names the exact line forms, requires the marker to start its
+ * own line as PLAIN TEXT, and forbids decoration: the verifier's pattern is
+ * `^\s*(?:\*\*)?Status:\s*(GOAL_ACHIEVED|CONTINUING|NEEDS_USER_INPUT)` — a
+ * backtick-quoted or bullet-prefixed line never matches (bold is tolerated).
+ */
+export const GOAL_MARKER_INSTRUCTION: string = [
+  'GOAL STATUS LINE (required while the goal is active): when the goal is met, write the exact line Status: GOAL_ACHIEVED on a line of its own IMMEDIATELY BEFORE the report block, so the report block remains the last thing in your answer. Until the goal is met, write the exact line Status: CONTINUING in that same place instead (on its own line, immediately before the block).',
+  'Write the status line as plain text starting the line — no backticks, no quotes, no bullet, nothing before the word Status; brief progress may follow it after an em-dash. Never write the status line after the report block.',
+].join('\n');
+
+/**
+ * I5 — the exact shape of EVERY optional field, read from the contract
+ * snapshot (contract/internal-api-client-snapshot.json, types.CompletionBlock,
+ * contractVersion 1.58.1 — test/completion-template.test.ts validates the
+ * shapes against that snapshot and against the client's own resolver).
+ * Root cause: the template said "add \"tests\" … only if they apply" without a
+ * shape, so GLM 5.3 Flash wrote `"tests": "4 pass / 0 fail"` (a string) and the
+ * server rejected the block SCHEMA_VIOLATION fieldPath tests — 7/7 blocks in
+ * the IV integrated proof. Each line that starts with `{` is one complete JSON
+ * object showing one field's exact shape.
+ */
+export const COMPLETION_FIELD_SHAPES: string = [
+  'FIELD SHAPES — every optional field of pi-completion/v1 (the server rejects a block whose fields do not match these shapes exactly; omit a field that does not apply, and never invent other fields):',
+  '{"summary":"<one line>"}',
+  '{"commands":[{"command":"<a command you ran>","exitCode":0,"note":"<optional>"}]}',
+  '{"tests":[{"name":"<test or suite name>","result":"pass","note":"<optional>"}]}',
+  '{"commits":[{"sha":"<full sha>","repo":"<repo path>","subject":"<optional>"}]}',
+  '{"filesChanged":["<path>"]}',
+  '{"openIssues":["<issue>"]}',
+  '{"blockedReason":"<why the task is blocked>"}',
+  '"tests" is an ARRAY of objects and each "result" is "pass", "fail" or "skip" — never write "tests" as a string such as "4 pass / 0 fail". Omit any field that does not apply.',
+].join('\n');
+
+/**
+ * I5 — the full instruction text a GOAL child receives as the template
+ * follow-up: the C3a-proven verbatim paragraph, plus the marker instruction
+ * and the field shapes. Composed here so the client, the tests and the live
+ * proof all quote the same bytes.
+ */
+export const GOAL_REPORT_INSTRUCTION: string = [
+  COMPLETION_REPORT_INSTRUCTION,
+  '',
+  GOAL_MARKER_INSTRUCTION,
+  '',
+  COMPLETION_FIELD_SHAPES,
+].join('\n');
+
+/**
  * Append the template to a task message or goal objective as its own trailing
  * paragraph. Idempotent: a task that already carries the template is returned
  * unchanged (re-dispatching a templated prompt never double-appends).
@@ -45,6 +104,11 @@ export function applyCompletionTemplate(task: string): string {
 export function applyGoalObjectiveTemplate(objective: string): string {
   if (!objective || objective.length === 0) throw new Error('pi-orch: completion template needs a non-empty task');
   if (objective.includes('pi-completion/v1')) return objective;
-  const flat = COMPLETION_REPORT_INSTRUCTION.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
-  return `${objective} [When you finish: ${flat} (the full report instructions arrive as a follow-up message.)]`;
+  const flat = (text: string): string => text.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
+  // I5: the pointer itself carries the marker instruction (flattened — the
+  // server caps the objective at 4000 chars, SINGLE-LINE), so a goal child is
+  // told the marker placement twice: here, and in the follow-up that delivers
+  // the verbatim paragraph. The builder's 4000-char guard (builders.ts) still
+  // rejects an objective that would overflow with the pointer attached.
+  return `${objective} [${flat(GOAL_MARKER_INSTRUCTION)} When you finish: ${flat(COMPLETION_REPORT_INSTRUCTION)} (the full report instructions arrive as a follow-up message.)]`;
 }

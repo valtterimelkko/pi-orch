@@ -287,3 +287,39 @@ test('client.spawn does not retry when the first follow-up run is healthy', asyn
   assert.equal(calls.filter((call) => call.path.endsWith('/prompt')).length, 1);
   assert.equal((spawned as { templateFollowUpRunId?: string }).templateFollowUpRunId, 'r-ok');
 });
+
+// ─── I5: the goal forms carry the marker instruction; plain forms unchanged ──
+
+test('I5: a goal objective built by the builder carries the marker instruction (single line, 4000-bounded)', () => {
+  const body = buildCreateBody({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  const goal = body.goal as { objective: string };
+  assert.ok(goal.objective.includes('Status: GOAL_ACHIEVED'), 'builder goal objective carries the achieved marker form');
+  assert.ok(goal.objective.includes('Status: CONTINUING'), 'builder goal objective carries the continuing marker form');
+  assert.ok(!goal.objective.includes('\n'), 'still single line');
+  assert.ok(goal.objective.length <= 4000, `objective is ${goal.objective.length} chars (limit 4000)`);
+  assert.ok(!COMPLETION_REPORT_INSTRUCTION.includes('GOAL_ACHIEVED'), 'the plain template text itself stays marker-free');
+});
+
+test('I5: the goal template follow-up carries the marker instruction and the field shapes', async () => {
+  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const transport = {
+    request: async (_method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
+      calls.push({ path, body: options.body ?? {} });
+      if (path === '/api/v1/sessions') return ok({ sessionId: 's-goal', leaseId: 'l1', goal: { armed: true }, retention: { leaseId: 'l1' } });
+      if (/^\/api\/v1\/sessions\/[^/]+$/.test(path)) return ok({ sessionId: 's-goal' });
+      return ok({ runId: 'r-follow', sessionId: 's-goal', detached: true, dispatchMode: 'follow_up' });
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  const followUp = calls.find((call) => call.path === '/api/v1/sessions/s-goal/prompt');
+  assert.ok(followUp, 'a follow-up prompt followed the create');
+  const message = String(followUp?.body.message);
+  assert.ok(message.includes('Status: GOAL_ACHIEVED'), 'follow-up carries the exact achieved form');
+  assert.ok(message.includes('Status: CONTINUING'), 'follow-up carries the exact continuing form');
+  assert.ok(/immediately before the report block/i.test(message), 'follow-up states the placement');
+  assert.ok(message.includes('"tests":[{"name"'), 'follow-up shows the tests array-of-objects shape');
+  assert.ok(message.includes('"commits":[{"sha"'), 'follow-up shows the commits shape');
+  assert.ok(message.includes('"openIssues":['), 'follow-up shows the openIssues shape');
+  assert.ok(message.includes('"blockedReason":"'), 'follow-up shows the blockedReason shape');
+});

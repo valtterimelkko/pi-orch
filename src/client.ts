@@ -21,7 +21,7 @@ import {
 } from './builders.ts';
 import { parseReceipt, ApiError, classifyRunOutput, type RunOutputClassification, type Receipt, type WatchConditionSpec } from './parsers.ts';
 import { resolveCompletion, type CompletionBlock, type CompletionParseError, type CompletionDelimiter, type CompletionCaptureSource, type ReceiptWithCompletion, type SessionDetailWithCompletion } from './completion.ts';
-import { COMPLETION_REPORT_INSTRUCTION } from './completion-template.ts';
+import { GOAL_REPORT_INSTRUCTION } from './completion-template.ts';
 
 /**
  * I1 (H2 item 2) + correction 01: does the first template receipt warrant the
@@ -499,8 +499,13 @@ export class PiOrchClient {
   private async deliverGoalTemplate(sessionId: string, objective: string, raw: Record<string, unknown>): Promise<string | undefined> {
     const send = async (suffix: string): Promise<{ runId: string } | { error: string }> => {
       try {
+        // I5: the goal follow-up carries the verbatim paragraph PLUS the marker
+        // instruction (write Status: GOAL_ACHIEVED / Status: CONTINUING on its
+        // own line immediately before the report block) and every optional
+        // field's exact shape (GOAL_REPORT_INSTRUCTION) — see the module docs
+        // in completion-template.ts.
         const followUp = await this.prompt(sessionId, {
-          message: `Report instructions for your active goal (${objective}):\n\n${COMPLETION_REPORT_INSTRUCTION}\n\nIf your goal is already complete, reply with the report block now. Otherwise keep working toward the goal and end your FINAL answer with the report block.`,
+          message: `Report instructions for your active goal (${objective}):\n\n${GOAL_REPORT_INSTRUCTION}\n\nIf your goal is already complete, reply now: first the status line (Status: GOAL_ACHIEVED), then the report block. Otherwise keep working toward the goal and end your FINAL answer with the status line immediately before the report block.`,
           mode: 'follow_up',
           idempotencyKey: `${this.randomId()}-tpl${suffix}`,
         });
