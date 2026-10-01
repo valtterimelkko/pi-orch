@@ -23,8 +23,21 @@ import { parseReceipt, ApiError, classifyRunOutput, type RunOutputClassification
 import { resolveCompletion, type CompletionBlock, type CompletionParseError, type CompletionDelimiter, type CompletionCaptureSource, type ReceiptWithCompletion, type SessionDetailWithCompletion } from './completion.ts';
 import { COMPLETION_REPORT_INSTRUCTION } from './completion-template.ts';
 
-/** I1 (H2 item 2): the receipt statuses that justify ONE template re-send — terminal failures only. */
-const TEMPLATE_RETRY_STATUSES: ReadonlySet<string> = new Set(['failed', 'cancelled', 'interrupted']);
+/**
+ * I1 (H2 item 2) + correction 01: does the first template receipt warrant the
+ * ONE re-send? `failed` (any code, incl. NEVER_STARTED) always does — nothing
+ * was delivered. `cancelled`/`interrupted` only WITHOUT `startedAt`: the
+ * server marks the follow-up started at the matching user message_start, so a
+ * startedAt on those receipts proves the template's user message WAS observed
+ * before a restart/cancel cut the run off — resending would duplicate the
+ * template, the exact defect I1 removes. Everything else — queued, accepted,
+ * started, completed, unknown — is healthy and never re-sent.
+ */
+function templateReceiptWantsRetry(status: string | undefined, startedAt: string | undefined): boolean {
+  if (status === 'failed') return true;
+  if (status === 'cancelled' || status === 'interrupted') return startedAt === undefined;
+  return false;
+}
 import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, type CompletionLoad } from './verify.ts';
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
 import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError } from './route-limits.ts';
@@ -507,16 +520,13 @@ export class PiOrchClient {
     let health: 'unknown' | 'ok' | 'failed' = 'unknown';
     try {
       const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(firstRunId)}`, { headers: this.headers() });
-      const receipt = response.body as { status?: string };
+      const receipt = response.body as { status?: string; startedAt?: string };
       // I1 (H2 item 2): the follow-up sits `queued` (or `accepted`) while the
-      // arm turn is busy — that is HEALTHY, not failed. Re-send only on a
-      // TERMINAL failure: `failed` (any code, incl. NEVER_STARTED),
-      // `cancelled`, `interrupted` (delivery never happened). Anything else —
-      // queued/accepted/started/completed/unknown — never causes a second
-      // send: both copies would drain in one loop and the duplicate would
-      // strand `queued` until cleanup cancels it (the G5 duplicate-template
-      // defect, 6 of 13 bad receipts).
-      health = receipt.status !== undefined && TEMPLATE_RETRY_STATUSES.has(receipt.status) ? 'failed' : 'ok';
+      // arm turn is busy — that is HEALTHY, not failed. Correction 01: a
+      // startedAt on a cancelled/interrupted receipt proves delivery (the
+      // message_start was observed before the restart/cancel) — re-sending a
+      // delivered template duplicates it. See templateReceiptWantsRetry.
+      health = templateReceiptWantsRetry(receipt.status, receipt.startedAt) ? 'failed' : 'ok';
     } catch {
       health = 'unknown'; // unreadable receipt: report the runId, no retry theatre
     }

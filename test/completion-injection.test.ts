@@ -235,14 +235,41 @@ test('I1: a never-started first template receipt (failed + NEVER_STARTED) is ret
   assert.equal(followUpCount, 2, 'a never-started delivery is a terminal failure: retry once');
 });
 
-test('I1: a cancelled first template receipt is retried once', async () => {
+test('I1: a cancelled first template receipt without startedAt is retried once (never delivered)', async () => {
   const { followUpCount } = await spawnWithFirstReceiptStatus({ runId: 'r-follow-1', status: 'cancelled' });
-  assert.equal(followUpCount, 2, 'cancelled delivery is a terminal failure: retry once');
+  assert.equal(followUpCount, 2, 'cancelled before delivery is a terminal failure: retry once');
 });
 
-test('I1: an interrupted first template receipt is retried once (never delivered)', async () => {
+test('I1: an interrupted first template receipt without startedAt is retried once (never delivered)', async () => {
   const { followUpCount } = await spawnWithFirstReceiptStatus({ runId: 'r-follow-1', status: 'interrupted', interruptionReason: 'server_restart' });
-  assert.equal(followUpCount, 2, 'interrupted delivery is a terminal failure: retry once');
+  assert.equal(followUpCount, 2, 'interrupted before delivery is a terminal failure: retry once');
+});
+
+// ─── Correction 01: startedAt proves DELIVERY — never re-send a delivered ────
+// ─── template ────────────────────────────────────────────────────────
+
+// The server marks the queued follow-up `started` at the matching user
+// message_start (internal-api/routes/sessions.ts queue-observer), so a
+// cancelled/interrupted receipt that carries startedAt means the template's
+// user message WAS observed before a restart/cancel cut the run off — the
+// child already has it. Resending duplicates the template: the exact defect
+// I1 removes. Retry those receipts only WITHOUT startedAt. `failed` stays an
+// unconditional retry (it covers NEVER_STARTED — no delivery possible).
+
+test('I1 correction 01: an interrupted receipt WITH startedAt was delivered — NO second send', async () => {
+  const { followUpCount, spawned } = await spawnWithFirstReceiptStatus({
+    runId: 'r-follow-1', status: 'interrupted', interruptionReason: 'server_restart', startedAt: '2026-10-01T13:49:05Z',
+  });
+  assert.equal(followUpCount, 1, 'delivered then interrupted: the child has the template');
+  assert.equal(spawned.raw.__templateFollowUpRetried, undefined, 'no retry recorded');
+});
+
+test('I1 correction 01: a cancelled receipt WITH startedAt was delivered — NO second send', async () => {
+  const { followUpCount, spawned } = await spawnWithFirstReceiptStatus({
+    runId: 'r-follow-1', status: 'cancelled', startedAt: '2026-10-01T13:49:05Z',
+  });
+  assert.equal(followUpCount, 1, 'delivered then cancelled: the child has the template');
+  assert.equal(spawned.raw.__templateFollowUpRetried, undefined, 'no retry recorded');
 });
 
 test('client.spawn does not retry when the first follow-up run is healthy', async () => {
