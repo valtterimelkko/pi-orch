@@ -134,3 +134,10 @@ test('h3a/b+: the bundled live-1 fixture classifies as the live run recorded it'
   assert.match(fixture._provenance, /live-1/);
   assert.deepEqual(countRunAttempts(fixture.receipts), fixture.expected);
 });
+
+test('h3a/b+: an explicit startedAt null reads as never started (serialisation-proof)', () => {
+  const nulled = { ...refused, startedAt: null } as unknown as Parameters<typeof classifyReceipt>[0];
+  const c = classifyReceipt(nulled);
+  assert.equal(c.kind === 'cancelled' && c.refusedBeforeDispatch, true);
+  assert.deepEqual(countRunAttempts([nulled]), { dispatched: 0, refusedBeforeDispatch: 1, other: 0 });
+});

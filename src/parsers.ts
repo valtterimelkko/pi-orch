@@ -95,7 +95,7 @@ export function classifyReceipt(receipt: Receipt): ReceiptClassification {
       return { kind: 'completed' };
     case 'cancelled': {
       const refusedBeforeDispatch =
-        receipt.startedAt === undefined
+        receipt.startedAt == null
         && receipt.errorCode !== undefined
         && REFUSED_BEFORE_DISPATCH_CODES.has(receipt.errorCode);
       return {
@@ -152,7 +152,7 @@ export interface RunAttemptCounts {
 export function countRunAttempts(receipts: readonly Receipt[]): RunAttemptCounts {
   const counts: RunAttemptCounts = { dispatched: 0, refusedBeforeDispatch: 0, other: 0 };
   for (const receipt of receipts) {
-    if (receipt.startedAt !== undefined) {
+    if (receipt.startedAt != null) {
       counts.dispatched += 1;
       continue;
     }
