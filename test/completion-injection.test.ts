@@ -30,11 +30,24 @@ test('create: completionTemplate:false leaves the goal objective untouched', () 
 });
 
 test('create: an objective that would overflow the server 4000-char limit with the template fails with a clear opt-out error', () => {
-  const long = 'x'.repeat(3400);
+  // I5 correction 01: the pointer suffix is ≤ 700 chars, so the overflow
+  // boundary sits near 3,300 accepted / ~3,690 rejected; 3,900 still overflows.
+  const long = 'x'.repeat(3900);
   assert.throws(
     () => buildCreateBody({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: long } }),
     /completionTemplate|no-completion-template/,
   );
+});
+
+test('I5 correction 01: a 3,300-char raw objective is accepted and the stored objective stays ≤ 4000 (boundary regression)', () => {
+  // Review minor: the I5 pointer suffix initially grew to 1,280 chars, so a
+  // 3,000-char plain objective that previously stored at 3,665 was rejected.
+  // With the concise pointer the full 3,300-char range is accepted again.
+  const body = buildCreateBody({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'y'.repeat(3300) } });
+  const goal = body.goal as { objective: string };
+  assert.ok(goal.objective.length <= 4000, `stored objective is ${goal.objective.length} chars`);
+  assert.ok(goal.objective.startsWith('y'.repeat(100)), 'objective preserved verbatim at the start');
+  assert.ok(!goal.objective.includes('\n'), 'still single line');
 });
 
 test('create: a non-goal spawn carries no template (there is no task text at spawn)', () => {
@@ -286,4 +299,40 @@ test('client.spawn does not retry when the first follow-up run is healthy', asyn
   const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship it' } });
   assert.equal(calls.filter((call) => call.path.endsWith('/prompt')).length, 1);
   assert.equal((spawned as { templateFollowUpRunId?: string }).templateFollowUpRunId, 'r-ok');
+});
+
+// ─── I5: the goal forms carry the marker instruction; plain forms unchanged ──
+
+test('I5: a goal objective built by the builder carries the marker instruction (single line, 4000-bounded)', () => {
+  const body = buildCreateBody({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  const goal = body.goal as { objective: string };
+  assert.ok(goal.objective.includes('Status: GOAL_ACHIEVED'), 'builder goal objective carries the achieved marker form');
+  assert.ok(goal.objective.includes('Status: CONTINUING'), 'builder goal objective carries the continuing marker form');
+  assert.ok(!goal.objective.includes('\n'), 'still single line');
+  assert.ok(goal.objective.length <= 4000, `objective is ${goal.objective.length} chars (limit 4000)`);
+  assert.ok(!COMPLETION_REPORT_INSTRUCTION.includes('GOAL_ACHIEVED'), 'the plain template text itself stays marker-free');
+});
+
+test('I5: the goal template follow-up carries the marker instruction and the field shapes', async () => {
+  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const transport = {
+    request: async (_method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
+      calls.push({ path, body: options.body ?? {} });
+      if (path === '/api/v1/sessions') return ok({ sessionId: 's-goal', leaseId: 'l1', goal: { armed: true }, retention: { leaseId: 'l1' } });
+      if (/^\/api\/v1\/sessions\/[^/]+$/.test(path)) return ok({ sessionId: 's-goal' });
+      return ok({ runId: 'r-follow', sessionId: 's-goal', detached: true, dispatchMode: 'follow_up' });
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  const followUp = calls.find((call) => call.path === '/api/v1/sessions/s-goal/prompt');
+  assert.ok(followUp, 'a follow-up prompt followed the create');
+  const message = String(followUp?.body.message);
+  assert.ok(message.includes('Status: GOAL_ACHIEVED'), 'follow-up carries the exact achieved form');
+  assert.ok(message.includes('Status: CONTINUING'), 'follow-up carries the exact continuing form');
+  assert.ok(/immediately before the report block/i.test(message), 'follow-up states the placement');
+  assert.ok(message.includes('"tests":[{"name"'), 'follow-up shows the tests array-of-objects shape');
+  assert.ok(message.includes('"commits":[{"sha"'), 'follow-up shows the commits shape');
+  assert.ok(message.includes('"openIssues":['), 'follow-up shows the openIssues shape');
+  assert.ok(message.includes('"blockedReason":"'), 'follow-up shows the blockedReason shape');
 });
