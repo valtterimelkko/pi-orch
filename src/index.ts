@@ -23,11 +23,14 @@ export {
 export {
   parseReceipt,
   classifyReceipt,
+  countRunAttempts,
+  REFUSED_BEFORE_DISPATCH_CODES,
   parseWatchesWait,
   isTerminalReceipt,
   ApiError,
   type Receipt,
   type ReceiptClassification,
+  type RunAttemptCounts,
   type WatchConditionSpec,
   type WatchFiring,
 } from './parsers.ts';

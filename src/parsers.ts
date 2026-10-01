@@ -68,7 +68,11 @@ export function parseReceipt(value: unknown): Receipt {
 export type ReceiptClassification =
   | { kind: 'running' }
   | { kind: 'completed' }
-  | { kind: 'cancelled' }
+  /** H3a B+: `refusedBeforeDispatch` marks the server's per-attempt refusal
+   * receipts (cancelled + never started + typed refusal code) additively —
+   * `kind` stays 'cancelled', so existing consumers are unaffected. A receipt
+   * cancelled AFTER start (it has `startedAt`) is a plain cancellation. */
+  | { kind: 'cancelled'; refusedBeforeDispatch: boolean; refusalCode?: string }
   | { kind: 'interrupted'; interruptedByRestart: boolean; reason?: string }
   | { kind: 'failed' }
   | { kind: 'never_started' }
@@ -77,12 +81,29 @@ export type ReceiptClassification =
   | { kind: 'prompt_not_executed' }
   | { kind: 'turn_stalled' };
 
+/**
+ * H3a B+ (parent 01-answer): the typed pre-dispatch refusal codes. The server
+ * receipts every refused attempt (receipt created before the admission check,
+ * idempotency key released on refusal), so a refused-then-retried prompt
+ * leaves one of these cancelled, never-started receipts per attempt.
+ */
+export const REFUSED_BEFORE_DISPATCH_CODES = new Set(['ADMISSION_CAPACITY_EXHAUSTED', 'SERVER_DRAINING', 'SESSION_BUSY']);
+
 export function classifyReceipt(receipt: Receipt): ReceiptClassification {
   switch (receipt.status) {
     case 'completed':
       return { kind: 'completed' };
-    case 'cancelled':
-      return { kind: 'cancelled' };
+    case 'cancelled': {
+      const refusedBeforeDispatch =
+        receipt.startedAt == null
+        && receipt.errorCode !== undefined
+        && REFUSED_BEFORE_DISPATCH_CODES.has(receipt.errorCode);
+      return {
+        kind: 'cancelled',
+        refusedBeforeDispatch,
+        ...(refusedBeforeDispatch ? { refusalCode: receipt.errorCode } : {}),
+      };
+    }
     case 'interrupted': {
       const byRestart = receipt.interruptionReason === 'server_restart' || receipt.interruptionReason === 'drain_timeout';
       return { kind: 'interrupted', interruptedByRestart: byRestart, reason: receipt.interruptionReason };
@@ -109,6 +130,40 @@ function classifyFailure(errorCode: string | undefined): ReceiptClassification {
     default:
       return { kind: 'failed' };
   }
+}
+
+/** H3a B+ counts of a session's receipts, split into real attempts and refusals. */
+export interface RunAttemptCounts {
+  /** Receipts whose run actually reached the runtime (has `startedAt`). */
+  dispatched: number;
+  /** Typed never-started refusals — one per refused attempt. */
+  refusedBeforeDispatch: number;
+  /** Everything else: post-start cancellations, failures, interruptions, in-flight receipts. */
+  other: number;
+}
+
+/**
+ * H3a B+: count a session's receipts into real attempts. The counts always
+ * sum to `receipts.length`. Audit rule: count runs with this, not receipt
+ * totals — a refused-then-retried prompt is one dispatched run, with its
+ * refused attempts reported separately (the server receipts every attempt;
+ * see classifyReceipt's `refusedBeforeDispatch`).
+ */
+export function countRunAttempts(receipts: readonly Receipt[]): RunAttemptCounts {
+  const counts: RunAttemptCounts = { dispatched: 0, refusedBeforeDispatch: 0, other: 0 };
+  for (const receipt of receipts) {
+    if (receipt.startedAt != null) {
+      counts.dispatched += 1;
+      continue;
+    }
+    const classification = classifyReceipt(receipt);
+    if (classification.kind === 'cancelled' && classification.refusedBeforeDispatch) {
+      counts.refusedBeforeDispatch += 1;
+    } else {
+      counts.other += 1;
+    }
+  }
+  return counts;
 }
 
 // ─── I1 (H2 item 1): run OUTPUT classification ─────────────────────────────
