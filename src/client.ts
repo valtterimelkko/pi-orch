@@ -19,9 +19,12 @@ import {
   type CreateInput,
   type PromptInput,
 } from './builders.ts';
-import { parseReceipt, ApiError, type Receipt, type WatchConditionSpec } from './parsers.ts';
+import { parseReceipt, ApiError, classifyRunOutput, type RunOutputClassification, type Receipt, type WatchConditionSpec } from './parsers.ts';
 import { resolveCompletion, type CompletionBlock, type CompletionParseError, type CompletionDelimiter, type CompletionCaptureSource, type ReceiptWithCompletion, type SessionDetailWithCompletion } from './completion.ts';
 import { COMPLETION_REPORT_INSTRUCTION } from './completion-template.ts';
+
+/** I1 (H2 item 2): the receipt statuses that justify ONE template re-send — terminal failures only. */
+const TEMPLATE_RETRY_STATUSES: ReadonlySet<string> = new Set(['failed', 'cancelled', 'interrupted']);
 import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, type CompletionLoad } from './verify.ts';
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
 import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError } from './route-limits.ts';
@@ -505,7 +508,15 @@ export class PiOrchClient {
     try {
       const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(firstRunId)}`, { headers: this.headers() });
       const receipt = response.body as { status?: string };
-      health = receipt.status === undefined || receipt.status === 'completed' || receipt.status === 'started' ? 'ok' : 'failed';
+      // I1 (H2 item 2): the follow-up sits `queued` (or `accepted`) while the
+      // arm turn is busy — that is HEALTHY, not failed. Re-send only on a
+      // TERMINAL failure: `failed` (any code, incl. NEVER_STARTED),
+      // `cancelled`, `interrupted` (delivery never happened). Anything else —
+      // queued/accepted/started/completed/unknown — never causes a second
+      // send: both copies would drain in one loop and the duplicate would
+      // strand `queued` until cleanup cancels it (the G5 duplicate-template
+      // defect, 6 of 13 bad receipts).
+      health = receipt.status !== undefined && TEMPLATE_RETRY_STATUSES.has(receipt.status) ? 'failed' : 'ok';
     } catch {
       health = 'unknown'; // unreadable receipt: report the runId, no retry theatre
     }
@@ -694,6 +705,9 @@ export class PiOrchClient {
     runId: string;
     sessionId: string;
     status: string;
+    /** I1 (H2 item 1): command | final_text | no_text — from the receipt's own evidence. */
+    outputClass: 'command' | 'final_text' | 'no_text';
+    outputClassBasis?: string;
     finalText?: string;
     finalTextTruncated?: boolean;
     servedModel?: string;
@@ -742,6 +756,7 @@ export class PiOrchClient {
       runId: receipt.runId,
       sessionId,
       status: receipt.status,
+      ...spreadOutputClass(classifyRunOutput(receipt)),
       finalText: receipt.finalText,
       finalTextTruncated: receipt.finalTextTruncated,
       servedModel: receipt.servedModel,
@@ -909,4 +924,11 @@ export class PiOrchClient {
 
 function defaultRandomId(): string {
   return `piorch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** I1: flatten the run-output classification onto the result body. */
+function spreadOutputClass(output: RunOutputClassification): { outputClass: 'command' | 'final_text' | 'no_text'; outputClassBasis?: string } {
+  return output.kind === 'command'
+    ? { outputClass: 'command', outputClassBasis: output.basis }
+    : { outputClass: output.kind };
 }
