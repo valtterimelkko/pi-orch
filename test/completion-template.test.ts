@@ -209,3 +209,17 @@ test('I5: the shapes text warns against the string form in plain words', () => {
   assert.ok(/never[\s\S]{0,40}string/i.test(COMPLETION_FIELD_SHAPES), 'says tests is never a string');
   assert.ok(/omit/i.test(COMPLETION_FIELD_SHAPES), 'says to omit fields that do not apply');
 });
+
+test('I5 (live round 1 finding): the goal form pins the fence format — JSON on its own line after a bare ```completion fence line', () => {
+  // Live evidence (I5 round 1, 2026-10-01): 2/4 fixed-arm children wrote the
+  // JSON on the SAME line as the opening fence ("```completion {json}"); the
+  // server's opening-fence rule (/^[ ]{0,3}(`{3,})[ \t]*([a-z0-9_-]*)[ \t]*$/,
+  // server/src/internal-api/completion/completion-parser.ts) never matches a
+  // line with content after the info string, so no block was captured at all
+  // (no completion, no error) — 2/4 fixed children lost their completion.
+  assert.ok(/```completion[\s\S]{0,80}own line/i.test(GOAL_REPORT_INSTRUCTION), 'says the fence line must be exactly ```completion on its own');
+  assert.ok(/next line/i.test(GOAL_REPORT_INSTRUCTION), 'says the JSON goes on the next line');
+  // The PLAIN template already shows the correct multi-line fence; the new
+  // sentence lives in the goal-form shapes text only (plain byte-pin holds).
+  assert.ok(!COMPLETION_REPORT_INSTRUCTION.includes('own line'));
+});

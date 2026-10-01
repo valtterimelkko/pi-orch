@@ -65,6 +65,7 @@ export const COMPLETION_FIELD_SHAPES: string = [
   '{"filesChanged":["<path>"]}',
   '{"openIssues":["<issue>"]}',
   '{"blockedReason":"<why the task is blocked>"}',
+  'Fence format: open the block with a line that is exactly ```completion on its own line (nothing else on that line), put the JSON on the next line, and close with ``` on its own line. The server only captures the block when the JSON is on its own line; JSON on the same line as the opening fence is not a block.',
   '"tests" is an ARRAY of objects and each "result" is "pass", "fail" or "skip" — never write "tests" as a string such as "4 pass / 0 fail". Omit any field that does not apply.',
 ].join('\n');
 
