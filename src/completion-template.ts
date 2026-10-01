@@ -102,14 +102,33 @@ export function applyCompletionTemplate(task: string): string {
  * the client delivers the verbatim paragraph as a follow_up prompt right
  * after the create (the C3a live-proven shape, 16/16 parse rate).
  */
+/**
+ * I5 correction 01 — the POINTER's one-sentence marker reminder. The full
+ * explanation (GOAL_MARKER_INSTRUCTION) rides in the template follow-up; the
+ * pointer keeps only this reminder plus the schema name and the follow-up
+ * promise, so the suffix stays within the 700-character budget (was 1,280,
+ * which had shrunk the largest accepted raw objective from 3,335 to 2,720).
+ * Same rules as the full instruction: exact line forms, own line, immediately
+ * before the block, plain text.
+ */
+export const GOAL_MARKER_REMINDER: string =
+  'When the goal is met, write the exact line Status: GOAL_ACHIEVED on its own line immediately before the report block (until then, Status: CONTINUING in the same place).';
+
+/**
+ * Goal objectives are SINGLE-LINE on the server (createSessionBody refine),
+ * so the verbatim multi-line paragraph cannot ride in the objective itself.
+ * The goal injection appends this single-line POINTER — a concise marker
+ * reminder plus the schema name and the follow-up promise (I5 correction 01:
+ * suffix ≤ 700 chars; the flattened template no longer rides here) — and the
+ * client delivers the verbatim paragraph plus the full marker instruction and
+ * field shapes as a follow_up prompt right after the create (the C3a
+ * live-proven shape, 16/16 parse rate).
+ */
 export function applyGoalObjectiveTemplate(objective: string): string {
   if (!objective || objective.length === 0) throw new Error('pi-orch: completion template needs a non-empty task');
   if (objective.includes('pi-completion/v1')) return objective;
-  const flat = (text: string): string => text.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
-  // I5: the pointer itself carries the marker instruction (flattened — the
-  // server caps the objective at 4000 chars, SINGLE-LINE), so a goal child is
-  // told the marker placement twice: here, and in the follow-up that delivers
-  // the verbatim paragraph. The builder's 4000-char guard (builders.ts) still
-  // rejects an objective that would overflow with the pointer attached.
-  return `${objective} [${flat(GOAL_MARKER_INSTRUCTION)} When you finish: ${flat(COMPLETION_REPORT_INSTRUCTION)} (the full report instructions arrive as a follow-up message.)]`;
+  // I5 correction 01: the pointer is a POINTER. The flattened template used to
+  // ride here too (suffix 1,280 chars), which cost 615 characters of objective
+  // budget for text the follow-up repeats verbatim — so it moved out.
+  return `${objective} [${GOAL_MARKER_REMINDER} When you finish: end with the fenced pi-completion/v1 completion report block (the full report instructions arrive as a follow-up message.)]`;
 }

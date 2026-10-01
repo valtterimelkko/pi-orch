@@ -30,11 +30,24 @@ test('create: completionTemplate:false leaves the goal objective untouched', () 
 });
 
 test('create: an objective that would overflow the server 4000-char limit with the template fails with a clear opt-out error', () => {
-  const long = 'x'.repeat(3400);
+  // I5 correction 01: the pointer suffix is ≤ 700 chars, so the overflow
+  // boundary sits near 3,300 accepted / ~3,690 rejected; 3,900 still overflows.
+  const long = 'x'.repeat(3900);
   assert.throws(
     () => buildCreateBody({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: long } }),
     /completionTemplate|no-completion-template/,
   );
+});
+
+test('I5 correction 01: a 3,300-char raw objective is accepted and the stored objective stays ≤ 4000 (boundary regression)', () => {
+  // Review minor: the I5 pointer suffix initially grew to 1,280 chars, so a
+  // 3,000-char plain objective that previously stored at 3,665 was rejected.
+  // With the concise pointer the full 3,300-char range is accepted again.
+  const body = buildCreateBody({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'y'.repeat(3300) } });
+  const goal = body.goal as { objective: string };
+  assert.ok(goal.objective.length <= 4000, `stored objective is ${goal.objective.length} chars`);
+  assert.ok(goal.objective.startsWith('y'.repeat(100)), 'objective preserved verbatim at the start');
+  assert.ok(!goal.objective.includes('\n'), 'still single line');
 });
 
 test('create: a non-goal spawn carries no template (there is no task text at spawn)', () => {

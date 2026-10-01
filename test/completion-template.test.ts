@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { COMPLETION_REPORT_INSTRUCTION, COMPLETION_FIELD_SHAPES, GOAL_MARKER_INSTRUCTION, GOAL_REPORT_INSTRUCTION, applyCompletionTemplate, applyGoalObjectiveTemplate } from '../src/completion-template.ts';
 import { loadSnapshot } from '../src/snapshot.ts';
-import { resolveCompletion, type CompletionBlock } from '../src/completion.ts';
 
 /**
  * I5 (R4 interim): a goal child must write `Status: GOAL_ACHIEVED` on its own
@@ -104,6 +103,28 @@ test('I5: the goal pointer is idempotent and stays in the 4000-char budget for r
   assert.equal(applyGoalObjectiveTemplate(out), out, 'already-templated objective unchanged');
 });
 
+// ─── I5 correction 01: keep the objective budget (review minor, 2026-10-01) ──
+
+test('I5 correction 01: the goal pointer suffix stays within a 700-character budget', () => {
+  // The I5 pointer initially carried the flattened template + the full marker
+  // instruction: 1,280 chars of suffix, shrinking the largest accepted raw
+  // objective from 3,335 to 2,720. The pointer is a POINTER — the verbatim
+  // instructions ride in the follow-up — so the suffix keeps only a concise
+  // marker reminder plus the schema name and the follow-up promise.
+  const out = applyGoalObjectiveTemplate('x');
+  const suffix = out.length - 1;
+  assert.ok(suffix <= 700, `pointer suffix is ${suffix} chars (budget 700)`);
+});
+
+test('I5 correction 01: the concise pointer still carries the marker reminder, schema name and follow-up promise', () => {
+  const out = applyGoalObjectiveTemplate('Ship the fix');
+  assert.ok(out.includes('Status: GOAL_ACHIEVED'), 'exact achieved form');
+  assert.ok(out.includes('Status: CONTINUING'), 'exact continuing form');
+  assert.ok(/immediately before the report block/i.test(out), 'placement');
+  assert.ok(out.includes('pi-completion/v1'), 'schema name');
+  assert.ok(out.includes('follow-up'), 'follow-up promise');
+});
+
 // ─── I5: the goal report instruction (follow-up) shows each field's shape ────
 
 test('I5: GOAL_REPORT_INSTRUCTION = the verbatim template + the marker instruction + the field shapes', () => {
@@ -117,80 +138,131 @@ function shownExamples(text: string): Array<Record<string, unknown>> {
   return text.split('\n').filter((line) => line.startsWith('{')).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
-/** Keys + required-ness + enum literals of an `Array<{ ... }>` snapshot type string. */
-function itemShape(typeString: string): { keys: string[]; required: Set<string>; enums: Map<string, Set<string>> } {
-  const inner = /\{(.*)\}/.exec(typeString)?.[1];
-  assert.ok(inner, `cannot parse item shape from: ${typeString}`);
-  const keys: string[] = [];
-  const required = new Set<string>();
-  const enums = new Map<string, Set<string>>();
-  for (const part of inner.split(';').map((p) => p.trim()).filter(Boolean)) {
-    const match = /^([A-Za-z]\w*)(\?)?: (.+)$/.exec(part);
-    assert.ok(match, `cannot parse item field from: ${part}`);
-    const key = match[1] as string;
-    const opt = match[2] as string | undefined;
-    const type = match[3] as string;
-    keys.push(key);
-    if (!opt) required.add(key);
-    const literals = [...type.matchAll(/'([^']+)'/g)].map((m) => m[1]).filter((m): m is string => m !== undefined);
-    if (literals.length > 0) enums.set(key, new Set(literals));
+/**
+ * I5 correction 01 — a recursive validator for the DISPLAYED examples, driven
+ * by the bundled snapshot's CompletionBlock type descriptions (the snapshot's
+ * zodSchemas cover only request bodies, so the type DSL is the schema view we
+ * have; the server's zod parser is not a client dependency). Checks unknown
+ * keys, required member keys inside displayed object/array items, scalar
+ * member types (string/number), literal-union members (status, result) and
+ * array-ness, field by field, recursively. Unlike the previous version of
+ * this check, examples are validated ON THEIR OWN (no merging, so the shapes
+ * text's own summary/commands/filesChanged specimens are actually checked)
+ * and nothing is "validated" by casting to a type and selecting it with
+ * resolveCompletion — the resolver only picks an already-typed object.
+ */
+function makeSnapshotValidator(fields: Record<string, { type: string; optional?: boolean }>) {
+  const problems: string[] = [];
+  function walk(value: unknown, type: string, path: string): void {
+    const t = type.trim();
+    if (t === 'typeof COMPLETION_SCHEMA_NAME') {
+      // The snapshot carries the type reference, not the literal; the wire
+      // literal is the schema name pi-completion/v1 (server constant).
+      if (value !== 'pi-completion/v1') problems.push(`${path}: expected 'pi-completion/v1', got ${JSON.stringify(value)}`);
+      return;
+    }
+    if (/^(?:'[^']*'\s*\|\s*)+'[^']*'$/.test(t)) {
+      const literals = [...t.matchAll(/'([^']+)'/g)].map((m) => m[1]).filter((m): m is string => m !== undefined);
+      if (!literals.includes(String(value))) problems.push(`${path}: ${JSON.stringify(value)} not in {${literals.join(' | ')}}`);
+      return;
+    }
+    if (t === 'string') {
+      if (typeof value !== 'string') problems.push(`${path}: expected string, got ${typeof value}`);
+      return;
+    }
+    if (t === 'number') {
+      if (typeof value !== 'number') problems.push(`${path}: expected number, got ${typeof value}`);
+      return;
+    }
+    if (t === 'string[]') {
+      if (!Array.isArray(value)) { problems.push(`${path}: expected array, got ${typeof value}`); return; }
+      value.forEach((el, i) => walk(el, 'string', `${path}[${i}]`));
+      return;
+    }
+    const arrayMatch = /^Array<([\s\S]+)>$/.exec(t);
+    if (arrayMatch) {
+      if (!Array.isArray(value)) { problems.push(`${path}: expected array, got ${typeof value}`); return; }
+      value.forEach((el, i) => walk(el, arrayMatch[1] as string, `${path}[${i}]`));
+      return;
+    }
+    const objectMatch = /^\{([\s\S]+)\}$/.exec(t);
+    if (objectMatch) {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        problems.push(`${path}: expected object, got ${typeof value}`);
+        return;
+      }
+      const members = new Map<string, { opt: boolean; type: string }>();
+      for (const part of (objectMatch[1] as string).split(';').map((s) => s.trim()).filter(Boolean)) {
+        const match = /^([A-Za-z]\w*)(\?)?:\s*([\s\S]+)$/.exec(part);
+        if (!match) { problems.push(`${path}: unparsable shape part '${part}'`); continue; }
+        members.set(match[1] as string, { opt: match[2] === '?', type: match[3] as string });
+      }
+      const record = value as Record<string, unknown>;
+      for (const [key, spec] of members) {
+        if (!(key in record)) {
+          if (!spec.opt) problems.push(`${path}.${key}: required by the schema, missing from the displayed example`);
+          continue;
+        }
+        walk(record[key], spec.type, `${path}.${key}`);
+      }
+      for (const key of Object.keys(record)) {
+        if (!members.has(key)) problems.push(`${path}.${key}: not part of the schema shape`);
+      }
+      return;
+    }
+    problems.push(`${path}: unparsable snapshot type '${t}'`);
   }
-  return { keys, required, enums };
+  return { walk, problems };
 }
 
- test('I5: a block written exactly as the goal template shows conforms to the snapshot schema and parses with the client resolver', () => {
+ test('I5 correction 01: every displayed example validates recursively against the snapshot schema, field by field', () => {
   const { snapshot } = loadSnapshot({ env: {} });
   const fields = snapshot.types.CompletionBlock!.fields as Record<string, { type: string; optional?: boolean }>;
-  const specOf = (key: string): { type: string; optional?: boolean } => {
-    const spec = fields[key];
-    assert.ok(spec, `snapshot CompletionBlock has no field '${key}'`);
-    return spec;
-  };
-  // The fenced example the plain template shows (summary/commands/filesChanged):
+  const { walk, problems } = makeSnapshotValidator(fields);
+  // The fenced example the plain template shows (a complete block: schema,
+  // status, summary, commands, filesChanged):
   const baseMatch = /```completion\n([\s\S]*?)```/.exec(COMPLETION_REPORT_INSTRUCTION);
   assert.ok(baseMatch, 'the template carries its fenced example');
   const baseExample = JSON.parse(baseMatch[1] as string) as Record<string, unknown>;
-  // …plus every field shape the goal form shows, merged into ONE candidate block.
+  // …and each field-shape line of the goal form, each validated ON ITS OWN —
+  // no merging, so the shapes text's own summary/commands/filesChanged
+  // specimens are checked (they used to be silently overwritten).
   const shown = shownExamples(COMPLETION_FIELD_SHAPES);
   assert.ok(shown.length >= 7, `the shapes text shows ${shown.length} fields`);
-  const block = Object.assign({}, ...shown, baseExample, { schema: 'pi-completion/v1', status: 'done' }) as Record<string, unknown>;
+  const examples: Array<{ where: string; value: Record<string, unknown>; completeBlock: boolean }> = [
+    { where: 'plain-template fenced example', value: baseExample, completeBlock: true },
+    ...shown.map((value, i) => ({ where: `shapes line ${i + 1}`, value, completeBlock: false })),
+  ];
+  for (const { where, value, completeBlock } of examples) {
+    for (const key of Object.keys(value)) {
+      if (!fields[key]) problems.push(`${where}: field '${key}' does not exist on the snapshot CompletionBlock`);
+    }
+    // Required-field completeness only applies to the complete-block specimen;
+    // each shapes line deliberately shows ONE field's shape.
+    if (completeBlock) {
+      for (const [key, spec] of Object.entries(fields)) {
+        if (!spec.optional && !(key in value)) problems.push(`${where}: required field '${key}' missing`);
+      }
+    }
+    for (const [key, v] of Object.entries(value)) {
+      if (fields[key]) walk(v, fields[key].type, `${where}.${key}`);
+    }
+  }
+  assert.deepEqual(problems, [], `displayed shapes violate the snapshot: ${problems.join('; ')}`);
+});
 
-  // 1. every key is a field the snapshot schema knows; required ones present.
-  for (const key of Object.keys(block)) {
-    assert.ok(fields[key], `block field '${key}' does not exist on the snapshot CompletionBlock`);
-  }
-  for (const [key, spec] of Object.entries(fields)) {
-    if (!spec.optional) assert.ok(key in block, `required field '${key}' missing`);
-  }
-  // 2. each array-of-objects field matches the snapshot item shape exactly.
-  for (const key of ['commands', 'tests', 'commits'] as const) {
-    const shape = itemShape(specOf(key).type);
-    assert.ok(Array.isArray(block[key]), `${key} is an array (never a string)`);
-    for (const item of block[key] as Array<Record<string, unknown>>) {
-      for (const itemKey of Object.keys(item)) {
-        assert.ok(shape.keys.includes(itemKey), `${key} item key '${itemKey}' is not in the snapshot shape (${shape.keys.join(', ')})`);
-      }
-      for (const requiredKey of shape.required) assert.ok(requiredKey in item, `${key} item misses required '${requiredKey}'`);
-      for (const [enumKey, allowed] of shape.enums) {
-        assert.ok(allowed.has(String(item[enumKey])), `${key}.${enumKey}='${item[enumKey]}' not in {${[...allowed].join(', ')}}`);
-      }
-    }
-  }
-  for (const key of ['summary', 'filesChanged', 'openIssues', 'blockedReason'] as const) {
-    if (block[key] !== undefined) {
-      const type = specOf(key).type;
-      if (type.endsWith('[]') || type === 'string[]') assert.ok(Array.isArray(block[key]), `${key} must be an array`);
-      else assert.equal(typeof block[key], 'string', `${key} must be a string`);
-    }
-  }
-  // 3. the client's own machinery accepts it: typed as CompletionBlock and
-  // resolved through resolveCompletion (the receipt path) with no error.
-  const resolved = resolveCompletion(
-    { runId: 'r1', sessionId: 's1', completion: block as unknown as CompletionBlock, completionDelimiter: 'completion' },
-    undefined,
-  );
-  assert.equal(resolved?.source, 'receipt');
-  assert.deepEqual(resolved?.completion, block);
+test('I5 correction 01: the validator is sensitive — a deliberately wrong displayed shape is reported', () => {
+  // Proves the walker checks scalar member types and enums, not just key
+  // names: the exact escapes the previous merged-and-cast check allowed.
+  const { snapshot } = loadSnapshot({ env: {} });
+  const fields = snapshot.types.CompletionBlock!.fields as Record<string, { type: string; optional?: boolean }>;
+  const first = makeSnapshotValidator(fields);
+  first.walk([{ command: 7, exitCode: '0' }], fields.commands!.type, 'probe');
+  assert.ok(first.problems.some((p) => p.includes('probe[0].exitCode') && p.includes('string')), `exitCode-as-string not caught: ${first.problems.join('; ')}`);
+  assert.ok(first.problems.some((p) => p.includes('probe[0].command') && p.includes('number')), `numeric command not caught: ${first.problems.join('; ')}`);
+  const second = makeSnapshotValidator(fields);
+  second.walk([{ name: 'x', result: 'PASS' }], fields.tests!.type, 'probe2');
+  assert.ok(second.problems.some((p) => p.includes('probe2[0].result')), `wrong enum literal not caught: ${second.problems.join('; ')}`);
 });
 
 test('I5: negative control — a string "tests" value (the live IV failure) fails the shape the template shows', () => {
