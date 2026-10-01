@@ -165,6 +165,113 @@ test('client.spawn retries the template follow-up ONCE when the first delivery f
   assert.equal((spawned.raw as { __templateFollowUpFirstRunId?: string }).__templateFollowUpFirstRunId, 'r-follow-1');
 });
 
+// ─── I1 criterion 1: a NON-TERMINAL first receipt is healthy — no re-send ───
+
+// Root cause (r4/rootcause-empty-cancelled.md Mechanism B): the +3s health
+// read classified ANY status except completed/started as failed, so a `queued`
+// follow-up (the normal state while the arm turn is still busy) was sent a
+// SECOND time; both copies drained in one loop and the second stayed `queued`
+// forever, then cancelled at cleanup — 6 of G5's 13 bad receipts. The retry is
+// for TERMINAL failures only: `failed` (any code, incl. NEVER_STARTED),
+// `cancelled`, `interrupted` (never delivered). `accepted`, `queued`,
+// `started`, `completed`, an unreadable receipt and any unknown status are
+// healthy and never re-sent.
+
+async function spawnWithFirstReceiptStatus(firstStatus: Record<string, unknown>): Promise<{ followUpCount: number; spawned: { templateFollowUpRunId?: string; raw: Record<string, unknown> } }> {
+  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  let followUpCount = 0;
+  const runReceipts: Record<string, Record<string, unknown>> = {};
+  const transport = {
+    request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
+      calls.push({ path, body: options.body ?? {} });
+      if (path === '/api/v1/sessions') return ok({ sessionId: 's-goal', retention: { leaseId: 'l1' }, goal: { armed: true } });
+      if (path.endsWith('/prompt')) {
+        followUpCount += 1;
+        const runId = `r-follow-${followUpCount}`;
+        runReceipts[runId] = followUpCount === 1 ? firstStatus : { runId, status: 'completed' };
+        return ok({ runId, sessionId: 's-goal', detached: true, dispatchMode: 'follow_up' });
+      }
+      if (path.startsWith('/api/v1/runs/')) {
+        const runId = path.split('/').pop() as string;
+        return ok(runReceipts[runId]);
+      }
+      if (/^\/api\/v1\/sessions\/[^/]+$/.test(path)) return ok({ sessionId: 's-goal' });
+      return ok({});
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  return { followUpCount, spawned: spawned as { templateFollowUpRunId?: string; raw: Record<string, unknown> } };
+}
+
+test('I1: a queued first template receipt is healthy — NO second send (the G5 duplicate-template defect)', async () => {
+  const { followUpCount, spawned } = await spawnWithFirstReceiptStatus({ runId: 'r-follow-1', status: 'queued' });
+  assert.equal(followUpCount, 1, 'exactly one template follow-up for a queued receipt');
+  assert.equal(spawned.templateFollowUpRunId, 'r-follow-1');
+  assert.equal(spawned.raw.__templateFollowUpRetried, undefined, 'no retry recorded');
+});
+
+test('I1: an accepted first template receipt is healthy — no second send', async () => {
+  const { followUpCount, spawned } = await spawnWithFirstReceiptStatus({ runId: 'r-follow-1', status: 'accepted' });
+  assert.equal(followUpCount, 1);
+  assert.equal(spawned.templateFollowUpRunId, 'r-follow-1');
+  assert.equal(spawned.raw.__templateFollowUpRetried, undefined);
+});
+
+test('I1: a started first template receipt is healthy — no second send', async () => {
+  const { followUpCount } = await spawnWithFirstReceiptStatus({ runId: 'r-follow-1', status: 'started' });
+  assert.equal(followUpCount, 1);
+});
+
+test('I1: a failed first template receipt still causes exactly ONE retry', async () => {
+  const { followUpCount, spawned } = await spawnWithFirstReceiptStatus({ runId: 'r-follow-1', status: 'failed', errorCode: 'RUNTIME_ERROR' });
+  assert.equal(followUpCount, 2, 'failed delivery is retried exactly once');
+  assert.equal(spawned.templateFollowUpRunId, 'r-follow-2');
+  assert.equal(spawned.raw.__templateFollowUpRetried, true);
+});
+
+test('I1: a never-started first template receipt (failed + NEVER_STARTED) is retried once', async () => {
+  const { followUpCount } = await spawnWithFirstReceiptStatus({ runId: 'r-follow-1', status: 'failed', errorCode: 'NEVER_STARTED' });
+  assert.equal(followUpCount, 2, 'a never-started delivery is a terminal failure: retry once');
+});
+
+test('I1: a cancelled first template receipt without startedAt is retried once (never delivered)', async () => {
+  const { followUpCount } = await spawnWithFirstReceiptStatus({ runId: 'r-follow-1', status: 'cancelled' });
+  assert.equal(followUpCount, 2, 'cancelled before delivery is a terminal failure: retry once');
+});
+
+test('I1: an interrupted first template receipt without startedAt is retried once (never delivered)', async () => {
+  const { followUpCount } = await spawnWithFirstReceiptStatus({ runId: 'r-follow-1', status: 'interrupted', interruptionReason: 'server_restart' });
+  assert.equal(followUpCount, 2, 'interrupted before delivery is a terminal failure: retry once');
+});
+
+// ─── Correction 01: startedAt proves DELIVERY — never re-send a delivered ────
+// ─── template ────────────────────────────────────────────────────────
+
+// The server marks the queued follow-up `started` at the matching user
+// message_start (internal-api/routes/sessions.ts queue-observer), so a
+// cancelled/interrupted receipt that carries startedAt means the template's
+// user message WAS observed before a restart/cancel cut the run off — the
+// child already has it. Resending duplicates the template: the exact defect
+// I1 removes. Retry those receipts only WITHOUT startedAt. `failed` stays an
+// unconditional retry (it covers NEVER_STARTED — no delivery possible).
+
+test('I1 correction 01: an interrupted receipt WITH startedAt was delivered — NO second send', async () => {
+  const { followUpCount, spawned } = await spawnWithFirstReceiptStatus({
+    runId: 'r-follow-1', status: 'interrupted', interruptionReason: 'server_restart', startedAt: '2026-10-01T13:49:05Z',
+  });
+  assert.equal(followUpCount, 1, 'delivered then interrupted: the child has the template');
+  assert.equal(spawned.raw.__templateFollowUpRetried, undefined, 'no retry recorded');
+});
+
+test('I1 correction 01: a cancelled receipt WITH startedAt was delivered — NO second send', async () => {
+  const { followUpCount, spawned } = await spawnWithFirstReceiptStatus({
+    runId: 'r-follow-1', status: 'cancelled', startedAt: '2026-10-01T13:49:05Z',
+  });
+  assert.equal(followUpCount, 1, 'delivered then cancelled: the child has the template');
+  assert.equal(spawned.raw.__templateFollowUpRetried, undefined, 'no retry recorded');
+});
+
 test('client.spawn does not retry when the first follow-up run is healthy', async () => {
   const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
   const transport = {

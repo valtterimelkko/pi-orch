@@ -448,10 +448,15 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       if (!runId) throw new UsageError('result needs <runId>');
       const body = await getClient().result(runId, { includeTranscript: args.flags.has('transcript') });
       return output(json, body, (value) => {
-        const result = value as { status: string; finalText?: string; evidence: { transcript: string } };
+        const result = value as { status: string; finalText?: string; outputClass?: 'command' | 'final_text' | 'no_text'; outputClassBasis?: string; evidence: { transcript: string } };
+        // I1 (H2 item 1): a handler-return receipt is a COMMAND — it has no
+        // final text by design, so it must not read as an empty final answer.
+        const outputLine = result.outputClass === 'command'
+          ? `output command (slash-command handler return${result.outputClassBasis ? `: ${result.outputClassBasis}` : ''} — no final text is expected on this receipt)`
+          : (result.finalText ?? '(no final text on the receipt — read the transcript)');
         return [
           `status ${result.status}`,
-          result.finalText ?? '(no final text on the receipt — read the transcript)',
+          outputLine,
           `transcript ${result.evidence.transcript}`,
         ].join('\n');
       });

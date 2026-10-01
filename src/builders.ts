@@ -197,11 +197,55 @@ function defaultRandomId(): string {
  * objective, plus the deadline — and deliberately NO per-turn agent_end
  * (goals.md: on a goal child it fires at every turn boundary, producing false
  * wakes that read like completion and burn the wake budget).
+ *
+ * Use this when the objective is AUTHORITATIVE — read from the goal projection
+ * (auto-detect) or handed over as the stored form. For an objective the CALLER
+ * typed (the raw form from `spawn --goal-objective`), use
+ * {@link callerObjectiveConditions}, which matches both forms.
  */
 export function defaultConditions(objective: string | undefined, deadlineMs: number): WatchConditionSpec[] {
   const conditions: WatchConditionSpec[] = objective
     ? [goalEnd(objective), goalPaused(objective)]
     : [agentEnd()];
+  return withDeadlineBackstop(conditions, deadlineMs);
+}
+
+/**
+ * I1 (H2 item 6): the goal conditions for an objective the CALLER supplied.
+ * `spawn --goal-objective X` stores `applyGoalObjectiveTemplate(X)` (the
+ * flattened completion pointer rides along) and the server matches
+ * goal_end/goal_state dataMatch.objective by strict equality, so a wait given
+ * the raw X can never fire — the G5 parent's achieved goal still ran to its
+ * deadline. The caller-objective set therefore matches BOTH the raw and the
+ * stored form. Decided over resolving the stored objective from the goal
+ * projection because it is deterministic (the same pure function spawn used,
+ * so byte-identical by construction) and race-free: the projection can lag
+ * the goal engine's registration on a fresh spawn, which would need the same
+ * dual-form fallback anyway. A caller objective that is already the stored
+ * form (contains the template pointer) registers once — the raw variant would
+ * never fire and is noise. An objective without the pointer that was spawned
+ * with completionTemplate:false stores raw; the raw condition matches, the
+ * templated variant merely never fires.
+ */
+export function callerObjectiveConditions(objective: string | undefined, deadlineMs: number): WatchConditionSpec[] {
+  if (!objective) return defaultConditions(undefined, deadlineMs);
+  const conditions: WatchConditionSpec[] = goalObjectiveConditionForms(objective).flatMap((form) => [goalEnd(form), goalPaused(form)]);
+  return withDeadlineBackstop(conditions, deadlineMs);
+}
+
+/**
+ * The objective forms a caller-objective wait must match: the given form, plus
+ * its stored (templated) expansion unless the given form already IS the stored
+ * form (it carries the template pointer — applyGoalObjectiveTemplate would
+ * return it unchanged).
+ */
+export function goalObjectiveConditionForms(objective: string): string[] {
+  if (objective.includes('pi-completion/v1')) return [objective];
+  const templated = applyGoalObjectiveTemplate(objective);
+  return templated === objective ? [objective] : [objective, templated];
+}
+
+function withDeadlineBackstop(conditions: WatchConditionSpec[], deadlineMs: number): WatchConditionSpec[] {
   const deadlineSeconds = Math.floor(deadlineMs / 1000);
   if (deadlineSeconds >= 1 && deadlineSeconds <= 86_400) {
     conditions.push(deadlineCondition(deadlineSeconds));

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { waitOnChild, waitOnChildren, type WaitDeps, type WaitOutcome } from '../src/wait.ts';
 import { agentEnd, goalEnd, goalPaused } from '../src/builders.ts';
+import { applyGoalObjectiveTemplate } from '../src/completion-template.ts';
 import type { Receipt } from '../src/parsers.ts';
 
 /**
@@ -311,6 +312,171 @@ test('goal_end conditions carry the exact-objective dataMatch and repeat (once:f
   const condition = goalEnd('The NEW objective');
   assert.deepEqual(condition.dataMatch, { objective: 'The NEW objective' });
   assert.equal(condition.once, false);
+});
+
+// ─── I1 criterion 2: a wait given the RAW goal objective settles on that ────
+// ─── goal's goal_end, although the server stores the templated form ──────
+
+test('I1: wait with the RAW caller objective registers BOTH forms and settles on the stored (templated) form goal_end', async () => {
+  const { deps, state } = makeDeps();
+  const raw = 'Add NOTES.md and commit it';
+  const stored = applyGoalObjectiveTemplate(raw);
+  // The projection reads `running` while the goal works; the goal_end event
+  // carries the STORED objective, exactly as the server publishes it.
+  let goalReads = 0;
+  state.receipts.set('run-1', { runId: 'run-1', sessionId: 'child', runtime: 'pi', status: 'started', acceptedAt: 't' });
+  let call = 0;
+  const outcome = await waitOnChild({
+    sessionId: 'child',
+    objective: raw,
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps: {
+      ...deps,
+      async getGoal() {
+        goalReads += 1;
+        // After the goal_end firing the projection reads terminal (the server
+        // publishes goal_end FROM the terminal projection; pi-orch reads later).
+        return { status: 'achieved', objective: stored } as never;
+      },
+      async longPoll() {
+        call += 1;
+        if (call === 1) {
+          // Prove the registration actually carries both forms.
+          const body = state.lastRegistrationBody as { conditions: Array<{ id?: string; eventType?: string; dataMatch?: { objective?: string } }> };
+          const goalEndObjectives = (body.conditions ?? []).filter((condition) => condition.eventType === 'goal_end').map((condition) => condition.dataMatch?.objective);
+          assert.ok(goalEndObjectives.includes(raw), `raw form registered (got: ${JSON.stringify(goalEndObjectives)})`);
+          assert.ok(goalEndObjectives.includes(stored), `stored form registered (got: ${JSON.stringify(goalEndObjectives)})`);
+          // The server fires the STORED-form goal_end.
+          const storedCondition = (body.conditions ?? []).find((condition) => condition.eventType === 'goal_end' && condition.dataMatch?.objective === stored);
+          return {
+            kind: 'fired' as const,
+            body: firingBody([{ conditionId: storedCondition?.id ?? '', firedAt: 5, eventType: 'goal_end', evidence: 'achieved' }], 1, 'cg'),
+          };
+        }
+        return { kind: 'timeout' as const };
+      },
+    },
+  });
+  assert.equal(outcome.kind, 'goal_achieved', `raw-objective wait must settle achieved, got ${JSON.stringify(outcome)}`);
+});
+
+test('I1: wait with the EXACT stored (templated) objective keeps working — one goal form registered', async () => {
+  const { deps, state } = makeDeps();
+  const raw = 'Add NOTES.md and commit it';
+  const stored = applyGoalObjectiveTemplate(raw);
+  state.receipts.set('run-1', { runId: 'run-1', sessionId: 'child', runtime: 'pi', status: 'started', acceptedAt: 't' });
+  state.goals.set('child', { supported: true, status: 'achieved' });
+  let call = 0;
+  const outcome = await waitOnChild({
+    sessionId: 'child',
+    objective: stored,
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps: {
+      ...deps,
+      async longPoll() {
+        call += 1;
+        if (call === 1) {
+          const body = state.lastRegistrationBody as { conditions: Array<{ id?: string; eventType?: string; dataMatch?: { objective?: string } }> };
+          const goalEnds = (body.conditions ?? []).filter((condition) => condition.eventType === 'goal_end');
+          assert.equal(goalEnds.length, 1, 'the stored form does not grow a second (never-firing) variant');
+          assert.equal(goalEnds[0]?.dataMatch?.objective, stored);
+          return {
+            kind: 'fired' as const,
+            body: firingBody([{ conditionId: goalEnds[0]?.id ?? '', firedAt: 5, eventType: 'goal_end', evidence: 'achieved' }], 1, 'cg'),
+          };
+        }
+        return { kind: 'timeout' as const };
+      },
+    },
+  });
+  assert.equal(outcome.kind, 'goal_achieved');
+});
+
+// ─── I1 criterion 3: a SYNTHETIC restart goal_end is interrupted, not ───────
+// ─── goal_failed ─────────────────────────────────────────────────────────
+
+// Root cause (r4/rootcause-goal-idle.md §5): B4's restart reconciliation emits
+// a synthetic goal_end (watch-manager handleEvent) whose data carries
+// interruptedByRestart: true and NO objective, and the condition evaluator
+// says so in the FIRING EVIDENCE ('event goal_end (interrupted by restart: …').
+// The live goal projection at that moment reads running (the engine rehydrates
+// paused only at session_start), so classifying the firing by the projection
+// mapped it to goal_failed — a false failure signal on every restart. The
+// honest classification of that firing is interrupted, interruptedByRestart.
+
+test('I1: a goal_end firing carrying the restart-reconciliation evidence is interrupted (interruptedByRestart), not goal_failed', async () => {
+  const { deps, state } = makeDeps();
+  const raw = 'Add NOTES.md and commit it';
+  state.receipts.set('run-1', { runId: 'run-1', sessionId: 'child', runtime: 'pi', status: 'started', acceptedAt: 't' });
+  // The projection reads `running` at the firing — exactly the pre-fix shape
+  // that produced the false goal_failed.
+  state.goals.set('child', { supported: true, status: 'running', objective: applyGoalObjectiveTemplate(raw) });
+  let call = 0;
+  const outcome = await waitOnChild({
+    sessionId: 'child',
+    objective: raw,
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps: {
+      ...deps,
+      async longPoll() {
+        call += 1;
+        if (call === 1) {
+          const body = state.lastRegistrationBody as { conditions: Array<{ id?: string; eventType?: string }> };
+          const goalEndCondition = (body.conditions ?? []).find((condition) => condition.eventType === 'goal_end');
+          return {
+            kind: 'fired' as const,
+            body: firingBody([{
+              conditionId: goalEndCondition?.id ?? '',
+              firedAt: 5,
+              eventType: 'goal_end',
+              // The server condition-evaluator's fixed evidence shape for a
+              // restart-reconciled event (internal-api/watch/condition-evaluator.ts).
+              evidence: 'event goal_end (interrupted by restart: run run-9, server_restart)',
+            }], 1, 'cg'),
+          };
+        }
+        return { kind: 'timeout' as const };
+      },
+    },
+  });
+  assert.equal(outcome.kind, 'interrupted', `a restart-reconciled goal_end must be interrupted, got ${JSON.stringify(outcome)}`);
+  assert.equal((outcome as { interruptedByRestart?: boolean }).interruptedByRestart, true);
+});
+
+test('I1: a REAL goal_end (no restart marker in the evidence) still classifies by the projection', async () => {
+  const { deps, state } = makeDeps();
+  const raw = 'Add NOTES.md and commit it';
+  state.receipts.set('run-1', { runId: 'run-1', sessionId: 'child', runtime: 'pi', status: 'started', acceptedAt: 't' });
+  state.goals.set('child', { supported: true, status: 'running', objective: applyGoalObjectiveTemplate(raw) });
+  let call = 0;
+  const outcome = await waitOnChild({
+    sessionId: 'child',
+    objective: raw,
+    deadlineMs: 60_000,
+    sliceMs: 5_000,
+    deps: {
+      ...deps,
+      async longPoll() {
+        call += 1;
+        if (call === 1) {
+          const body = state.lastRegistrationBody as { conditions: Array<{ id?: string; eventType?: string }> };
+          const goalEndCondition = (body.conditions ?? []).find((condition) => condition.eventType === 'goal_end');
+          return {
+            kind: 'fired' as const,
+            body: firingBody([{ conditionId: goalEndCondition?.id ?? '', firedAt: 5, eventType: 'goal_end', evidence: 'achieved' }], 1, 'cg'),
+          };
+        }
+        return { kind: 'timeout' as const };
+      },
+    },
+  });
+  // Projection running + a real goal_end: the honest outcome stays the
+  // correction-04 verdict (projection unreadable for success purposes) — NOT
+  // interrupted. This is the guard against over-matching the restart marker.
+  assert.equal(outcome.kind, 'goal_failed', `got ${JSON.stringify(outcome)}`);
 });
 
 test('deadline exceeded without any event is a distinct outcome', async () => {

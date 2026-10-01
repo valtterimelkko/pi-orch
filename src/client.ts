@@ -19,9 +19,25 @@ import {
   type CreateInput,
   type PromptInput,
 } from './builders.ts';
-import { parseReceipt, ApiError, type Receipt, type WatchConditionSpec } from './parsers.ts';
+import { parseReceipt, ApiError, classifyRunOutput, type RunOutputClassification, type Receipt, type WatchConditionSpec } from './parsers.ts';
 import { resolveCompletion, type CompletionBlock, type CompletionParseError, type CompletionDelimiter, type CompletionCaptureSource, type ReceiptWithCompletion, type SessionDetailWithCompletion } from './completion.ts';
 import { COMPLETION_REPORT_INSTRUCTION } from './completion-template.ts';
+
+/**
+ * I1 (H2 item 2) + correction 01: does the first template receipt warrant the
+ * ONE re-send? `failed` (any code, incl. NEVER_STARTED) always does — nothing
+ * was delivered. `cancelled`/`interrupted` only WITHOUT `startedAt`: the
+ * server marks the follow-up started at the matching user message_start, so a
+ * startedAt on those receipts proves the template's user message WAS observed
+ * before a restart/cancel cut the run off — resending would duplicate the
+ * template, the exact defect I1 removes. Everything else — queued, accepted,
+ * started, completed, unknown — is healthy and never re-sent.
+ */
+function templateReceiptWantsRetry(status: string | undefined, startedAt: string | undefined): boolean {
+  if (status === 'failed') return true;
+  if (status === 'cancelled' || status === 'interrupted') return startedAt === undefined;
+  return false;
+}
 import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, type CompletionLoad } from './verify.ts';
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
 import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError } from './route-limits.ts';
@@ -504,8 +520,13 @@ export class PiOrchClient {
     let health: 'unknown' | 'ok' | 'failed' = 'unknown';
     try {
       const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(firstRunId)}`, { headers: this.headers() });
-      const receipt = response.body as { status?: string };
-      health = receipt.status === undefined || receipt.status === 'completed' || receipt.status === 'started' ? 'ok' : 'failed';
+      const receipt = response.body as { status?: string; startedAt?: string };
+      // I1 (H2 item 2): the follow-up sits `queued` (or `accepted`) while the
+      // arm turn is busy — that is HEALTHY, not failed. Correction 01: a
+      // startedAt on a cancelled/interrupted receipt proves delivery (the
+      // message_start was observed before the restart/cancel) — re-sending a
+      // delivered template duplicates it. See templateReceiptWantsRetry.
+      health = templateReceiptWantsRetry(receipt.status, receipt.startedAt) ? 'failed' : 'ok';
     } catch {
       health = 'unknown'; // unreadable receipt: report the runId, no retry theatre
     }
@@ -694,6 +715,9 @@ export class PiOrchClient {
     runId: string;
     sessionId: string;
     status: string;
+    /** I1 (H2 item 1): command | final_text | no_text — from the receipt's own evidence. */
+    outputClass: 'command' | 'final_text' | 'no_text';
+    outputClassBasis?: string;
     finalText?: string;
     finalTextTruncated?: boolean;
     servedModel?: string;
@@ -742,6 +766,7 @@ export class PiOrchClient {
       runId: receipt.runId,
       sessionId,
       status: receipt.status,
+      ...spreadOutputClass(classifyRunOutput(receipt)),
       finalText: receipt.finalText,
       finalTextTruncated: receipt.finalTextTruncated,
       servedModel: receipt.servedModel,
@@ -909,4 +934,11 @@ export class PiOrchClient {
 
 function defaultRandomId(): string {
   return `piorch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** I1: flatten the run-output classification onto the result body. */
+function spreadOutputClass(output: RunOutputClassification): { outputClass: 'command' | 'final_text' | 'no_text'; outputClassBasis?: string } {
+  return output.kind === 'command'
+    ? { outputClass: 'command', outputClassBasis: output.basis }
+    : { outputClass: output.kind };
 }
