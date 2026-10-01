@@ -10,7 +10,10 @@ import {
   goalPaused,
   questionSentinel,
   deadlineCondition,
+  callerObjectiveConditions,
+  goalObjectiveConditionForms,
 } from '../src/builders.ts';
+import { applyGoalObjectiveTemplate } from '../src/completion-template.ts';
 import { ZodSpec } from '../src/zod-spec.ts';
 
 /**
@@ -164,4 +167,60 @@ test('watch body: plain agent_end is the default condition shape', () => {
   const goalCondition = goalEnd('obj');
   assert.equal(goalCondition.eventType, 'goal_end');
   assert.equal(goalPaused('obj').eventType, 'goal_state');
+});
+
+// ─── I1 criterion 2: a CALLER objective must match BOTH its raw and its ──────
+// ─── stored (templated) form ─────────────────────────────────────────────
+
+// Root cause (r4/rootcause-goal-idle.md §2 defect 1): `spawn --goal-objective
+// "X"` stores the objective as applyGoalObjectiveTemplate("X") (the flattened
+// completion-report pointer rides along), and the server matches goal_end
+// dataMatch.objective by strict ===. A wait given the RAW "X" can therefore
+// never fire — the G5 parent's goal was in fact achieved at 19:08:41 and the
+// driver still ran to its deadline. Fix: the caller-objective condition set
+// matches BOTH forms (deterministic — the same pure function spawn used —
+// and race-free: it needs no projection read, which can lag the goal
+// engine's registration on a fresh spawn). A wait given the exact stored
+// form keeps working (single form; the raw variant would never fire and is
+// not registered). An auto-DETECTED objective comes from the projection and
+// is already the stored form — it keeps the single-form defaultConditions.
+
+test('I1: goalObjectiveConditionForms expands a raw objective to raw + templated forms', () => {
+  const raw = 'Ship the fix';
+  const forms = goalObjectiveConditionForms(raw);
+  assert.deepEqual(forms, [raw, applyGoalObjectiveTemplate(raw)]);
+  assert.equal(forms.length, 2, 'raw + stored forms');
+  assert.ok(forms.includes(applyGoalObjectiveTemplate(raw)), 'the stored form is registered');
+});
+
+test('I1: goalObjectiveConditionForms passes an already-templated objective through as ONE form', () => {
+  const stored = applyGoalObjectiveTemplate('Ship the fix');
+  assert.deepEqual(goalObjectiveConditionForms(stored), [stored], 'the stored form must not grow a second pointer');
+});
+
+test('I1: callerObjectiveConditions registers goal_end + paused for BOTH forms plus the deadline', () => {
+  const raw = 'Ship the fix';
+  const conditions = callerObjectiveConditions(raw, 120_000);
+  const goalEnds = conditions.filter((condition) => condition.eventType === 'goal_end');
+  const paused = conditions.filter((condition) => condition.eventType === 'goal_state');
+  const deadlines = conditions.filter((condition) => condition.type === 'deadline');
+  assert.deepEqual(goalEnds.map((condition) => (condition.dataMatch as { objective: string }).objective), [raw, applyGoalObjectiveTemplate(raw)]);
+  assert.deepEqual(paused.map((condition) => (condition.dataMatch as { objective: string }).objective), [raw, applyGoalObjectiveTemplate(raw)]);
+  assert.equal(deadlines.length, 1, 'one deadline backstop');
+  assert.equal(goalEnds[0]?.once, false, 'goal conditions repeat, as before');
+});
+
+test('I1: callerObjectiveConditions with an already-templated objective registers ONE goal form (unchanged shape)', () => {
+  const stored = applyGoalObjectiveTemplate('Ship the fix');
+  const conditions = callerObjectiveConditions(stored, 120_000);
+  const goalEnds = conditions.filter((condition) => condition.eventType === 'goal_end');
+  assert.equal(goalEnds.length, 1);
+  assert.equal((goalEnds[0]?.dataMatch as { objective: string }).objective, stored);
+});
+
+test('I1: callerObjectiveConditions without an objective is the plain agent_end + deadline set', () => {
+  const conditions = callerObjectiveConditions(undefined, 120_000);
+  assert.equal(conditions.filter((condition) => condition.eventType === 'agent_end').length, 1);
+  assert.equal(conditions.filter((condition) => condition.type === 'deadline').length, 1);
+  assert.equal(conditions.some((condition) => condition.eventType === 'goal_end'), false);
 });

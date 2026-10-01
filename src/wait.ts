@@ -11,7 +11,7 @@
  * reconciled firing, and the cursor resets to 0 for the new ledger.
  */
 
-import { defaultConditions } from './builders.ts';
+import { defaultConditions, callerObjectiveConditions } from './builders.ts';
 import type { WatchConditionSpec } from './parsers.ts';
 import { OUTCOME_EXIT_CODES } from './exit-codes.ts';
 import { classifyReceipt, isTerminalReceipt, parseWatchesWait, type Receipt, type ReceiptClassification } from './parsers.ts';
@@ -55,6 +55,14 @@ export interface WaitOptions {
   runId?: string;
   conditions?: WatchConditionSpec[];
   objective?: string;
+  /**
+   * I1: true when {@link objective} was auto-DETECTED from the goal projection
+   * (waitOnChild / waitOnChildren per-child detection). The projection carries
+   * the STORED objective, so the single-form default conditions are exact. A
+   * caller-supplied objective (the raw `spawn --goal-objective` form) needs
+   * the dual-form {@link callerObjectiveConditions} instead.
+   */
+  objectiveFromProjection?: boolean;
   /** Overall deadline in ms (client-side). */
   deadlineMs: number;
   /** Long-poll slice in ms; the server caps any single wait at 300000. */
@@ -144,7 +152,7 @@ export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
   if (!options.conditions && !options.objective) {
     const detected = await detectActiveGoal(options.sessionId, options.deps);
     if (detected) {
-      const outcome = await waitOnChildCore({ ...options, objective: detected });
+      const outcome = await waitOnChildCore({ ...options, objective: detected, objectiveFromProjection: true });
       return withAutoGoalNote(outcome);
     }
   }
@@ -157,7 +165,13 @@ async function waitOnChildCore(options: WaitOptions): Promise<WaitOutcome> {
   if (fast) return fast;
   const sliceMs = Math.min(options.sliceMs ?? 45_000, MAX_SLICE_MS);
   const start = deps.now();
-  const conditions = options.conditions ?? defaultConditions(options.objective, options.deadlineMs);
+  // I1 (H2 item 6): a CALLER objective is matched against both its raw and its
+  // stored (templated) form — the server stores applyGoalObjectiveTemplate(X)
+  // and compares dataMatch.objective strictly, so raw-only conditions never
+  // fire. A projection-detected objective is already the stored form.
+  const conditions = options.conditions ?? (options.objectiveFromProjection
+    ? defaultConditions(options.objective, options.deadlineMs)
+    : callerObjectiveConditions(options.objective, options.deadlineMs));
   const conditionsById = new Map(conditions.flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
 
   let watch = await registerOrReuse(options.sessionId, conditions, options.label, deps);
@@ -281,6 +295,15 @@ async function goalEndOutcome(
   evidence: string,
   deps: WaitDeps,
 ): Promise<WaitOutcome> {
+  // I1 (H2 item 7, restart edge): the server's B4 restart reconciliation emits
+  // a SYNTHETIC goal_end — data carries interruptedByRestart: true and no
+  // objective, and the condition evaluator states it in the FIRING EVIDENCE
+  // ('event goal_end (interrupted by restart: …'). The projection at that
+  // moment still reads running, so the projection classification below would
+  // report a false goal_failed on every restart. The honest outcome for that
+  // firing is interrupted.
+  const restart = restartInterruptedOutcome(evidence);
+  if (restart) return restart;
   try {
     const goal = await deps.getGoal(sessionId);
     switch (goal.status) {
@@ -300,6 +323,22 @@ async function goalEndOutcome(
     // reported as success (correction 04 item 1).
     return { kind: 'goal_failed', evidence, note: 'goal_end fired but the projection was unreadable' };
   }
+}
+
+/**
+ * I1: the interrupted outcome for a restart-reconciled goal_end firing, or
+ * null when the evidence is a real goal event. The marker string is the
+ * server condition-evaluator's fixed evidence shape for an event whose data
+ * carries interruptedByRestart (internal-api/watch/condition-evaluator.ts:
+ * `event ${type} (interrupted by restart: run ${runId}, ${reason})`).
+ */
+function restartInterruptedOutcome(evidence: string | undefined): WaitOutcome | null {
+  if (evidence === undefined || !evidence.includes('interrupted by restart')) return null;
+  return {
+    kind: 'interrupted',
+    interruptedByRestart: true,
+    note: 'goal_end fired by the server restart reconciliation — the run(s) were interrupted, the goal did not fail',
+  };
 }
 
 async function outcomeFromFirings(
@@ -632,7 +671,8 @@ function childConditions(
   detectedObjective?: string,
 ): WatchConditionSpec[] {
   if (detectedObjective !== undefined) return defaultConditions(detectedObjective, options.deadlineMs);
-  return options.conditions ?? defaultConditions(options.objective, options.deadlineMs);
+  // I1 (H2 item 6): a caller objective matches both its raw and stored forms.
+  return options.conditions ?? callerObjectiveConditions(options.objective, options.deadlineMs);
 }
 
 function allExitCode(children: Array<{ outcome?: WaitOutcome }>): number {
