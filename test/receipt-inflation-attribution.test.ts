@@ -1,127 +1,136 @@
 /**
- * H3a — receipt inflation from refused-prompt retries (attribution pin).
+ * H3a B+ (parent 01-answer.md, 2026-10-01T20:50Z) — additive classification
+ * of refused-before-dispatch receipts.
  *
- * G3 measured that one `pi-orch prompt` call under admission pressure can
- * leave up to 3 run receipts on the same session: every refused attempt
- * (429/503 + Retry-After) leaves a cancelled ADMISSION_CAPACITY_EXHAUSTED
- * (or SERVER_DRAINING) receipt whose idempotency key the server releases
- * (rejectBeforeDispatch → clearIdempotency), so the retry creates a NEW
- * receipt even under the SAME key.
+ * The server (1.58.x) creates a run receipt BEFORE the admission check and
+ * releases the idempotency key on refusal, so every refused attempt of a
+ * Retry-After retry leaves one cancelled, never-started receipt (H3a
+ * attribution; live-proven, live-1/). Receipt totals therefore overcount
+ * real runs. This module classifies those receipts so audits count one run
+ * per real attempt, with refused attempts reported separately.
  *
- * H3a's frozen criterion 1 asks WHY: does the client send a new idempotency
- * key per attempt, or does the server release the key and receipt every
- * attempt anyway? These tests pin the client half of that answer: ONE logical
- * prompt() call generates exactly ONE idempotency key and re-sends it on
- * every transport-level Retry-After retry (and on the followUpOnBusy 409
- * retry). Key multiplication therefore cannot originate in pi-orch; the
- * per-attempt receipts are server-side (receipt created at beginRun before
- * the admission check; key released on refusal). The full attribution and
- * the proposed server change live in the lane's hand-back (01-question.md).
- *
- * Characterization tests: no behaviour change, so there is no RED→GREEN
- * pair; their power is proven by mutation (a build that regenerates the key
- * per attempt fails these tests).
+ * Classification rule (parent answer, item 1): a receipt is
+ * refusedBeforeDispatch when it is `cancelled`, has NO `startedAt`, and its
+ * `errorCode` is one of the typed pre-dispatch refusals
+ * (ADMISSION_CAPACITY_EXHAUSTED, SERVER_DRAINING, SESSION_BUSY). A receipt
+ * cancelled AFTER start (has `startedAt`) stays a plain cancellation.
+ * Additive and non-breaking: `kind` keeps the receipt's own status; wait
+ * exit codes are untouched.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PiOrchClient } from '../src/client.ts';
-import { ApiError } from '../src/parsers.ts';
-import { Transport } from '../src/transport.ts';
-import type { TransportResponse } from '../src/transport.ts';
+import { readFile } from 'node:fs/promises';
+import { classifyReceipt, countRunAttempts, type Receipt } from '../src/parsers.ts';
 
-function ok(body: unknown): TransportResponse {
-  return { status: 200, headers: {}, body, raw: JSON.stringify(body) };
-}
+/** A real dispatched run from the live-1 proof (C's accepted attempt). */
+const dispatched: Receipt = {
+  runId: 'a5a2d827-154d-4eac-850d-0af3afdb8942',
+  sessionId: '01a0f91f-fcbb-76d3-9167-6684c8218f6a',
+  status: 'completed',
+  mode: 'prompt',
+  acceptedAt: '2026-10-01T20:29:31.209Z',
+  startedAt: '2026-10-01T20:29:31.219Z',
+  terminalAt: '2026-10-01T20:29:33.437Z',
+};
 
-function admissionRefusal(status: 429 | 503, code: string, retryAfter: string): TransportResponse {
-  return { status, headers: { 'retry-after': retryAfter }, body: { error: 'refused', code }, raw: '' };
-}
+/** A real refused attempt from live-1 (C's round-1 call, attempt 1 of 3). */
+const refused: Receipt = {
+  runId: 'b7f4068e',
+  sessionId: '01a0f91f-fcbb-76d3-9167-6684c8218f6a',
+  status: 'cancelled',
+  errorCode: 'ADMISSION_CAPACITY_EXHAUSTED',
+  mode: 'prompt',
+  acceptedAt: '2026-10-01T20:24:50.892Z',
+  terminalAt: '2026-10-01T20:24:50.896Z',
+};
 
-test('h3a: one prompt() call sends the SAME idempotency key on every Retry-After retry', async () => {
-  const attempts: Array<{ method: string; path: string; body?: unknown }> = [];
-  let promptAttempts = 0;
-  const transport = new Transport({
-    apiBase: 'http://127.0.0.1:1',
-    token: 't',
-    retry: { maxAttempts: 3, maxTotalWaitMs: 120_000, sleep: async () => {} },
-  });
-  (transport as unknown as { requestOnce: unknown }).requestOnce = async (
-    method: string,
-    path: string,
-    options: { body?: unknown } = {},
-  ) => {
-    attempts.push({ method, path, body: options.body });
-    // G1: the prompt-side route gate reads the child's detail first; the
-    // pinned behaviour below is about the PROMPT attempts.
-    if (path.endsWith('/prompt')) {
-      promptAttempts += 1;
-      if (promptAttempts === 1) return admissionRefusal(429, 'ADMISSION_CAPACITY_EXHAUSTED', '2');
-    }
-    return ok({ runId: 'r1', sessionId: 's1', detached: true, status: 'accepted', dispatchMode: 'prompt' });
-  };
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'h3a-fixed-key' });
-  const result = await client.prompt('s1', { message: 'go', completionTemplate: false });
-  assert.equal(result.runId, 'r1');
-  assert.equal(promptAttempts, 2, 'exactly one transport-level retry after the 429');
-  const promptPosts = attempts.filter((attempt) => attempt.path.endsWith('/prompt'));
-  assert.equal(promptPosts.length, 2);
-  assert.deepEqual(
-    promptPosts.map((attempt) => (attempt.body as Record<string, unknown>).idempotencyKey),
-    ['h3a-fixed-key', 'h3a-fixed-key'],
-    'both attempts carry the SAME idempotency key — pi-orch does not multiply keys per attempt',
-  );
-  assert.deepEqual(
-    promptPosts[0]?.body,
-    promptPosts[1]?.body,
-    'the retry re-sends the identical request body (same key, same message, same mode)',
-  );
+test('h3a/b+: a never-started cancelled refusal receipt classifies refusedBeforeDispatch with its refusal code', () => {
+  const c = classifyReceipt(refused);
+  assert.equal(c.kind, 'cancelled', 'additive: kind keeps the receipt status');
+  if (c.kind !== 'cancelled') throw new Error('unreachable');
+  assert.equal(c.refusedBeforeDispatch, true);
+  assert.equal(c.refusalCode, 'ADMISSION_CAPACITY_EXHAUSTED');
 });
 
-test('h3a: a 503 SERVER_DRAINING refusal is retried under the same key too', async () => {
-  const bodies: Array<Record<string, unknown>> = [];
-  let promptAttempts = 0;
-  const transport = new Transport({
-    apiBase: 'http://127.0.0.1:1',
-    token: 't',
-    retry: { maxAttempts: 3, maxTotalWaitMs: 120_000, sleep: async () => {} },
+for (const errorCode of ['SERVER_DRAINING', 'SESSION_BUSY']) {
+  test(`h3a/b+: the typed refusal ${errorCode} classifies refusedBeforeDispatch`, () => {
+    const c = classifyReceipt({ ...refused, errorCode });
+    if (c.kind !== 'cancelled') throw new Error('unreachable');
+    assert.equal(c.refusedBeforeDispatch, true);
+    assert.equal(c.refusalCode, errorCode);
   });
-  (transport as unknown as { requestOnce: unknown }).requestOnce = async (
-    _method: string,
-    path: string,
-    options: { body?: unknown } = {},
-  ) => {
-    if (path.endsWith('/prompt')) {
-      promptAttempts += 1;
-      bodies.push(options.body as Record<string, unknown>);
-      if (promptAttempts === 1) return admissionRefusal(503, 'SERVER_DRAINING', '30');
-    }
-    return ok({ runId: 'r2', sessionId: 's1', detached: true, status: 'accepted', dispatchMode: 'prompt' });
-  };
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'h3a-key-503' });
-  const result = await client.prompt('s1', { message: 'go', completionTemplate: false });
-  assert.equal(result.runId, 'r2');
-  assert.equal(promptAttempts, 2);
-  assert.deepEqual(
-    bodies.map((body) => body.idempotencyKey),
-    ['h3a-key-503', 'h3a-key-503'],
-  );
+}
+
+test('h3a/b+: a receipt cancelled AFTER start (has startedAt) stays a plain cancellation', () => {
+  // The window-end cleanup shape (G3): the turn really ran, then was cancelled.
+  const c = classifyReceipt({ ...refused, startedAt: '2026-10-01T20:24:50.900Z', errorCode: 'ADMISSION_CAPACITY_EXHAUSTED' });
+  assert.equal(c.kind, 'cancelled');
+  assert.equal(c.refusedBeforeDispatch, false);
+  assert.equal(c.refusalCode, undefined);
 });
 
-test('h3a: the followUpOnBusy 409 retry reuses the same idempotency key (one logical dispatch)', async () => {
-  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
-  let promptCalls = 0;
-  const transport = {
-    request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
-      calls.push({ path, body: options.body ?? {} });
-      if (path.endsWith('/prompt')) {
-        promptCalls += 1;
-        if (promptCalls === 1) throw new ApiError(409, 'SESSION_BUSY', 'Session is currently busy', { retryAfterSeconds: 2 });
-      }
-      return ok({ runId: 'r1', sessionId: 's1', detached: true, status: 'accepted', dispatchMode: 'follow_up' });
-    },
-  } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
-  await client.prompt('s1', { message: 'go', followUpOnBusy: true, completionTemplate: false });
-  const keys = calls.filter((call) => call.path.endsWith('/prompt')).map((call) => call.body.idempotencyKey);
-  assert.deepEqual(keys, ['k1', 'k1'], 'the single allowed 409 retry is part of the SAME logical dispatch');
+test('h3a/b+: a dispatched run is never refusedBeforeDispatch, whatever its status', () => {
+  // Only the cancelled variant carries the refusal fields; every other kind
+  // classifies exactly as before (additive, non-breaking).
+  assert.equal(classifyReceipt(dispatched).kind, 'completed');
+  assert.equal(classifyReceipt({ ...refused, status: 'failed' }).kind, 'failed', 'only cancelled receipts classify as refusals');
+  assert.equal(classifyReceipt({ ...refused, status: 'started' }).kind, 'running');
+});
+
+test('h3a/b+: countRunAttempts — one dispatched run plus N refused attempts on the same key (live-1 shape)', () => {
+  // C's session in live-1: one logical prompt refused 3 times (3 receipts),
+  // then the retried dispatch succeeded (1 receipt).
+  const counts = countRunAttempts([refused, { ...refused, runId: '2e4682d4' }, { ...refused, runId: 'd58e6a4c' }, dispatched]);
+  assert.deepEqual(counts, { dispatched: 1, refusedBeforeDispatch: 3, other: 0 });
+});
+
+test('h3a/b+: countRunAttempts — a post-start cancellation was a real attempt (dispatched), not a refusal', () => {
+  const counts = countRunAttempts([
+    dispatched,
+    { ...refused, startedAt: '2026-10-01T20:24:50.900Z', runId: 'window-end-kill' },
+  ]);
+  assert.deepEqual(counts, { dispatched: 2, refusedBeforeDispatch: 0, other: 0 });
+});
+
+test('h3a/b+: countRunAttempts — the counts always sum to the receipt count', () => {
+  const receipts: Receipt[] = [
+    dispatched,
+    refused,
+    { ...refused, runId: 'x2', errorCode: 'SERVER_DRAINING' },
+    { ...refused, runId: 'x3', status: 'interrupted' },
+    { ...refused, runId: 'x4', status: 'queued' },
+  ];
+  const counts = countRunAttempts(receipts);
+  assert.equal(counts.dispatched + counts.refusedBeforeDispatch + counts.other, receipts.length);
+  assert.equal(counts.dispatched, 1);
+  assert.equal(counts.refusedBeforeDispatch, 2);
+  assert.equal(counts.other, 2, 'interrupted and in-flight queued receipts are neither dispatched nor refused');
+});
+
+test('h3a/b+: an empty receipt list counts to zeros', () => {
+  assert.deepEqual(countRunAttempts([]), { dispatched: 0, refusedBeforeDispatch: 0, other: 0 });
+});
+
+test('h3a/b+: the classifier reads only snapshot-defined RunReceipt fields (contract drift guard)', async () => {
+  const snapshot = JSON.parse(await readFile(new URL('../contract/internal-api-client-snapshot.json', import.meta.url), 'utf8')) as {
+    types: Record<string, { fields: Record<string, unknown> }>;
+  };
+  const fields = snapshot.types.RunReceipt?.fields;
+  assert.ok(fields, 'RunReceipt must exist in the bundled contract snapshot');
+  for (const field of ['status', 'startedAt', 'errorCode']) {
+    assert.ok(field in fields, `RunReceipt.${field} must exist in the bundled contract snapshot`);
+  }
+});
+
+test('h3a/b+: the bundled live-1 fixture classifies as the live run recorded it', async () => {
+  // Fixture provenance: live-1 (disposable server, build 5480b9c1, 2026-10-01);
+  // session C = 3 refused attempts (one logical call) + 1 completed dispatch;
+  // session A = 2 goal-arm/template dispatches + 2 refused attempts.
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/receipt-inflation-live1.json', import.meta.url), 'utf8')) as {
+    _provenance: string;
+    receipts: Receipt[];
+    expected: { dispatched: number; refusedBeforeDispatch: number; other: number };
+  };
+  assert.match(fixture._provenance, /live-1/);
+  assert.deepEqual(countRunAttempts(fixture.receipts), fixture.expected);
 });

@@ -103,6 +103,10 @@ pi-orch spawn --runtime pi --cwd /task --model-selector zai/glm-5.3-flash \
   --owner me --route-limit 'zai/glm-5.3-flash=2' --wait-for-slot 600
 ```
 
+### Counting runs under admission pressure (receipt inflation)
+
+Under admission pressure the server refuses a prompt with `429`/`503` + `Retry-After`; `pi-orch` retries under the SAME idempotency key, and the server — which creates a receipt before the admission check and releases the key on refusal — leaves one cancelled, never-started receipt per refused attempt (typed `ADMISSION_CAPACITY_EXHAUSTED`, `SERVER_DRAINING` or `SESSION_BUSY`; server behaviour at 1.58.x). A refused-then-retried prompt therefore leaves one real receipt **plus one refusal receipt per refused attempt**. Count runs with `countRunAttempts(receipts)` (from the public module surface) — it returns `{ dispatched, refusedBeforeDispatch, other }`, one run per real attempt with refusals reported separately — never with raw receipt totals, and never read run-receipt counts as dispatch counts (`classifyReceipt` marks each refusal receipt `refusedBeforeDispatch: true`).
+
 ## Environment
 
 | Variable | Meaning |
