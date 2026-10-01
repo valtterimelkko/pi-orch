@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PiOrchClient } from '../src/client.ts';
+import { classifyRunOutput } from '../src/parsers.ts';
 import { resolveCompletion, type CompletionBlock, type ReceiptWithCompletion, type SessionDetailWithCompletion } from '../src/completion.ts';
 import type { TransportResponse } from '../src/transport.ts';
 
@@ -118,6 +119,71 @@ test('result: falls back to the session surface for a receipt-less goal child', 
   assert.equal(result.completion, BLOCK);
   assert.equal(result.completionSource, 'session_surface');
   assert.equal(result.evidence.completion, '/api/v1/sessions/s1');
+});
+
+// ─── I1 criterion 4: a slash-command handler-return receipt is a COMMAND, ───
+// ─── not an empty final answer ───────────────────────────────────────
+
+// Root cause (r4/rootcause-empty-cancelled.md Mechanism A): a `/goal …` arm
+// prompt completes at the command's handler return (status completed,
+// cessation.basis 'documented_handler_return', assistantMessages 0, no
+// finalText). G5's receipt instrument counted those as "empty final" — 6 of
+// the 13 bad receipts — though nothing was returned empty by a provider. The
+// receipt carries the marker; the client just never looked. H2 item 1: count
+// handler-return receipts as commands in `result` and document it (the
+// receipt-breakdown instrument adopts the same rule at the integrated proof).
+
+function armReceipt(): Record<string, unknown> {
+  return {
+    runId: 'r-arm', sessionId: 's1', runtime: 'pi', status: 'completed',
+    cessation: { state: 'confirmed', basis: 'documented_handler_return', observedAt: 't' },
+    outputEvidence: { policyVersion: 'run-output-v1', source: 'normalized-events-v1', assistantMessages: 0, assistantTextBlocks: 0, assistantTextChars: 0, toolCalls: 0, disposition: 'unknown' },
+  };
+}
+
+test('I1: classifyRunOutput reads a handler-return receipt as a command (no final text expected)', () => {
+  const classified = classifyRunOutput(armReceipt() as never);
+  assert.deepEqual(classified, { kind: 'command', basis: 'documented_handler_return' });
+});
+
+test('I1: classifyRunOutput also reads the liveness.cessation mirror when the top-level field is absent', () => {
+  const receipt = armReceipt();
+  delete (receipt as { cessation?: unknown }).cessation;
+  (receipt as { liveness?: unknown }).liveness = { cessation: { state: 'confirmed', basis: 'documented_handler_return', observedAt: 't' } };
+  assert.equal(classifyRunOutput(receipt as never).kind, 'command');
+});
+
+test('I1: classifyRunOutput reads a normal text receipt as final_text and a bare completion as no_text', () => {
+  assert.deepEqual(classifyRunOutput({ runId: 'r', sessionId: 's', status: 'completed', finalText: 'done' } as never), { kind: 'final_text' });
+  assert.deepEqual(classifyRunOutput({ runId: 'r', sessionId: 's', status: 'completed', finalText: '' } as never), { kind: 'no_text' });
+  assert.deepEqual(classifyRunOutput({ runId: 'r', sessionId: 's', status: 'completed' } as never), { kind: 'no_text' });
+});
+
+test('I1: result returns outputClass command for the arm run (and does not claim an empty final)', async () => {
+  const transport = {
+    request: async (_method: string, path: string) => {
+      if (path === '/api/v1/runs/r-arm') return ok(armReceipt());
+      if (path === '/api/v1/sessions/s1') return ok({ sessionId: 's1' });
+      throw new Error(`unexpected call ${path}`);
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport });
+  const result = await client.result('r-arm');
+  assert.equal(result.outputClass, 'command');
+  assert.equal(result.outputClassBasis, 'documented_handler_return');
+});
+
+test('I1: result returns outputClass final_text for a normal receipt', async () => {
+  const transport = {
+    request: async (_method: string, path: string) => {
+      if (path === '/api/v1/runs/r1') return ok(receipt({ finalText: 'all done' }));
+      if (path === '/api/v1/sessions/s1') return ok({ sessionId: 's1' });
+      throw new Error(`unexpected call ${path}`);
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport });
+  const result = await client.result('r1');
+  assert.equal(result.outputClass, 'final_text');
 });
 
 test('result: no completion anywhere → completion stays undefined, result still returns', async () => {

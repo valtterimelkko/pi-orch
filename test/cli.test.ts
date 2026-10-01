@@ -142,6 +142,29 @@ test('prompt prints the runId; wait passes deadline; result prints final text', 
   assert.equal((JSON.parse(result.stdout ?? '{}') as Record<string, unknown>).finalText, 'all done');
 });
 
+test('I1: result human output reports a handler-return receipt as a command, not an empty final', async () => {
+  const result = await runCli(
+    ['result', 'run-arm'],
+    fakeDeps({
+      client: () => ({
+        async result() {
+          return {
+            runId: 'run-arm',
+            status: 'completed',
+            outputClass: 'command',
+            outputClassBasis: 'documented_handler_return',
+            evidence: { transcript: '/api/v1/sessions/s1/transcript?scope=visible_full' },
+          };
+        },
+      }) as never,
+    }),
+  );
+  assert.equal(result.exitCode, 0);
+  const out = result.stdout ?? '';
+  assert.ok(out.includes('command'), `human output names the command class: ${out}`);
+  assert.ok(!out.includes('(no final text on the receipt'), `no empty-final reading: ${out}`);
+});
+
 test('wait outcomes map to their documented exit codes', async () => {
   const wait = await runCli(
     ['wait', 'sess-9', '--run-id', 'run-77', '--json'],

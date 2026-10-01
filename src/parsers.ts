@@ -111,6 +111,39 @@ function classifyFailure(errorCode: string | undefined): ReceiptClassification {
   }
 }
 
+// ─── I1 (H2 item 1): run OUTPUT classification ─────────────────────────────
+
+export type RunOutputClassification =
+  | { kind: 'command'; basis: string }
+  | { kind: 'final_text' }
+  | { kind: 'no_text' };
+
+/**
+ * Classify what a terminal run OUTPUT, from the receipt's own evidence.
+ * `command` = the run is a slash-command handler return (status completed at
+ * the command boundary: cessation.basis 'documented_handler_return', no
+ * assistant text, no finalText — the `/goal` arm-prompt shape). G5's receipt
+ * instrument counted these as "empty final" (6 of its 13 bad receipts), but
+ * nothing was returned empty by a provider: a command has no final text BY
+ * DESIGN. `final_text` = the receipt carries final text. `no_text` = neither —
+ * the genuinely unexplained class (assistant messages but no text).
+ *
+ * The public receipt mirrors liveness.cessation to a top-level `cessation`
+ * (run-receipts/run-receipt-manager.ts); read both, the stored receipts used
+ * by offline instruments carry only the liveness copy.
+ */
+export function classifyRunOutput(receipt: Receipt): RunOutputClassification {
+  const basis = receipt.cessation?.basis
+    ?? (receipt.liveness as { cessation?: { basis?: string } } | undefined)?.cessation?.basis;
+  if (receipt.status === 'completed' && basis === 'documented_handler_return') {
+    return { kind: 'command', basis };
+  }
+  if (typeof receipt.finalText === 'string' && receipt.finalText.trim() !== '') {
+    return { kind: 'final_text' };
+  }
+  return { kind: 'no_text' };
+}
+
 // ─── /watches/wait ───────────────────────────────────────────────────────────
 
 export interface WatchFiring {
