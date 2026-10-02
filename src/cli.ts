@@ -65,7 +65,7 @@ interface ParsedArgs {
 
 const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool', 'route-limit']);
 /** Flags that never consume the following token (so `--all c1@r1` keeps the id positional). */
-const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled']);
+const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled', 'force-unconditional']);
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const verb = argv[0] ?? '';
@@ -172,9 +172,12 @@ Verbs:
   spawn --runtime rt --cwd dir [...]   create a child (retention, goal, preflight)
   goal <sessionId> start [...]         arm a goal on a CREATED child (H-b parent
                                        pattern: create, then goal) with budget
-  watch <sessionId> register|list|delete
-                                       server-side watch WITHOUT waiting: register,
-                                       print the watchId, exit (idle-parent pattern)
+  watch <sessionId> register --conditions a,b [--label L] [--pin] [--fire-if-settled]
+  watch <sessionId> delete [--generation G] | list
+                                       delete is generation-safe (409 mismatch → exit 19,
+                                       nothing deleted); with no generation available it
+                                       REFUSES unless --force-unconditional (legacy blind
+                                       delete — the only unconditional path)
   prompt <sessionId> --message text    detached dispatch with idempotency key
   wait <sessionId> [--run-id id]       watch-based wait; never polls; deadline
        [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
@@ -262,7 +265,7 @@ const VERB_FLAGS: Record<string, Set<string>> = {
   cleanup: new Set(['lease', 'owner', 'watch']),
   status: new Set(['parent', 'owner']),
   goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template']),
-  watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only', 'generation']),
+  watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only', 'generation', 'force-unconditional']),
 };
 
 /** The full allowed flag set for a verb (connection flags included), or undefined for an unknown verb. */
@@ -403,8 +406,13 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       // 02-correction 1: the shared goal-field validation as a usage error
       // BEFORE the client factory — the Luna probe (1e12 budget) never
       // reaches a request now.
-      if (goalObjective) {
-        validatedGoalFields({ objective: goalObjective, maxTurns: flagNumber(args, 'goal-max-turns'), verifyCommand: flagString(args, 'goal-verify'), budgetTokens: goalBudget });
+      // 04-correction B: ANY goal flag (an objective present even if empty,
+      // a budget, max-turns, verify) opts this spawn into goal validation —
+      // goal flags without an objective used to be silently dropped and a
+      // PLAIN child created.
+      const goalFlagsGiven = args.flags.has('goal-objective') || args.flags.has('goal-budget-tokens') || args.flags.has('goal-max-turns') || args.flags.has('goal-verify');
+      if (goalFlagsGiven) {
+        validatedGoalFields({ objective: goalObjective ?? '', maxTurns: flagNumber(args, 'goal-max-turns'), verifyCommand: flagString(args, 'goal-verify'), budgetTokens: goalBudget });
       }
       // G1: validate the flag (cheap usage error) BEFORE the client factory runs.
       const waitForSlotMs = args.flags.has('wait-for-slot') ? waitForSlotSeconds(args) : undefined;
@@ -533,14 +541,30 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         });
       }
       if (sub === 'delete') {
-        // 02-correction 2: generation-safe delete. An explicit --generation is
-        // used as-is; otherwise a FRESH read supplies the observed generation,
-        // and the delete carries it as the server's CAS precondition. A
-        // mismatch (409) names both generations and deletes nothing.
+        // 04-correction A1: fail closed. A delete carries the server's CAS
+        // precondition (expectedGeneration) from --generation or from a fresh
+        // read; when NO generation is available (nothing registered, or a
+        // read without one) the unconditional delete is REFUSED — exit 19 —
+        // unless the caller passes --force-unconditional, the documented
+        // legacy escape. 04-correction A2: the acknowledgement is validated
+        // (success:true, watchId present, generation equal to the one sent)
+        // before anything is reported as deleted.
+        const force = args.flags.has('force-unconditional');
         let expectedGeneration = flagString(args, 'generation');
-        if (expectedGeneration === undefined) {
+        if (expectedGeneration === undefined && !force) {
           const watch = await getClient().getWatch(sessionId);
-          if (!watch) return output(json, { deleted: false, note: 'no watch registered' }, () => 'no watch registered');
+          if (!watch) {
+            return {
+              exitCode: 19,
+              stderr: `pi-orch: no watch registered for ${sessionId} — refusing an unconditional delete (pass --generation <g> to target a known watch, or --force-unconditional for the legacy blind delete)`,
+            };
+          }
+          if (watch.generation === undefined) {
+            return {
+              exitCode: 19,
+              stderr: `pi-orch: the watch on ${sessionId} reported no generation — refusing an unconditional delete (pass --generation <g>, or --force-unconditional for the legacy blind delete)`,
+            };
+          }
           expectedGeneration = watch.generation;
         }
         try {
@@ -550,11 +574,17 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
             return `watch deleted${deleted.generation ? ` (generation ${deleted.generation})` : ''}`;
           });
         } catch (error) {
-          const mismatch = error as { code?: string; expectedGeneration?: string; currentGeneration?: string };
+          const mismatch = error as { code?: string; expectedGeneration?: string; currentGeneration?: string; message?: string };
           if (mismatch.code === 'WATCH_GENERATION_MISMATCH') {
             return {
               exitCode: 19,
               stderr: `pi-orch: WATCH_GENERATION_MISMATCH — deleted nothing; the watch was replaced since it was read (expected ${mismatch.expectedGeneration ?? 'unknown'}, current ${mismatch.currentGeneration ?? 'unknown'})`,
+            };
+          }
+          if (mismatch.code === 'WATCH_DELETE_ACK_FAILED') {
+            return {
+              exitCode: 19,
+              stderr: mismatch.message ?? 'pi-orch: WATCH_DELETE_ACK_FAILED — nothing is reported as deleted',
             };
           }
           throw error;

@@ -92,6 +92,22 @@ export class WatchGenerationMismatchError extends Error {
   }
 }
 
+/**
+ * 04-correction A2: the server answered a watch delete, but the
+ * acknowledgement does not confirm THIS delete (success:false, a missing
+ * watchId, or a different generation). Nothing may be reported as deleted.
+ */
+export class WatchDeleteAcknowledgementError extends Error {
+  readonly ack: Record<string, unknown> | undefined;
+  code = 'WATCH_DELETE_ACK_FAILED';
+
+  constructor(detail: string, ack?: Record<string, unknown>) {
+    super(`pi-orch: WATCH_DELETE_ACK_FAILED — the server answered, but the acknowledgement does not confirm this delete (${detail}); reporting NOTHING as deleted`);
+    this.name = 'WatchDeleteAcknowledgementError';
+    this.ack = ack;
+  }
+}
+
 export class PiOrchClient {
   readonly transport: Transport;
   readonly parentSessionId?: string;
@@ -287,7 +303,9 @@ export class PiOrchClient {
     }
     const oursToClean = watchable.map((entry) => entry.sessionId);
     const waited = await this.waitMany({ mode: 'any', children: watchable.map((entry) => ({ sessionId: entry.sessionId })), deadlineMs: remainingMs });
-    await Promise.all(oursToClean.map((sessionId) => this.deleteWatch(sessionId).catch(() => undefined)));
+    // 04-correction A3: conditional deletes — the generation is read and sent
+    // as the precondition; a replaced watch is skipped, never deleted.
+    await Promise.all(oursToClean.map((sessionId) => this.deleteOwnWatchConditionally(sessionId).catch(() => ({ deleted: false }))));
     // session_not_found (a vanished child) is NOT a refusal: the caller
     // re-counts and the next attempt uses the fresh live set.
     void waited;
@@ -703,8 +721,19 @@ export class PiOrchClient {
         headers: this.headers(),
       });
       const raw = response.body as Record<string, unknown>;
+      // 04-correction A2: validate the acknowledgement before reporting
+      // success — success:true, a watchId, and (when a precondition was sent)
+      // the exact generation the server acked (docs/INTERNAL-API.md:
+      // "require the exact generation before reporting confirmed cleanup").
+      const problems: string[] = [];
+      if (raw.success !== true) problems.push(`success is ${JSON.stringify(raw.success)}, expected true`);
+      if (typeof raw.watchId !== 'string' || raw.watchId.length === 0) problems.push('watchId missing from the acknowledgement');
+      if (options.expectedGeneration !== undefined && raw.generation !== options.expectedGeneration) {
+        problems.push(`generation is ${JSON.stringify(raw.generation)}, expected ${options.expectedGeneration}`);
+      }
+      if (problems.length > 0) throw new WatchDeleteAcknowledgementError(problems.join('; '), raw);
       return {
-        success: raw.success === true,
+        success: true,
         watchId: typeof raw.watchId === 'string' ? raw.watchId : undefined,
         generation: typeof raw.generation === 'string' ? raw.generation : undefined,
       };
@@ -717,6 +746,28 @@ export class PiOrchClient {
           typeof data.currentGeneration === 'string' ? data.currentGeneration : undefined,
           typeof data.watchId === 'string' ? data.watchId : undefined,
         );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 04-correction A3: the guarded delete every INTERNAL caller uses — the
+   * generation is read fresh and sent as the CAS precondition; a missing
+   * watch, a missing generation, or a replaced watch is skipped (disclosed),
+   * NEVER deleted unconditionally.
+   */
+  private async deleteOwnWatchConditionally(sessionId: string): Promise<{ deleted: boolean; note?: string }> {
+    const watch = await this.getWatch(sessionId).catch(() => null);
+    if (!watch) return { deleted: false, note: 'no watch registered (nothing to delete)' };
+    if (watch.generation === undefined) return { deleted: false, note: 'watch delete skipped: the read returned no generation (fail-closed, 04-correction A)' };
+    try {
+      const ack = await this.deleteWatch(sessionId, { expectedGeneration: watch.generation });
+      return { deleted: true, note: `watch ${ack.watchId ?? ''} deleted (generation ${ack.generation ?? 'unknown'})`.trim() };
+    } catch (error) {
+      const mismatch = error as { code?: string };
+      if (mismatch.code === 'WATCH_GENERATION_MISMATCH') {
+        return { deleted: false, note: 'watch delete skipped: the watch was replaced since it was read — the replacement is not ours to delete' };
       }
       throw error;
     }
@@ -950,8 +1001,10 @@ export class PiOrchClient {
     let released = false;
     if (options.watchId !== undefined) {
       try {
-        await this.deleteWatch(sessionId);
-        notes.push(`watch ${options.watchId} deleted`);
+        // 04-correction A3: conditional delete with the generation read here;
+        // a replaced watch is skipped and disclosed, never deleted blindly.
+        const outcome = await this.deleteOwnWatchConditionally(sessionId);
+        notes.push(outcome.note ?? (outcome.deleted ? `watch ${options.watchId} deleted` : 'watch delete skipped'));
       } catch (error) {
         notes.push(`watch delete failed: ${(error as Error).message}`);
       }

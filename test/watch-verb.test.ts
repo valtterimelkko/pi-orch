@@ -235,3 +235,148 @@ test('02-correction 2: CLI watch delete on mismatch exits 19 naming BOTH generat
   assert.match(result.stderr ?? '', /G2/);
   assert.equal(deleteCalls, 1, 'no retry, nothing else deleted');
 });
+
+// ─── 04-correction [major] A1: watch delete fails closed without a generation ──
+
+test('04-correction A1: a read without a generation refuses the delete — no DELETE sent, exit 19', async () => {
+  let deleteCalls = 0;
+  const result = await runCli(
+    ['watch', 's1', 'delete', '--json'],
+    fakeDeps(() => ({
+      getWatch: async () => ({ watchId: 'w-1', status: 'active', firingCount: 0 }), // no generation
+      deleteWatch: async () => {
+        deleteCalls += 1;
+        return { success: true, watchId: 'w-1' };
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 19, `stderr: ${result.stderr ?? ''}`);
+  assert.match(result.stderr ?? '', /generation/);
+  assert.equal(deleteCalls, 0, 'no unconditional DELETE may be sent');
+});
+
+test('04-correction A1: a missing watch refuses the blind delete — exit 19, no DELETE sent', async () => {
+  let deleteCalls = 0;
+  const result = await runCli(
+    ['watch', 's1', 'delete', '--json'],
+    fakeDeps(() => ({
+      getWatch: async () => null,
+      deleteWatch: async () => {
+        deleteCalls += 1;
+        return { success: true };
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 19);
+  assert.match(result.stderr ?? '', /no watch registered/);
+  assert.equal(deleteCalls, 0);
+});
+
+test('04-correction A1: --force-unconditional is the documented legacy escape (unconditional delete allowed)', async () => {
+  const bodies: Array<Record<string, unknown> | undefined> = [];
+  const result = await runCli(
+    ['watch', 's1', 'delete', '--force-unconditional', '--json'],
+    fakeDeps(() => ({
+      getWatch: async () => null,
+      deleteWatch: async (_sessionId: string, options?: Record<string, unknown>) => {
+        bodies.push(options);
+        return { success: true, watchId: 'w-1' };
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 0, `stderr: ${result.stderr ?? ''}`);
+  assert.deepEqual(bodies, [undefined], 'the escape path deletes without a precondition, and nothing else may');
+});
+
+// ─── 04-correction [major] A2: the delete acknowledgement is validated ──────
+
+test('04-correction A2: client.deleteWatch rejects a success:false acknowledgement', async () => {
+  const transport = {
+    request: async () => ok({ success: false, watchId: 'w-1', generation: 'G1' }),
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  await assert.rejects(
+    client.deleteWatch('s1', { expectedGeneration: 'G1' }),
+    (error: { code?: string; message?: string }) => error.code === 'WATCH_DELETE_ACK_FAILED' && /success/.test(error.message ?? ''),
+  );
+});
+
+test('04-correction A2: client.deleteWatch rejects a mismatched acknowledgement generation', async () => {
+  const transport = {
+    request: async () => ok({ success: true, watchId: 'w-1', generation: 'G9' }),
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  await assert.rejects(
+    client.deleteWatch('s1', { expectedGeneration: 'G1' }),
+    (error: { code?: string; message?: string }) => error.code === 'WATCH_DELETE_ACK_FAILED' && /G1/.test(error.message ?? '') && /G9/.test(error.message ?? ''),
+  );
+});
+
+test('04-correction A2: client.deleteWatch rejects an acknowledgement without a watchId', async () => {
+  const transport = {
+    request: async () => ok({ success: true, generation: 'G1' }),
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  await assert.rejects(client.deleteWatch('s1', { expectedGeneration: 'G1' }), /watchId/);
+});
+
+test('04-correction A2: CLI maps an acknowledgement failure to a non-zero exit, reporting nothing as deleted', async () => {
+  const result = await runCli(
+    ['watch', 's1', 'delete', '--json'],
+    fakeDeps(() => ({
+      getWatch: async () => ({ watchId: 'w-1', status: 'active', generation: 'G1', firingCount: 0 }),
+      deleteWatch: async () => {
+        const error = new Error('pi-orch: WATCH_DELETE_ACK_FAILED — the server answered, but the acknowledgement does not confirm this delete (success is false)') as Error & { code?: string };
+        error.code = 'WATCH_DELETE_ACK_FAILED';
+        throw error;
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 19);
+  assert.match(result.stderr ?? '', /WATCH_DELETE_ACK_FAILED/);
+  assert.doesNotMatch(result.stdout ?? '', /deleted/, 'nothing is reported as deleted');
+});
+
+// ─── 04-correction [major] A3: internal callers use conditional deletes ──────
+
+test('04-correction A3: cleanup deletes the watch with the generation it reads (request body asserted)', async () => {
+  const deletes: Array<{ path: string; body?: Record<string, unknown> }> = [];
+  const transport = {
+    request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
+      if (method === 'GET' && path.endsWith('/watch')) return ok({ watchId: 'w-1', status: 'active', generation: 'G-cleanup', firingCount: 0 });
+      if (method === 'DELETE' && path.endsWith('/watch')) {
+        deletes.push({ path, body: options.body });
+        return ok({ success: true, watchId: 'w-1', generation: 'G-cleanup' });
+      }
+      if (method === 'POST' && path.endsWith('/control')) return ok({ released: true });
+      if (method === 'DELETE' && path.endsWith(path)) return ok({}); // session delete
+      throw new Error(`unexpected ${method} ${path}`);
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, spawnLedgerPath: tempLedgerPath(), randomId: () => 'k1' });
+  const body = await client.cleanup('s1', { watchId: 'w-1', leaseId: 'l-1', ownerId: 'o' });
+  assert.deepEqual(deletes[0]?.body, { expectedGeneration: 'G-cleanup' }, 'the conditional generation guard rides on the internal delete');
+  assert.ok(body.notes.join(' ').includes('deleted'));
+});
+
+test('04-correction A3: cleanup on a replaced watch skips it (never deletes the replacement) and says so', async () => {
+  const deletes: Array<Record<string, unknown> | undefined> = [];
+  let sessionDeleted = false;
+  const transport = {
+    request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
+      if (method === 'GET' && path.endsWith('/watch')) return ok({ watchId: 'w-1', status: 'active', generation: 'G-read', firingCount: 0 });
+      if (method === 'DELETE' && path.endsWith('/watch')) {
+        deletes.push(options.body);
+        throw parseApiError(409, { error: 'mismatch', code: 'WATCH_GENERATION_MISMATCH', expectedGeneration: 'G-read', currentGeneration: 'G-other', watchId: 'w-1' });
+      }
+      if (method === 'POST' && path.endsWith('/control')) return ok({ released: true });
+      if (method === 'DELETE') { sessionDeleted = true; return ok({}); }
+      throw new Error(`unexpected ${method} ${path}`);
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, spawnLedgerPath: tempLedgerPath(), randomId: () => 'k1' });
+  const body = await client.cleanup('s1', { watchId: 'w-1' });
+  assert.deepEqual(deletes, [{ expectedGeneration: 'G-read' }], 'exactly one conditional attempt');
+  assert.equal(sessionDeleted, true, 'the session cleanup itself still proceeds');
+  assert.match(body.notes.join(' '), /replaced|skipped/i, 'the skipped replacement is disclosed in the notes');
+});

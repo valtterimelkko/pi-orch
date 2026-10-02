@@ -211,19 +211,22 @@ function fencedLogicalLines(markdown: string): string[] {
     buffer = '';
   }
   if (buffer) out.push(buffer);
-  return out.filter((line) => line.includes('pi-orch ') || line.includes('pi-orch\n'));
+  return out.filter((line) => line.includes('pi-orch ') || line.includes('pi-orch\n') || /\$\{?PO\}?/.test(line));
 }
 
-/** Extract every pi-orch command (verb + flags) from a logical line. */
-function piOrchCommands(line: string): Array<{ verb: string; flags: string[] }> {
+/** Extract every pi-orch command (verb + flags) from a logical line. $PO and ${PO} (the skills' alias for the pi-orch binary) are substituted first; ';' separates multiple commands on one line. */
+function piOrchCommands(rawLine: string): Array<{ verb: string; flags: string[] }> {
+  const line = rawLine.replace(/\$\{PO\}/g, 'pi-orch').replace(/\$PO\b/g, 'pi-orch');
   const commands: Array<{ verb: string; flags: string[] }> = [];
-  for (const match of line.matchAll(/pi-orch\s+([^;|&`]*?)(?=\s*(?:\)|`|$))/g)) {
-    const rest = (match[1] as string).replace(/^\$\(/, '').trim();
-    if (!rest) continue;
-    const words = rest.split(/\s+/);
-    const verb = words[0] as string;
-    const flags = [...rest.matchAll(/(?:^|\s)--([a-z][a-z0-9-]+)/g)].map((flag) => flag[1] as string);
-    commands.push({ verb, flags });
+  for (const segment of line.split(';')) {
+    for (const match of segment.matchAll(/pi-orch\s+([^;|&`]*?)(?=\s*(?:\)|`|$))/g)) {
+      const rest = (match[1] as string).replace(/^\$\(/, '').trim();
+      if (!rest) continue;
+      const words = rest.split(/\s+/);
+      const verb = words[0] as string;
+      const flags = [...rest.matchAll(/(?:^|\s)--([a-z][a-z0-9-]+)/g)].map((flag) => flag[1] as string);
+      commands.push({ verb, flags });
+    }
   }
   return commands;
 }
@@ -278,5 +281,36 @@ test('02-correction 6: canonical skills scan (read-only, report-only, skips when
   // complete.md, so a drifted skill line is still visible in CI output.
   if (offenders.length > 0) {
     console.error(`PI-ORCH SKILLS SCAN — command lines for the PARENT to fix (${offenders.length}):\n${offenders.join('\n')}`);
+  }
+});
+
+test('04-correction C: alias invocations ($PO, ${PO}) in the canonical skills parse with 0 unknown flags', () => {
+  const skillsRoot = '/root/.skills-global/skills-global';
+  const files = ['pi-web-ui-internal-api-orchestration/SKILL.md'];
+  const aliasCommands: Array<{ verb: string; flags: string[] }> = [];
+  let scanned = 0;
+  for (const rel of files) {
+    let md: string;
+    try { md = readFileSync(join(skillsRoot, rel), 'utf8'); } catch { continue; } // absent: CI portability
+    scanned += 1;
+    for (const line of fencedLogicalLines(md)) {
+      if (!/\$\{?PO\}?/.test(line)) continue;
+      // The universal $PO/${PO} substitution inside piOrchCommands maps the
+      // alias to pi-orch; each logical line may carry several commands (;).
+      for (const command of piOrchCommands(line)) {
+        aliasCommands.push(command);
+        const allowed = allowedFlagsFor(command.verb);
+        if (!allowed) { aliasCommands.push({ verb: `UNKNOWN-${command.verb}`, flags: [] }); continue; }
+        const bad = command.flags.filter((name) => !allowed.has(name));
+        if (bad.length > 0) aliasCommands.push({ verb: `OFFENDER-${command.verb}`, flags: bad });
+      }
+    }
+  }
+  // The parent's count: the eight current $PO examples must all parse.
+  const parsed = aliasCommands.filter((command) => !command.verb.startsWith('UNKNOWN-') && !command.verb.startsWith('OFFENDER-'));
+  console.error(`PI-ORCH SKILLS ALIAS SCAN: parsed ${parsed.length} alias command(s); offenders: ${aliasCommands.length - parsed.length}`);
+  if (scanned > 0) {
+    assert.ok(parsed.length >= 8, `expected the eight current $PO examples to parse, got ${parsed.length}`);
+    assert.equal(aliasCommands.length - parsed.length, 0, `alias lines with unknown verbs/flags: ${JSON.stringify(aliasCommands.filter((c) => c.verb.startsWith('UNKNOWN-') || c.verb.startsWith('OFFENDER-')))}`);
   }
 });

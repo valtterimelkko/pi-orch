@@ -31,6 +31,7 @@ interface FakeChild {
 interface RecordedCall {
   method: string;
   path: string;
+  options?: { body?: Record<string, unknown> };
 }
 
 function ok(body: unknown): TransportResponse {
@@ -87,7 +88,7 @@ function fakeTransport(options: {
   let watchCounter = 0;
   const transport = {
     request: async (method: string, path: string, options_: { body?: Record<string, unknown> } = {}): Promise<TransportResponse> => {
-      calls.push({ method, path });
+      calls.push({ method, path, options: options_ });
       if (method === 'POST' && path === '/api/v1/sessions') {
         const body = (options_.body ?? {}) as Record<string, unknown>;
         return ok({ sessionId: `new-${calls.length}`, ...body });
@@ -121,11 +122,14 @@ function fakeTransport(options: {
         return ok({ runId: `run-${calls.length}`, sessionId: 's', detached: true, status: 'accepted' });
       }
       if (method === 'GET' && path.endsWith('/watch')) {
-        return throwsNotFound();
+        // 04-correction A3: a registered watch carries a generation, and GET
+        // returns it — the guarded slot-wait cleanup needs the generation.
+        if (watchCounter === 0) return throwsNotFound();
+        return ok({ watchId: `w-${watchCounter}`, status: 'active', generation: `g-${watchCounter}` });
       }
       if (method === 'POST' && path.endsWith('/watch')) {
         watchCounter += 1;
-        return ok({ watchId: `w-${watchCounter}`, status: 'active' });
+        return ok({ watchId: `w-${watchCounter}`, status: 'active', generation: `g-${watchCounter}` });
       }
       if (method === 'GET' && path.startsWith('/api/v1/watches/wait')) {
         const result = options.longPoll ? await options.longPoll() : { fired: false };
@@ -356,6 +360,8 @@ test('wait-for-slot: leaves no leftover watch on the children it watched (the pa
   assert.equal(created(calls), 1);
   const watchDeletes = calls.filter((call) => call.method === 'DELETE' && call.path.endsWith('/watch'));
   assert.ok(watchDeletes.length >= 1, 'the slot-wait deleted the watch it created on the settled child');
+  // 04-correction A3: the internal cleanup deletes CONDITIONALLY.
+  assert.deepEqual(watchDeletes[0]?.options?.body, { expectedGeneration: 'g-1' }, 'the slot-wait sends the generation it registered');
 });
 
 test('wait-for-slot: never deletes a pre-existing watch; refuses when nothing is watchable', async () => {
@@ -561,7 +567,7 @@ test('correction01/1: a concurrent pair at cap 1 creates exactly one (count→cr
   const base = fakeTransport({ children });
   const transport = {
     request: async (method: string, path: string, options_: { body?: Record<string, unknown> } = {}): Promise<TransportResponse> => {
-      calls.push({ method, path });
+      calls.push({ method, path, options: options_ });
       if (method === 'POST' && path === '/api/v1/sessions') {
         const sessionId = `c-${created.length + 1}`;
         await gateA; // A's create POST holds the route lock while we hold the test

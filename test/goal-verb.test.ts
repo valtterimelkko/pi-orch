@@ -281,3 +281,67 @@ test('02-correction 3: CLI goal start accepts --no-completion-template', async (
   assert.equal(result.exitCode, 0, `stderr: ${result.stderr ?? ''}`);
   assert.equal(seen[0]?.completionTemplate, false);
 });
+
+// ─── 04-correction [major] B: goal flags without an objective must not silently
+// create a plain child ────────────────────────────────────────────────────────
+
+test('04-correction B: spawn with an empty --goal-objective and a budget fails locally (exit 2, no spawn)', async () => {
+  let spawnCalls = 0;
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/x', '--goal-objective', '', '--goal-budget-tokens', '1000000000000'],
+    fakeDeps(() => ({
+      spawn: async () => {
+        spawnCalls += 1;
+        return { sessionId: 's1', raw: {} };
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 2, 'the flags must not be silently dropped into a plain child');
+  assert.equal(spawnCalls, 0, 'nothing reaches the client');
+});
+
+test('04-correction B: spawn with a budget but NO objective fails locally (exit 2, no spawn)', async () => {
+  let spawnCalls = 0;
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/x', '--goal-budget-tokens', '60000000'],
+    fakeDeps(() => ({
+      spawn: async () => {
+        spawnCalls += 1;
+        return { sessionId: 's1', raw: {} };
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 2);
+  assert.match(result.stderr ?? '', /objective/);
+  assert.equal(spawnCalls, 0);
+});
+
+test('04-correction B: goal-verify or goal-max-turns alone also require an objective', async () => {
+  let spawnCalls = 0;
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/x', '--goal-verify', 'true'],
+    fakeDeps(() => ({
+      spawn: async () => {
+        spawnCalls += 1;
+        return { sessionId: 's1', raw: {} };
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 2);
+  assert.equal(spawnCalls, 0);
+});
+
+test('04-correction B: a real objective with goal flags still works (negative control)', async () => {
+  let spawnCalls = 0;
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/x', '--goal-objective', 'Do the thing', '--goal-budget-tokens', '60000000', '--json'],
+    fakeDeps(() => ({
+      spawn: async () => {
+        spawnCalls += 1;
+        return { sessionId: 's1', raw: {} };
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 0, `stderr: ${result.stderr ?? ''}`);
+  assert.equal(spawnCalls, 1, 'exactly one spawn (the factory itself may be constructed more than once)');
+});
