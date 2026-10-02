@@ -100,10 +100,13 @@ test('CLI: watch <sid> list reads the watch back and shows firings; delete remov
 
   let deleted = 0;
   const del = await runCli(
-    ['watch', 's1', 'delete'],
+    ['watch', 's1', 'delete', '--json'],
     fakeDeps(() => ({
-      deleteWatch: async () => {
+      getWatch: async () => ({ watchId: 'w-1', status: 'active', generation: 'G0', firingCount: 0 }),
+      deleteWatch: async (_sessionId: string, options?: Record<string, unknown>) => {
         deleted += 1;
+        assert.deepEqual(options, { expectedGeneration: 'G0' }, 'delete carries the observed generation (02-correction 2)');
+        return { success: true, watchId: 'w-1', generation: 'G0' };
       },
     }) as never),
   );
@@ -117,4 +120,117 @@ test('CLI: watch needs a subcommand (register|list|delete) and never blocks', as
   assert.match(result.stderr ?? '', /register|list|delete/);
   const bad = await runCli(['watch', 's1', 'await'], fakeDeps(() => ({}) as never));
   assert.equal(bad.exitCode, 2, 'the verb never waits — "await" is not a subcommand');
+});
+
+// ─── 02-correction [major] 2: generation-safe watch delete ───────────────────
+// Wire (docs/INTERNAL-API.md, contract 1.35.0): DELETE accepts body
+// {expectedGeneration}; a stale precondition returns 409 WATCH_GENERATION_MISMATCH
+// with {expectedGeneration, currentGeneration} and leaves the watch unchanged.
+// Luna: pi-orch's deleteWatch sent no body and could delete a REPLACED watch.
+
+import { ApiError } from '../src/parsers.ts';
+import { parseApiError } from '../src/parsers.ts';
+
+test('02-correction 2: register and getWatch surface the generation', async () => {
+  const transport = {
+    request: async () => ok({ watchId: 'w-9', status: 'active', generation: 'gen-A', firingCount: 0 }),
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const registered = await client.registerWatch('s1', { conditions: [{ id: 'd', type: 'event_type', eventType: 'agent_end', once: true }] });
+  assert.equal(registered.generation, 'gen-A');
+  const got = await client.getWatch('s1');
+  assert.equal(got?.generation, 'gen-A');
+});
+
+test('02-correction 2: parseApiError carries the 409 body so both generations can be named', () => {
+  const error = parseApiError(409, {
+    error: 'generation mismatch',
+    code: 'WATCH_GENERATION_MISMATCH',
+    expectedGeneration: 'G1',
+    currentGeneration: 'G2',
+    watchId: 'w-1',
+  });
+  assert.equal((error as ApiError & { data?: Record<string, unknown> }).data?.currentGeneration, 'G2');
+  assert.equal((error as ApiError & { data?: Record<string, unknown> }).data?.expectedGeneration, 'G1');
+});
+
+test('02-correction 2: replacement race — delete with the OBSERVED generation sends it and refuses on mismatch', async () => {
+  const deletes: Array<Record<string, unknown> | undefined> = [];
+  const transport = {
+    request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
+      if (method === 'GET' && path.endsWith('/watch')) return ok({ watchId: 'w-1', generation: 'G1', firingCount: 0 });
+      if (method === 'DELETE' && path.endsWith('/watch')) {
+        deletes.push(options.body);
+        throw parseApiError(409, {
+          error: 'generation mismatch',
+          code: 'WATCH_GENERATION_MISMATCH',
+          expectedGeneration: 'G1',
+          currentGeneration: 'G2',
+          watchId: 'w-1',
+        });
+      }
+      throw new Error(`unexpected ${method} ${path}`);
+    },
+  } as never;
+  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const watch = await client.getWatch('s1');
+  await assert.rejects(
+    client.deleteWatch('s1', { expectedGeneration: watch?.generation }),
+    (error: { expectedGeneration?: string; currentGeneration?: string }) => error.expectedGeneration === 'G1' && error.currentGeneration === 'G2',
+  );
+  assert.deepEqual(deletes, [{ expectedGeneration: 'G1' }], 'exactly one conditional delete; G2 is untouched');
+});
+
+test('02-correction 2: CLI watch delete without --generation reads the generation first and reports it', async () => {
+  const seen: Array<Record<string, unknown> | undefined> = [];
+  const result = await runCli(
+    ['watch', 's1', 'delete', '--json'],
+    fakeDeps(() => ({
+      getWatch: async () => ({ watchId: 'w-1', status: 'active', generation: 'G1', firingCount: 0 }),
+      deleteWatch: async (_sessionId: string, options?: Record<string, unknown>) => {
+        seen.push(options);
+        return { success: true, watchId: 'w-1', generation: 'G1' };
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 0, `stderr: ${result.stderr ?? ''}`);
+  assert.deepEqual(seen[0], { expectedGeneration: 'G1' }, 'the observed generation guards the delete');
+  assert.match(result.stdout ?? '', /"generation": "G1"/, 'confirmed cleanup names the exact generation');
+});
+
+test('02-correction 2: CLI watch delete --generation passes it through', async () => {
+  const seen: Array<Record<string, unknown> | undefined> = [];
+  const result = await runCli(
+    ['watch', 's1', 'delete', '--generation', 'G-explicit', '--json'],
+    fakeDeps(() => ({
+      deleteWatch: async (_sessionId: string, options?: Record<string, unknown>) => {
+        seen.push(options);
+        return { success: true, watchId: 'w-1', generation: 'G-explicit' };
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(seen[0], { expectedGeneration: 'G-explicit' });
+});
+
+test('02-correction 2: CLI watch delete on mismatch exits 19 naming BOTH generations and deletes nothing further', async () => {
+  let deleteCalls = 0;
+  const result = await runCli(
+    ['watch', 's1', 'delete', '--json'],
+    fakeDeps(() => ({
+      getWatch: async () => ({ watchId: 'w-1', status: 'active', generation: 'G1', firingCount: 0 }),
+      deleteWatch: async () => {
+        deleteCalls += 1;
+        const error = new Error('pi-orch: WATCH_GENERATION_MISMATCH: the watch was replaced since you read it') as Error & { expectedGeneration?: string; currentGeneration?: string; code?: string };
+        error.expectedGeneration = 'G1';
+        error.currentGeneration = 'G2';
+        error.code = 'WATCH_GENERATION_MISMATCH';
+        throw error;
+      },
+    }) as never),
+  );
+  assert.equal(result.exitCode, 19, 'watch conflict exit code');
+  assert.match(result.stderr ?? '', /G1/);
+  assert.match(result.stderr ?? '', /G2/);
+  assert.equal(deleteCalls, 1, 'no retry, nothing else deleted');
 });

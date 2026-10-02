@@ -12,6 +12,8 @@ import {
   questionSentinel,
   deadlineCondition,
   buildPreflightSpec,
+  validateGoalFields,
+  GoalFieldValidationError,
 } from './builders.ts';
 import type { WatchConditionSpec } from './parsers.ts';
 import { ApiError } from './parsers.ts';
@@ -21,10 +23,10 @@ import { defaultSocketPath, defaultTokenPath, loadSnapshot, liveContractVersion 
 import { readToken } from './transport.ts';
 
 export interface ClientLike {
-  goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number }): Promise<Record<string, unknown>>;
-  registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; raw: unknown }>;
-  getWatch(sessionId: string): Promise<{ watchId: string; status?: string; label?: string; firingCount?: number; allFired?: boolean; firings?: Array<Record<string, unknown>> } | null>;
-  deleteWatch(sessionId: string): Promise<void>;
+  goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number; completionTemplate?: boolean }): Promise<Record<string, unknown>>;
+  registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; generation?: string; raw: unknown }>;
+  getWatch(sessionId: string): Promise<{ watchId: string; status?: string; label?: string; generation?: string; firingCount?: number; allFired?: boolean; firings?: Array<Record<string, unknown>> } | null>;
+  deleteWatch(sessionId: string, options?: { expectedGeneration?: string }): Promise<{ success?: boolean; watchId?: string; generation?: string }>;
   spawn(input: Record<string, unknown>): Promise<{ sessionId: string; leaseId?: string; parentId?: string; resolvedModel?: string; raw?: unknown }>;
   prompt(sessionId: string, input: Record<string, unknown>): Promise<{ runId: string; sessionId: string; detached: boolean; duplicate: boolean; dispatchMode?: string }>;
   wait(options: { sessionId: string; runId?: string; conditions?: WatchConditionSpec[]; objective?: string; deadlineMs?: number; label?: string }): Promise<{ kind: string; [key: string]: unknown }>;
@@ -217,7 +219,7 @@ Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
     live children when the prompt would start a new turn on an idle child),
   --no-completion-template (both spawn and prompt: skip the C3b END-OF-TASK
   REPORT instruction, which rides by default on every dispatched message and
-  on a spawn --goal-objective)
+  on a create-time goal objective)
 
 Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end+paused matched),
   --deadline S (default 1800), --conditions a,b
@@ -254,13 +256,13 @@ const VERB_FLAGS: Record<string, Set<string>> = {
   models: new Set(['runtime', 'match']),
   spawn: new Set(['runtime', 'cwd', 'owner', 'ttl', 'label', 'model-selector', 'model-match', 'thinking', 'goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'wait-for-slot', 'agent-os-capture', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
   prompt: new Set(['message', 'mode', 'no-detach', 'idempotency-key', 'verbosity', 'require-active-turn', 'owner', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
-  wait: new Set(['deadline', 'objective', 'conditions', 'run-id', 'all', 'any', 'label']),
+  wait: new Set(['deadline', 'objective', 'conditions', 'run-id', 'all', 'any', 'label', 'slice']),
   result: new Set(['transcript']),
   verify: new Set(['run-id', 'since', 'rerun', 'rerun-timeout', 'cwd', 'repo']),
   cleanup: new Set(['lease', 'owner', 'watch']),
   status: new Set(['parent', 'owner']),
-  goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens']),
-  watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only']),
+  goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template']),
+  watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only', 'generation']),
 };
 
 /** The full allowed flag set for a verb (connection flags included), or undefined for an unknown verb. */
@@ -398,6 +400,12 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const goalObjective = flagString(args, 'goal-objective');
       const goalBudget = flagNumber(args, 'goal-budget-tokens');
       const preflight = preflightFrom(args);
+      // 02-correction 1: the shared goal-field validation as a usage error
+      // BEFORE the client factory — the Luna probe (1e12 budget) never
+      // reaches a request now.
+      if (goalObjective) {
+        validatedGoalFields({ objective: goalObjective, maxTurns: flagNumber(args, 'goal-max-turns'), verifyCommand: flagString(args, 'goal-verify'), budgetTokens: goalBudget });
+      }
       // G1: validate the flag (cheap usage error) BEFORE the client factory runs.
       const waitForSlotMs = args.flags.has('wait-for-slot') ? waitForSlotSeconds(args) : undefined;
       const body = await getClient().spawn({
@@ -462,16 +470,32 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const budget = flagNumber(args, 'goal-budget-tokens');
       const maxTurns = flagNumber(args, 'goal-max-turns');
       const verifyCommand = flagString(args, 'goal-verify');
+      // 02-correction 1: same validation, same usage-class failure, before
+      // anything runs.
+      validatedGoalFields({ objective, maxTurns, verifyCommand, budgetTokens: budget });
+      const completionTemplate = args.flags.has('no-completion-template') ? false : undefined;
       const body = await getClient().goalStart(sessionId, {
         objective,
         ...(maxTurns !== undefined ? { maxTurns } : {}),
         ...(verifyCommand !== undefined ? { verifyCommand } : {}),
         ...(budget !== undefined ? { budgetTokens: budget } : {}),
+        ...(completionTemplate !== undefined ? { completionTemplate } : {}),
       });
       const rendered = output(json, body, (value) => {
         const goal = value as { status?: string; objective?: string };
         return `goal ${goal.status ?? 'unknown'}${goal.objective ? ` — ${goal.objective.slice(0, 80)}` : ''}`;
       });
+      // 02-correction 3: a goal child armed through the verb is the same
+      // receipt-less class — a template that could not be delivered is a real
+      // failure (exit 22), exactly like on spawn.
+      const templateError = ((body as { raw?: { __templateFollowUpError?: unknown } }).raw)?.__templateFollowUpError;
+      if (templateError !== undefined) {
+        return {
+          ...rendered,
+          exitCode: 22,
+          stderr: `pi-orch: TEMPLATE_NOT_DELIVERED — the completion template could not be delivered to ${(body as { sessionId?: string }).sessionId ?? sessionId}: ${String(templateError)}. The child holds only the pointer objective, not the full report instructions; re-send the template with 'prompt <sessionId> --message <instructions>' or re-dispatch.`,
+        };
+      }
       return budget === undefined ? { ...rendered, stderr: DEFAULT_BUDGET_NOTE } : rendered;
     }
     case 'watch': {
@@ -509,8 +533,32 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         });
       }
       if (sub === 'delete') {
-        await getClient().deleteWatch(sessionId);
-        return output(json, { deleted: true }, () => 'watch deleted');
+        // 02-correction 2: generation-safe delete. An explicit --generation is
+        // used as-is; otherwise a FRESH read supplies the observed generation,
+        // and the delete carries it as the server's CAS precondition. A
+        // mismatch (409) names both generations and deletes nothing.
+        let expectedGeneration = flagString(args, 'generation');
+        if (expectedGeneration === undefined) {
+          const watch = await getClient().getWatch(sessionId);
+          if (!watch) return output(json, { deleted: false, note: 'no watch registered' }, () => 'no watch registered');
+          expectedGeneration = watch.generation;
+        }
+        try {
+          const body = await getClient().deleteWatch(sessionId, expectedGeneration !== undefined ? { expectedGeneration } : undefined);
+          return output(json, body, (value) => {
+            const deleted = value as { generation?: string };
+            return `watch deleted${deleted.generation ? ` (generation ${deleted.generation})` : ''}`;
+          });
+        } catch (error) {
+          const mismatch = error as { code?: string; expectedGeneration?: string; currentGeneration?: string };
+          if (mismatch.code === 'WATCH_GENERATION_MISMATCH') {
+            return {
+              exitCode: 19,
+              stderr: `pi-orch: WATCH_GENERATION_MISMATCH — deleted nothing; the watch was replaced since it was read (expected ${mismatch.expectedGeneration ?? 'unknown'}, current ${mismatch.currentGeneration ?? 'unknown'})`,
+            };
+          }
+          throw error;
+        }
       }
       throw new UsageError(`unknown watch subcommand '${sub}' (register|list|delete — the verb never waits)`);
     }
@@ -547,6 +595,11 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const deadlineSeconds = flagNumber(args, 'deadline') ?? 1800;
       const objective = flagString(args, 'objective');
       const conditionsFlag = flagString(args, 'conditions');
+      // 02-correction 5: --slice never did anything; accepted as a deprecated
+      // no-op so existing callers do not break silently.
+      const sliceNote = args.flags.has('slice')
+        ? 'pi-orch: note — --slice is a deprecated no-op (it never had any effect); it will be removed in a future release'
+        : undefined;
       if (args.flags.has('all') || args.flags.has('any')) {
         const mode = args.flags.has('all') ? 'all' as const : 'any' as const;
         if (args.positional.length === 0) throw new UsageError(`wait --${mode} needs at least one <sessionId>[@<runId>]`);
@@ -558,7 +611,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         const stdout = json ? `${JSON.stringify(body, null, 2)}` : body.children
           .map((child) => `${child.sessionId}: ${child.outcome?.kind ?? 'no outcome'}`)
           .join('\n');
-        return { exitCode: body.exitCode, stdout };
+        return { exitCode: body.exitCode, stdout, ...(sliceNote ? { stderr: sliceNote } : {}) };
       }
       const sessionId = args.positional[0];
       if (!sessionId) throw new UsageError('wait needs <sessionId>');
@@ -576,7 +629,10 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       });
       const exitCode = exitCodeFor({ kind: outcome.kind });
       const stdout = json ? `${JSON.stringify(outcome, null, 2)}` : `wait: ${outcome.kind}${outcome.note ? ` — ${outcome.note as string}` : ''}`;
-      return { exitCode, stdout, ...(exitCode === 0 ? {} : { stderr: stdout }) };
+      const waitStderr = exitCode === 0
+        ? sliceNote
+        : [stdout, sliceNote].filter(Boolean).join('\n');
+      return { exitCode, stdout, ...(waitStderr !== undefined ? { stderr: waitStderr } : {}) };
     }
     case 'result': {
       const runId = args.positional[0];
@@ -730,6 +786,16 @@ function output<T>(json: boolean, body: T, human: (value: T) => string): CliResu
 
 /** J2 P1/P2: printed on stderr (never an error) when a goal is armed without an explicit budget. */
 const DEFAULT_BUDGET_NOTE = 'pi-orch: note — no --goal-budget-tokens given; the server default budget is 5,000,000 tokens, which pauses long goals mid-run';
+
+/** 02-correction 1: validate the CLI-assembled goal fields as a USAGE error (exit 2) before any request. */
+function validatedGoalFields(goal: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number }): void {
+  try {
+    validateGoalFields(goal);
+  } catch (error) {
+    if (error instanceof GoalFieldValidationError) throw new UsageError(error.message.replace(/^pi-orch: /, ''));
+    throw error;
+  }
+}
 
 // ─── process entry ───────────────────────────────────────────────────────────
 
