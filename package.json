@@ -27,7 +27,7 @@
     "pi-orch": "bin/pi-orch"
   },
   "scripts": {
-    "test": "node --test 'test/*.test.ts'",
+    "test": "PI_ORCH_SPAWN_LEDGER=\"$(mktemp -d)/spawn-ledger.json\" node --test 'test/*.test.ts'",
     "typecheck": "node scripts/typecheck.mjs"
   },
   "devDependencies": {

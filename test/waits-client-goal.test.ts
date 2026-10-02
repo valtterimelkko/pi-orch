@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { PiOrchClient } from '../src/client.ts';
 import { runCli, type CliDeps } from '../src/cli.ts';
 import type { TransportResponse } from '../src/transport.ts';
+import { tempLedgerPath } from './isolated-ledger.ts';
 
 /**
  * C3b correction 01 item 1: goal auto-detect is bypassed by early defaults.
@@ -39,7 +40,7 @@ test('client.wait on a goal child (no objective/conditions): watches goal_end/pa
       throw new Error(`unexpected ${method} ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, waitSliceMs: 50, waitDeadlineMs: 5_000 });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, waitSliceMs: 50, waitDeadlineMs: 5_000 });
   const outcome = await client.wait({ sessionId: 's1' });
   assert.equal(outcome.kind, 'goal_achieved', JSON.stringify(outcome));
   assert.ok((outcome as { note?: string }).note?.includes('auto-detected'), `note: ${(outcome as { note?: string }).note}`);

@@ -4,6 +4,7 @@ import { PiOrchClient } from '../src/client.ts';
 import { defaultConditions } from '../src/builders.ts';
 import { ApiError } from '../src/parsers.ts';
 import type { TransportResponse } from '../src/transport.ts';
+import { tempLedgerPath } from './isolated-ledger.ts';
 
 test('defaultConditions: goal children get goal_end+paused+deadline and NO per-turn agent_end', () => {
   // goals.md: a per-turn agent_end on a goal-armed child fires at every turn
@@ -53,7 +54,7 @@ test('prompt with followUpOnBusy retries once in follow_up mode after 409 SESSIO
       return ok({ runId: 'r1', sessionId: 's1', detached: true, status: 'accepted', dispatchMode: promptCalls > 1 ? 'follow_up' : 'prompt' });
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   const result = await client.prompt('s1', { message: 'go', followUpOnBusy: true });
   assert.equal(result.runId, 'r1');
   assert.equal(result.dispatchMode, 'follow_up');
@@ -72,7 +73,7 @@ test('without followUpOnBusy the 409 propagates to the caller', async () => {
       throw new ApiError(409, 'SESSION_BUSY', 'Session is currently busy', { retryAfterSeconds: 2 });
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   await assert.rejects(
     client.prompt('s1', { message: 'go' }),
     (error: { code?: string }) => error.code === 'SESSION_BUSY',
@@ -87,7 +88,7 @@ test('followUpOnBusy does not mask other 409 codes', async () => {
       throw new ApiError(409, 'SESSION_OWNED_BY_OTHER_RUNTIME', 'owned elsewhere');
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   await assert.rejects(
     client.prompt('s1', { message: 'go', followUpOnBusy: true }),
     (error: { code?: string }) => error.code === 'SESSION_OWNED_BY_OTHER_RUNTIME',

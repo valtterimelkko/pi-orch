@@ -4,6 +4,7 @@ import { PiOrchClient } from '../src/client.ts';
 import { classifyRunOutput } from '../src/parsers.ts';
 import { resolveCompletion, type CompletionBlock, type ReceiptWithCompletion, type SessionDetailWithCompletion } from '../src/completion.ts';
 import type { TransportResponse } from '../src/transport.ts';
+import { tempLedgerPath } from './isolated-ledger.ts';
 
 /**
  * C3b item 2: `result` returns the parsed completion — the receipt's
@@ -87,7 +88,7 @@ test('result: returns the receipt completion and does NOT read the session', asy
       throw new Error(`unexpected call ${method} ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport });
   const result = await client.result('r1');
   assert.equal(result.completion, BLOCK);
   assert.equal(result.completionSource, 'receipt');
@@ -114,7 +115,7 @@ test('result: falls back to the session surface for a receipt-less goal child', 
       throw new Error(`unexpected call ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport });
   const result = await client.result('r1');
   assert.equal(result.completion, BLOCK);
   assert.equal(result.completionSource, 'session_surface');
@@ -167,7 +168,7 @@ test('I1: result returns outputClass command for the arm run (and does not claim
       throw new Error(`unexpected call ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport });
   const result = await client.result('r-arm');
   assert.equal(result.outputClass, 'command');
   assert.equal(result.outputClassBasis, 'documented_handler_return');
@@ -181,7 +182,7 @@ test('I1: result returns outputClass final_text for a normal receipt', async () 
       throw new Error(`unexpected call ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport });
   const result = await client.result('r1');
   assert.equal(result.outputClass, 'final_text');
 });
@@ -194,7 +195,7 @@ test('result: no completion anywhere → completion stays undefined, result stil
       throw new Error(`unexpected call ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport });
   const result = await client.result('r1');
   assert.equal(result.completion, undefined);
   assert.equal(result.completionError, undefined);

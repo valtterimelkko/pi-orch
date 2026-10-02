@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { runCli, type CliDeps } from '../src/cli.ts';
 import { PiOrchClient } from '../src/client.ts';
 import type { TransportResponse } from '../src/transport.ts';
+import { tempLedgerPath } from './isolated-ledger.ts';
 
 /**
  * J2 P4: the `watch` verb — register/list/delete, NEVER waits. The H-b parent
@@ -32,7 +33,7 @@ test('client.getWatch surfaces firings so a parent can read the wake back', asyn
       conditions: [{ id: 'done', spec: { type: 'event_type', eventType: 'agent_end' } }],
     }),
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   const watch = await client.getWatch('s1');
   assert.equal(watch?.firingCount, 2);
   assert.equal(watch?.allFired, true);
@@ -135,7 +136,7 @@ test('02-correction 2: register and getWatch surface the generation', async () =
   const transport = {
     request: async () => ok({ watchId: 'w-9', status: 'active', generation: 'gen-A', firingCount: 0 }),
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   const registered = await client.registerWatch('s1', { conditions: [{ id: 'd', type: 'event_type', eventType: 'agent_end', once: true }] });
   assert.equal(registered.generation, 'gen-A');
   const got = await client.getWatch('s1');
@@ -172,7 +173,7 @@ test('02-correction 2: replacement race — delete with the OBSERVED generation 
       throw new Error(`unexpected ${method} ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   const watch = await client.getWatch('s1');
   await assert.rejects(
     client.deleteWatch('s1', { expectedGeneration: watch?.generation }),

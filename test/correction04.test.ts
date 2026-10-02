@@ -9,6 +9,7 @@ import { PiOrchClient } from '../src/client.ts';
 import { Transport, type TransportResponse } from '../src/transport.ts';
 import { runCli } from '../src/cli.ts';
 import { exitCodeFor } from '../src/exit-codes.ts';
+import { tempLedgerPath } from './isolated-ledger.ts';
 
 /**
  * Correction 04 RED tests (Luna majors + parent pre-review). Each test
@@ -215,7 +216,7 @@ test('correction04/3: a create whose response is lost is NEVER retried — one P
       return { status: 200, headers: {}, body: {}, raw: '' } as TransportResponse;
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k' });
   await assert.rejects(
     client.spawn({ runtime: 'pi', cwd: '/tmp/x', retention: { mode: 'durable', ownerId: 'o' } }),
     (error: { code?: string }) => error.code === 'CREATE_UNKNOWN',
@@ -231,7 +232,7 @@ test('correction04/3: prompt dispatch carries the idempotent marker (transport o
       return { status: 200, headers: {}, body: { runId: 'r9', sessionId: 's1', detached: true, status: 'accepted' }, raw: '' } as TransportResponse;
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k' });
   const result = await client.prompt('s1', { message: 'go' });
   assert.equal(result.runId, 'r9');
   // G1: the prompt-side route gate's detail read is not idempotent-marked;
@@ -302,7 +303,7 @@ test('correction04/8: a delay the budget cannot cover returns the refusal with i
 // ─── Item 6: status shape on both paths ──────────────────────────────────────
 
 test('correction04/6: status --parent enriches children with busy, goal status and last run', async () => {
-  const client = new PiOrchClient({ transportInstance: fakeStatusTransport() as never, randomId: () => 'k' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: fakeStatusTransport() as never, randomId: () => 'k' });
   const status = await client.status({ parent: 'p1' });
   const child = status.children[0] as Record<string, unknown>;
   assert.equal(child.busy, false);
@@ -312,7 +313,7 @@ test('correction04/6: status --parent enriches children with busy, goal status a
 });
 
 test('correction04/6: direct status <id> derives busy from session detail', async () => {
-  const client = new PiOrchClient({ transportInstance: fakeStatusTransport() as never, randomId: () => 'k' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: fakeStatusTransport() as never, randomId: () => 'k' });
   const status = await client.status({ sessionId: 'c1' });
   const child = status.children[0] as Record<string, unknown>;
   assert.equal(child.busy, true, 'busy comes from the session detail');

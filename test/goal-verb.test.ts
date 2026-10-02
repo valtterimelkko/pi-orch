@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { runCli, type CliDeps } from '../src/cli.ts';
 import { PiOrchClient } from '../src/client.ts';
 import type { TransportResponse } from '../src/transport.ts';
+import { tempLedgerPath } from './isolated-ledger.ts';
 
 /**
  * J2 P2: the `goal` verb — the H-b parent pattern arms the goal AFTER create
@@ -35,7 +36,7 @@ test('client.goalStart POSTs the goal-control start body with the budget', async
       return ok({ sessionId: 's1', runtime: 'pi', action: 'start', accepted: true, applied: true, receipt: { runId: 'r1' }, goal: { status: 'running', objective: 'O', budget: { tokens: 60_000_000 } } });
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   const body = await client.goalStart('s1', {
     objective: 'Do the bounded thing',
     maxTurns: 40,
@@ -69,7 +70,7 @@ test('client.goalStart omits unset optionals (server schemas are strict)', async
       return ok({ sessionId: 's1', action: 'start', accepted: true, applied: true, receipt: { runId: 'arm-1' }, goal: { status: 'running' } });
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
   await client.goalStart('s1', { objective: 'O', completionTemplate: false });
   const call = calls[0];
   assert.ok(call, 'exactly one goal-control call');
@@ -185,7 +186,7 @@ test('02-correction 1: client.goalStart rejects an out-of-range budget before an
       throw new Error('request must never be made');
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   await assert.rejects(
     client.goalStart('s1', { objective: 'O', budgetTokens: 1_000_000_000_000 }),
     /budget/,
@@ -227,7 +228,7 @@ test('02-correction 3: goal start templates the objective and delivers the follo
       throw new Error(`unexpected ${method} ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
   const body = await client.goalStart('s1', { objective: 'Do the bounded thing' });
   const goalCall = calls.find((call) => call.path?.endsWith('/goal'));
   assert.ok(goalCall, 'goal control was called');
@@ -246,7 +247,7 @@ test('02-correction 3: goal start with completionTemplate false stays raw (no fo
       throw new Error(`unexpected ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
   const body = await client.goalStart('s1', { objective: 'Raw objective', completionTemplate: false });
   assert.equal(calls.filter((call) => call.path?.endsWith('/prompt')).length, 0, 'no follow-up without the template');
   const goalCall = calls.find((call) => call.path?.endsWith('/goal'));
