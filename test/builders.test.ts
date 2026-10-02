@@ -224,3 +224,34 @@ test('I1: callerObjectiveConditions without an objective is the plain agent_end 
   assert.equal(conditions.filter((condition) => condition.type === 'deadline').length, 1);
   assert.equal(conditions.some((condition) => condition.eventType === 'goal_end'), false);
 });
+
+// ─── J2 P1: goal budgetTokens ────────────────────────────────────────────────
+// The I1–I4 lesson and hb5 (DeepSeek needed ~40M): the 5M default budget
+// pauses long goals mid-run. Phase A live receipt: --goal-budget-tokens was
+// silently dropped (exit 0, projection showed budget.tokens 5,000,000). The
+// builder must carry the caller's budget and validate it loudly.
+
+test('J2 P1: goal budgetTokens reaches the create-goal body (60M zai lanes)', () => {
+  const body = buildCreateBody({
+    runtime: 'pi',
+    cwd: '/tmp/work/child-1',
+    goal: { objective: 'Ship the fix', maxTurns: 40, budgetTokens: 60_000_000 },
+  });
+  const goal = body.goal as { budgetTokens?: number };
+  assert.equal(goal.budgetTokens, 60_000_000);
+  const problems = new ZodSpec(snapshot.zodSchemas.goalSpec!).check(body.goal);
+  assert.deepEqual(problems, [], 'the budgeted goal body still conforms to the server goalSpec');
+});
+
+test('J2 P1: goal budgetTokens validation — integer, positive, typo-proof ceiling', () => {
+  assert.throws(() => buildCreateBody({ runtime: 'pi', cwd: '/tmp/x', goal: { objective: 'o', budgetTokens: 0 } }));
+  assert.throws(() => buildCreateBody({ runtime: 'pi', cwd: '/tmp/x', goal: { objective: 'o', budgetTokens: -5 } }));
+  assert.throws(() => buildCreateBody({ runtime: 'pi', cwd: '/tmp/x', goal: { objective: 'o', budgetTokens: 1.5 } }));
+  assert.throws(() => buildCreateBody({ runtime: 'pi', cwd: '/tmp/x', goal: { objective: 'o', budgetTokens: 1_000_000_000_000 } }), /ceiling/);
+});
+
+test('J2 P1: without budgetTokens the key stays absent (server default applies untouched)', () => {
+  const body = buildCreateBody({ runtime: 'pi', cwd: '/tmp/x', goal: { objective: 'o' } });
+  const goal = body.goal as Record<string, unknown>;
+  assert.equal('budgetTokens' in goal, false);
+});

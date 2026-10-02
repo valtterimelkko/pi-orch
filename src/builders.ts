@@ -23,7 +23,7 @@ export interface CreateInput {
   modelSelector?: string;
   thinkingLevel?: ThinkingLevel;
   retention?: { mode: 'durable' | 'resident'; ttlSeconds?: number; ownerId: string; label?: string };
-  goal?: { objective: string; maxTurns?: number; verifyCommand?: string };
+  goal?: { objective: string; maxTurns?: number; verifyCommand?: string; /** J2 P1: token budget for the goal engine (server default 5,000,000 pauses long goals). */ budgetTokens?: number };
   preflight?: { paths?: string[]; tools?: string[] };
   parentSessionId?: string;
   agentOsCapture?: 'enabled' | 'disabled';
@@ -62,6 +62,15 @@ export function buildCreateBody(input: CreateInput): Record<string, unknown> {
     if (input.goal.maxTurns !== undefined && (!Number.isInteger(input.goal.maxTurns) || input.goal.maxTurns < 1 || input.goal.maxTurns > 100)) {
       throw new Error('pi-orch: goal.maxTurns must be an integer in 1..100');
     }
+    // J2 P1: the I1–I4/hb5 lesson — the 5M default budget pauses long goals
+    // mid-run. Validate loudly here (integer, positive, typo-proof ceiling);
+    // the server takes any positive integer, so this is client-side defence.
+    if (input.goal.budgetTokens !== undefined) {
+      const { budgetTokens } = input.goal;
+      if (!Number.isInteger(budgetTokens) || budgetTokens < 1 || budgetTokens > 1_000_000_000) {
+        throw new Error(`pi-orch: goal.budgetTokens must be an integer in 1..1000000000 (ceiling is typo defence; the server default is 5000000)`);
+      }
+    }
     // C3b: goal children are the receipt-less class — the completion template
     // must reach them, but the server caps the objective at 4000 chars and
     // requires it SINGLE-LINE, so the objective carries a flattened pointer
@@ -78,7 +87,14 @@ export function buildCreateBody(input: CreateInput): Record<string, unknown> {
     if (templated.includes('\n')) {
       throw new Error('pi-orch: goal.objective must be a single line (server rule)');
     }
-    body.goal = { ...input.goal, objective: templated };
+    // J2 P1: explicit fields, not a spread — the server schema is .strict(), so
+    // an unexpected caller field must never ride into the request body.
+    body.goal = {
+      objective: templated,
+      ...(input.goal.maxTurns !== undefined ? { maxTurns: input.goal.maxTurns } : {}),
+      ...(input.goal.verifyCommand !== undefined ? { verifyCommand: input.goal.verifyCommand } : {}),
+      ...(input.goal.budgetTokens !== undefined ? { budgetTokens: input.goal.budgetTokens } : {}),
+    };
   }
   if (input.preflight) {
     body.preflight = buildPreflightSpec(input.preflight);
