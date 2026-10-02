@@ -589,7 +589,17 @@ export class PiOrchClient {
     if (input.verifyCommand !== undefined) body.verifyCommand = input.verifyCommand;
     if (input.budgetTokens !== undefined) body.budgetTokens = input.budgetTokens;
     const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { body, headers: this.headers() });
-    return response.body as Record<string, unknown>;
+    const raw = response.body as Record<string, unknown>;
+    // The wire shape nests the projection and the arm receipt; surface the
+    // fields a parent actually reads (accepted/applied, runId, goal status)
+    // at the top level and keep the full projection under `goal`.
+    const receipt = raw.receipt as { runId?: string } | undefined;
+    const goal = raw.goal as Record<string, unknown> | undefined;
+    return {
+      ...raw,
+      ...(receipt?.runId ? { runId: receipt.runId } : {}),
+      ...(goal && typeof goal === 'object' ? { status: goal.status, objective: goal.objective, goal } : {}),
+    };
   }
 
   async registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; raw: unknown }> {

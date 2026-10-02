@@ -32,7 +32,7 @@ test('client.goalStart POSTs the goal-control start body with the budget', async
   const transport = {
     request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
       calls.push({ method, path, body: options.body ?? {} });
-      return ok({ sessionId: 's1', runtime: 'pi', status: 'running', objective: 'O' });
+      return ok({ sessionId: 's1', runtime: 'pi', action: 'start', accepted: true, applied: true, receipt: { runId: 'r1', dispatchMode: 'prompt' }, goal: { status: 'running', objective: 'O', budget: { tokens: 60_000_000 } } });
     },
   } as never;
   const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
@@ -54,7 +54,10 @@ test('client.goalStart POSTs the goal-control start body with the budget', async
     verifyCommand: 'tail -n1 done.md | grep -qx FROZEN',
     budgetTokens: 60_000_000,
   });
-  assert.equal((body as { status?: string }).status, 'running');
+  assert.equal((body as { status?: string }).status, 'running', 'the goal projection status is surfaced at the top level');
+  assert.equal((body as { accepted?: boolean }).accepted, true);
+  assert.equal((body as { runId?: string }).runId, 'r1', 'the arm receipt runId is surfaced for wait/result');
+  assert.equal((body as { goal?: { budget?: { tokens?: number } } }).goal?.budget?.tokens, 60_000_000, 'the full projection stays available under goal');
 });
 
 test('client.goalStart omits unset optionals (server schemas are strict)', async () => {
@@ -70,6 +73,15 @@ test('client.goalStart omits unset optionals (server schemas are strict)', async
   const call = calls[0];
   assert.ok(call, 'exactly one goal-control call');
   assert.deepEqual(call.body, { action: 'start', objective: 'O' });
+});
+
+test('CLI: goal start human output names the accepted action and arm run', async () => {
+  const result = await runCli(
+    ['goal', 's1', 'start', '--goal-objective', 'O', '--json'],
+    fakeDeps(() => ({ goalStart: async () => ({ sessionId: 's1', accepted: true, applied: true, runId: 'r-9', status: 'running' }) }) as never),
+  );
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout ?? '', /"accepted": true/);
 });
 
 test('CLI: goal <sid> start arms the goal through the client and exits 0', async () => {
