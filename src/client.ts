@@ -576,6 +576,22 @@ export class PiOrchClient {
     throw new RouteLimitError(route as string, limit, live);
   }
 
+  /**
+   * J2 P2: arm a goal on an ALREADY-CREATED session — the H-b parent
+   * pattern's create-then-goal order (POST /sessions/:id/goal, action start).
+   * The Phase A replay had no way to do this from pi-orch (`pi-orch goal` was
+   * an unknown verb). Start-only: pause/resume/clear stay interactive.
+   */
+  async goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number }): Promise<Record<string, unknown>> {
+    if (!input.objective) throw new Error('pi-orch: goal start needs an objective');
+    const body: Record<string, unknown> = { action: 'start', objective: input.objective };
+    if (input.maxTurns !== undefined) body.maxTurns = input.maxTurns;
+    if (input.verifyCommand !== undefined) body.verifyCommand = input.verifyCommand;
+    if (input.budgetTokens !== undefined) body.budgetTokens = input.budgetTokens;
+    const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { body, headers: this.headers() });
+    return response.body as Record<string, unknown>;
+  }
+
   async registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; raw: unknown }> {
     const body = buildWatchBody(input);
     const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, {
@@ -586,7 +602,7 @@ export class PiOrchClient {
     return { watchId: String(raw.watchId), status: typeof raw.status === 'string' ? raw.status : undefined, raw };
   }
 
-  async getWatch(sessionId: string): Promise<{ watchId: string; status?: string; conditions?: Array<{ id?: string; spec?: Record<string, unknown> }>; label?: string } | null> {
+  async getWatch(sessionId: string): Promise<{ watchId: string; status?: string; conditions?: Array<{ id?: string; spec?: Record<string, unknown> }>; label?: string; firingCount?: number; allFired?: boolean; firings?: Array<Record<string, unknown>> } | null> {
     try {
       const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, {
         headers: this.headers(),
@@ -596,6 +612,11 @@ export class PiOrchClient {
         watchId: String(raw.watchId),
         status: typeof raw.status === 'string' ? raw.status : undefined,
         label: typeof raw.label === 'string' ? raw.label : undefined,
+        // J2 P4: the wake surface — a bare-CLI parent reads the firing back
+        // with `watch list` instead of hand-writing curl against the socket.
+        firingCount: typeof raw.firingCount === 'number' ? raw.firingCount : undefined,
+        allFired: raw.allFired === true,
+        firings: Array.isArray(raw.firings) ? (raw.firings as Array<Record<string, unknown>>) : undefined,
         conditions: Array.isArray(raw.conditions)
           ? (raw.conditions as Array<Record<string, unknown>>).map((condition) => ({
               id: typeof condition.id === 'string' ? condition.id : undefined,
@@ -862,8 +883,11 @@ export class PiOrchClient {
     return { released, deleted: true, notes };
   }
 
-  async status(target: { parent?: string; sessionId?: string }): Promise<{
+  async status(target: { parent?: string; sessionId?: string; owner?: string }): Promise<{
     parent?: string;
+    owner?: string;
+    pruned?: number;
+    note?: string;
     children: Array<{
       sessionId: string;
       runtime?: string;
@@ -877,7 +901,29 @@ export class PiOrchClient {
     if (target.sessionId) {
       return { children: [await this.childStatus(target.sessionId)] };
     }
-    if (!target.parent) throw new Error('pi-orch: status needs --parent <id> or a sessionId');
+    // J2 P5: the external-parent lineage. A Claude Code parent is not a Pi
+    // Web UI session, so ?parent= cannot find its children — the only record
+    // is the retention ownerId the spawn carried, which the local spawn
+    // ledger noted at spawn time (G1). Per-host, best-effort: children
+    // spawned by other clients (hand-written curl) are invisible here.
+    if (target.owner) {
+      const list = await this.transport.request('GET', '/api/v1/sessions', { headers: this.headers() });
+      const sessions = (list.body as { sessions?: Array<{ sessionId: string }> }).sessions ?? [];
+      const known = new Set(sessions.map((session) => session.sessionId));
+      const { sessionIds, pruned, note } = this.spawnLedger.entriesFor(target.owner, known);
+      const children: Awaited<ReturnType<PiOrchClient['childStatus']>>[] = [];
+      const queue = [...sessionIds];
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const sessionId = queue.shift();
+          if (!sessionId) return;
+          children.push(await this.childStatus(sessionId));
+        }
+      };
+      await Promise.all([worker(), worker(), worker(), worker()]);
+      return { owner: target.owner, pruned, ...(note ? { note } : {}), children };
+    }
+    if (!target.parent) throw new Error('pi-orch: status needs --parent <id>, --owner <id> or a sessionId');
     const query = new URLSearchParams({ parent: target.parent });
     const response = await this.transport.request('GET', `/api/v1/sessions?${query.toString()}`, { headers: this.headers() });
     const body = response.body as { sessions?: Array<{ sessionId: string; runtime?: string; busy?: boolean; status?: string }> };
