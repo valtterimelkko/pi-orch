@@ -253,8 +253,10 @@ export class ApiError extends Error {
   readonly details?: string;
   readonly failures?: unknown;
   readonly retryAfterSeconds?: number;
+  /** 02-correction 2: the parsed error body, so route-specific fields (e.g. the watch 409's both generations) stay reachable. */
+  readonly data?: Record<string, unknown>;
 
-  constructor(status: number, code: string, message: string, options: { details?: string; failures?: unknown; retryAfterSeconds?: number } = {}) {
+  constructor(status: number, code: string, message: string, options: { details?: string; failures?: unknown; retryAfterSeconds?: number; data?: Record<string, unknown> } = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
@@ -262,6 +264,7 @@ export class ApiError extends Error {
     this.details = options.details;
     this.failures = options.failures;
     this.retryAfterSeconds = options.retryAfterSeconds;
+    this.data = options.data;
   }
 }
 
@@ -277,5 +280,6 @@ export function parseApiError(status: number, body: unknown, retryAfterSeconds?:
     details: typeof record.details === 'string' ? record.details : undefined,
     failures: record.failures,
     retryAfterSeconds,
+    data: record,
   });
 }

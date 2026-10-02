@@ -21,7 +21,7 @@ import {
 } from './builders.ts';
 import { parseReceipt, ApiError, classifyRunOutput, type RunOutputClassification, type Receipt, type WatchConditionSpec } from './parsers.ts';
 import { resolveCompletion, type CompletionBlock, type CompletionParseError, type CompletionDelimiter, type CompletionCaptureSource, type ReceiptWithCompletion, type SessionDetailWithCompletion } from './completion.ts';
-import { GOAL_REPORT_INSTRUCTION } from './completion-template.ts';
+import { GOAL_REPORT_INSTRUCTION, applyGoalObjectiveTemplate } from './completion-template.ts';
 
 /**
  * I1 (H2 item 2) + correction 01: does the first template receipt warrant the
@@ -42,6 +42,7 @@ import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, t
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
 import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError } from './route-limits.ts';
 import { SpawnLedger, defaultLedgerPath } from './spawn-ledger.ts';
+import { validateGoalFields, GoalFieldValidationError } from './builders.ts';
 import { withRouteLock, ROUTE_LOCK_STALE_MARGIN_MS } from './route-lock.ts';
 import { dirname } from 'node:path';
 
@@ -69,6 +70,42 @@ export interface ClientConfig {
   routeLockTimeoutMs?: number;
   /** G1: warning sink (default a line on stderr). */
   onWarn?: (line: string) => void;
+}
+
+/**
+ * 02-correction 2: the server refused a generation-guarded watch delete
+ * (409 WATCH_GENERATION_MISMATCH). Carries BOTH generations so a caller can
+ * report exactly what happened; the watch is unchanged server-side.
+ */
+export class WatchGenerationMismatchError extends Error {
+  readonly expectedGeneration: string | undefined;
+  readonly currentGeneration: string | undefined;
+  readonly watchId: string | undefined;
+  code = 'WATCH_GENERATION_MISMATCH';
+
+  constructor(expectedGeneration: string | undefined, currentGeneration: string | undefined, watchId: string | undefined) {
+    super(`pi-orch: WATCH_GENERATION_MISMATCH — deleted nothing; the watch was replaced since it was read (expected ${expectedGeneration ?? 'unknown'}, current ${currentGeneration ?? 'unknown'})`);
+    this.name = 'WatchGenerationMismatchError';
+    this.expectedGeneration = expectedGeneration;
+    this.currentGeneration = currentGeneration;
+    this.watchId = watchId;
+  }
+}
+
+/**
+ * 04-correction A2: the server answered a watch delete, but the
+ * acknowledgement does not confirm THIS delete (success:false, a missing
+ * watchId, or a different generation). Nothing may be reported as deleted.
+ */
+export class WatchDeleteAcknowledgementError extends Error {
+  readonly ack: Record<string, unknown> | undefined;
+  code = 'WATCH_DELETE_ACK_FAILED';
+
+  constructor(detail: string, ack?: Record<string, unknown>) {
+    super(`pi-orch: WATCH_DELETE_ACK_FAILED — the server answered, but the acknowledgement does not confirm this delete (${detail}); reporting NOTHING as deleted`);
+    this.name = 'WatchDeleteAcknowledgementError';
+    this.ack = ack;
+  }
 }
 
 export class PiOrchClient {
@@ -266,7 +303,9 @@ export class PiOrchClient {
     }
     const oursToClean = watchable.map((entry) => entry.sessionId);
     const waited = await this.waitMany({ mode: 'any', children: watchable.map((entry) => ({ sessionId: entry.sessionId })), deadlineMs: remainingMs });
-    await Promise.all(oursToClean.map((sessionId) => this.deleteWatch(sessionId).catch(() => undefined)));
+    // 04-correction A3: conditional deletes — the generation is read and sent
+    // as the precondition; a replaced watch is skipped, never deleted.
+    await Promise.all(oursToClean.map((sessionId) => this.deleteOwnWatchConditionally(sessionId).catch(() => ({ deleted: false }))));
     // session_not_found (a vanished child) is NOT a refusal: the caller
     // re-counts and the next attempt uses the fresh live set.
     void waited;
@@ -576,17 +615,68 @@ export class PiOrchClient {
     throw new RouteLimitError(route as string, limit, live);
   }
 
-  async registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; raw: unknown }> {
+  /**
+   * J2 P2: arm a goal on an ALREADY-CREATED session — the H-b parent
+   * pattern's create-then-goal order (POST /sessions/:id/goal, action start).
+   * The Phase A replay had no way to do this from pi-orch (`pi-orch goal` was
+   * an unknown verb). Start-only: pause/resume/clear stay interactive.
+   */
+  async goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number; completionTemplate?: boolean }): Promise<Record<string, unknown>> {
+    // 02-correction 1: the shared validator — the Luna probe sent
+    // budgetTokens 1000000000000 because only the create path validated.
+    validateGoalFields(input);
+    // 02-correction 3: goal children started through the verb are the same
+    // receipt-less class as create-time goal children — the objective carries
+    // the flattened completion pointer and the verbatim paragraph rides as a
+    // follow-up (delivered once, exit 22 when it is not), unless opted out.
+    const templated = input.completionTemplate === false
+      ? input.objective
+      : applyGoalObjectiveTemplate(input.objective);
+    if (templated.length > 4000) {
+      throw new Error(`pi-orch: goal.objective with the completion template is ${templated.length} chars (server limit 4000); shorten the objective or pass completionTemplate: false / --no-completion-template`);
+    }
+    const body: Record<string, unknown> = { action: 'start', objective: templated };
+    if (input.maxTurns !== undefined) body.maxTurns = input.maxTurns;
+    if (input.verifyCommand !== undefined) body.verifyCommand = input.verifyCommand;
+    if (input.budgetTokens !== undefined) body.budgetTokens = input.budgetTokens;
+    const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { body, headers: this.headers() });
+    const raw = response.body as Record<string, unknown>;
+    // The wire shape nests the projection and the arm receipt; surface the
+    // fields a parent actually reads (accepted/applied, runId, goal status)
+    // at the top level and keep the full projection under `goal`.
+    const receipt = raw.receipt as { runId?: string } | undefined;
+    const goal = raw.goal as Record<string, unknown> | undefined;
+    const flattened: Record<string, unknown> = {
+      ...raw,
+      ...(receipt?.runId ? { runId: receipt.runId } : {}),
+      ...(goal && typeof goal === 'object' ? { status: goal.status, objective: goal.objective, goal } : {}),
+    };
+    if (input.completionTemplate !== false) {
+      const delivery = await this.deliverGoalTemplate(sessionId, input.objective, raw);
+      if (delivery !== undefined) flattened.templateFollowUpRunId = delivery;
+    }
+    // raw by REFERENCE (not a spread): deliverGoalTemplate records the
+    // delivery outcome (__templateFollowUpError) on it after this point.
+    flattened.raw = raw;
+    return flattened;
+  }
+  async registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; generation?: string; raw: unknown }> {
     const body = buildWatchBody(input);
     const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, {
       body,
       headers: this.headers(),
     });
     const raw = response.body as Record<string, unknown>;
-    return { watchId: String(raw.watchId), status: typeof raw.status === 'string' ? raw.status : undefined, raw };
+    return {
+      watchId: String(raw.watchId),
+      status: typeof raw.status === 'string' ? raw.status : undefined,
+      // 02-correction 2: the CAS generation a later conditional delete needs.
+      generation: typeof raw.generation === 'string' ? raw.generation : undefined,
+      raw,
+    };
   }
 
-  async getWatch(sessionId: string): Promise<{ watchId: string; status?: string; conditions?: Array<{ id?: string; spec?: Record<string, unknown> }>; label?: string } | null> {
+  async getWatch(sessionId: string): Promise<{ watchId: string; status?: string; conditions?: Array<{ id?: string; spec?: Record<string, unknown> }>; label?: string; generation?: string; firingCount?: number; allFired?: boolean; firings?: Array<Record<string, unknown>> } | null> {
     try {
       const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, {
         headers: this.headers(),
@@ -596,6 +686,13 @@ export class PiOrchClient {
         watchId: String(raw.watchId),
         status: typeof raw.status === 'string' ? raw.status : undefined,
         label: typeof raw.label === 'string' ? raw.label : undefined,
+        // 02-correction 2: the CAS generation a later conditional delete needs.
+        generation: typeof raw.generation === 'string' ? raw.generation : undefined,
+        // J2 P4: the wake surface — a bare-CLI parent reads the firing back
+        // with `watch list` instead of hand-writing curl against the socket.
+        firingCount: typeof raw.firingCount === 'number' ? raw.firingCount : undefined,
+        allFired: raw.allFired === true,
+        firings: Array.isArray(raw.firings) ? (raw.firings as Array<Record<string, unknown>>) : undefined,
         conditions: Array.isArray(raw.conditions)
           ? (raw.conditions as Array<Record<string, unknown>>).map((condition) => ({
               id: typeof condition.id === 'string' ? condition.id : undefined,
@@ -609,8 +706,71 @@ export class PiOrchClient {
     }
   }
 
-  async deleteWatch(sessionId: string): Promise<void> {
-    await this.transport.request('DELETE', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, { headers: this.headers() });
+  /**
+   * 02-correction 2: generation-safe delete. The server's DELETE accepts
+   * `{expectedGeneration}` (contract 1.35.0 CAS): a stale generation returns
+   * 409 WATCH_GENERATION_MISMATCH and leaves the watch (and its ledger,
+   * subscriptions and pin claims) unchanged — this client surfaces that as
+   * {@link WatchGenerationMismatchError} with BOTH generations named, never
+   * an unconditional delete.
+   */
+  async deleteWatch(sessionId: string, options: { expectedGeneration?: string } = {}): Promise<{ success?: boolean; watchId?: string; generation?: string }> {
+    try {
+      const response = await this.transport.request('DELETE', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, {
+        ...(options.expectedGeneration !== undefined ? { body: { expectedGeneration: options.expectedGeneration } } : {}),
+        headers: this.headers(),
+      });
+      const raw = response.body as Record<string, unknown>;
+      // 04-correction A2: validate the acknowledgement before reporting
+      // success — success:true, a watchId, and (when a precondition was sent)
+      // the exact generation the server acked (docs/INTERNAL-API.md:
+      // "require the exact generation before reporting confirmed cleanup").
+      const problems: string[] = [];
+      if (raw.success !== true) problems.push(`success is ${JSON.stringify(raw.success)}, expected true`);
+      if (typeof raw.watchId !== 'string' || raw.watchId.length === 0) problems.push('watchId missing from the acknowledgement');
+      if (options.expectedGeneration !== undefined && raw.generation !== options.expectedGeneration) {
+        problems.push(`generation is ${JSON.stringify(raw.generation)}, expected ${options.expectedGeneration}`);
+      }
+      if (problems.length > 0) throw new WatchDeleteAcknowledgementError(problems.join('; '), raw);
+      return {
+        success: true,
+        watchId: typeof raw.watchId === 'string' ? raw.watchId : undefined,
+        generation: typeof raw.generation === 'string' ? raw.generation : undefined,
+      };
+    } catch (error) {
+      const apiError = error as ApiError;
+      if (apiError instanceof ApiError && apiError.status === 409 && apiError.code === 'WATCH_GENERATION_MISMATCH') {
+        const data = (apiError.data ?? {}) as { expectedGeneration?: unknown; currentGeneration?: unknown; watchId?: unknown };
+        throw new WatchGenerationMismatchError(
+          typeof data.expectedGeneration === 'string' ? data.expectedGeneration : options.expectedGeneration,
+          typeof data.currentGeneration === 'string' ? data.currentGeneration : undefined,
+          typeof data.watchId === 'string' ? data.watchId : undefined,
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 04-correction A3: the guarded delete every INTERNAL caller uses — the
+   * generation is read fresh and sent as the CAS precondition; a missing
+   * watch, a missing generation, or a replaced watch is skipped (disclosed),
+   * NEVER deleted unconditionally.
+   */
+  private async deleteOwnWatchConditionally(sessionId: string): Promise<{ deleted: boolean; note?: string }> {
+    const watch = await this.getWatch(sessionId).catch(() => null);
+    if (!watch) return { deleted: false, note: 'no watch registered (nothing to delete)' };
+    if (watch.generation === undefined) return { deleted: false, note: 'watch delete skipped: the read returned no generation (fail-closed, 04-correction A)' };
+    try {
+      const ack = await this.deleteWatch(sessionId, { expectedGeneration: watch.generation });
+      return { deleted: true, note: `watch ${ack.watchId ?? ''} deleted (generation ${ack.generation ?? 'unknown'})`.trim() };
+    } catch (error) {
+      const mismatch = error as { code?: string };
+      if (mismatch.code === 'WATCH_GENERATION_MISMATCH') {
+        return { deleted: false, note: 'watch delete skipped: the watch was replaced since it was read — the replacement is not ours to delete' };
+      }
+      throw error;
+    }
   }
 
   /** Watch-based wait: registers the watch, long-polls, reconciles the receipt. Never polls. */
@@ -841,8 +1001,10 @@ export class PiOrchClient {
     let released = false;
     if (options.watchId !== undefined) {
       try {
-        await this.deleteWatch(sessionId);
-        notes.push(`watch ${options.watchId} deleted`);
+        // 04-correction A3: conditional delete with the generation read here;
+        // a replaced watch is skipped and disclosed, never deleted blindly.
+        const outcome = await this.deleteOwnWatchConditionally(sessionId);
+        notes.push(outcome.note ?? (outcome.deleted ? `watch ${options.watchId} deleted` : 'watch delete skipped'));
       } catch (error) {
         notes.push(`watch delete failed: ${(error as Error).message}`);
       }
@@ -862,8 +1024,11 @@ export class PiOrchClient {
     return { released, deleted: true, notes };
   }
 
-  async status(target: { parent?: string; sessionId?: string }): Promise<{
+  async status(target: { parent?: string; sessionId?: string; owner?: string }): Promise<{
     parent?: string;
+    owner?: string;
+    pruned?: number;
+    note?: string;
     children: Array<{
       sessionId: string;
       runtime?: string;
@@ -877,7 +1042,29 @@ export class PiOrchClient {
     if (target.sessionId) {
       return { children: [await this.childStatus(target.sessionId)] };
     }
-    if (!target.parent) throw new Error('pi-orch: status needs --parent <id> or a sessionId');
+    // J2 P5: the external-parent lineage. A Claude Code parent is not a Pi
+    // Web UI session, so ?parent= cannot find its children — the only record
+    // is the retention ownerId the spawn carried, which the local spawn
+    // ledger noted at spawn time (G1). Per-host, best-effort: children
+    // spawned by other clients (hand-written curl) are invisible here.
+    if (target.owner) {
+      const list = await this.transport.request('GET', '/api/v1/sessions', { headers: this.headers() });
+      const sessions = (list.body as { sessions?: Array<{ sessionId: string }> }).sessions ?? [];
+      const known = new Set(sessions.map((session) => session.sessionId));
+      const { sessionIds, pruned, note } = this.spawnLedger.entriesFor(target.owner, known);
+      const children: Awaited<ReturnType<PiOrchClient['childStatus']>>[] = [];
+      const queue = [...sessionIds];
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const sessionId = queue.shift();
+          if (!sessionId) return;
+          children.push(await this.childStatus(sessionId));
+        }
+      };
+      await Promise.all([worker(), worker(), worker(), worker()]);
+      return { owner: target.owner, pruned, ...(note ? { note } : {}), children };
+    }
+    if (!target.parent) throw new Error('pi-orch: status needs --parent <id>, --owner <id> or a sessionId');
     const query = new URLSearchParams({ parent: target.parent });
     const response = await this.transport.request('GET', `/api/v1/sessions?${query.toString()}`, { headers: this.headers() });
     const body = response.body as { sessions?: Array<{ sessionId: string; runtime?: string; busy?: boolean; status?: string }> };

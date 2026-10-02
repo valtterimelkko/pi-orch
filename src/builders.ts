@@ -16,6 +16,30 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 const GOALLESS_RUNTIMES: readonly Runtime[] = ['opencode', 'antigravity'];
 
+/** 02-correction 1: one validator for goal fields, shared by create-time goals and goalStart. */
+export class GoalFieldValidationError extends Error {}
+
+export function validateGoalFields(goal: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number }): void {
+  if (!goal.objective || goal.objective.length > 4000) {
+    throw new GoalFieldValidationError('pi-orch: goal.objective must be 1..4000 chars');
+  }
+  if (/[\n\r]/.test(goal.objective)) {
+    throw new GoalFieldValidationError('pi-orch: goal.objective must be a single line (server rule)');
+  }
+  if (goal.maxTurns !== undefined && (!Number.isInteger(goal.maxTurns) || goal.maxTurns < 1 || goal.maxTurns > 100)) {
+    throw new GoalFieldValidationError('pi-orch: goal.maxTurns must be an integer in 1..100');
+  }
+  if (goal.verifyCommand !== undefined && (typeof goal.verifyCommand !== 'string' || goal.verifyCommand.length === 0 || goal.verifyCommand.length > 2000)) {
+    throw new GoalFieldValidationError('pi-orch: goal.verifyCommand must be a non-empty string (max 2000 chars)');
+  }
+  if (goal.budgetTokens !== undefined) {
+    const { budgetTokens } = goal;
+    if (!Number.isInteger(budgetTokens) || budgetTokens < 1 || budgetTokens > 1_000_000_000) {
+      throw new GoalFieldValidationError('pi-orch: goal.budgetTokens must be an integer in 1..1000000000 (ceiling is typo defence; the server default is 5000000)');
+    }
+  }
+}
+
 export interface CreateInput {
   runtime: Runtime;
   cwd: string;
@@ -23,7 +47,7 @@ export interface CreateInput {
   modelSelector?: string;
   thinkingLevel?: ThinkingLevel;
   retention?: { mode: 'durable' | 'resident'; ttlSeconds?: number; ownerId: string; label?: string };
-  goal?: { objective: string; maxTurns?: number; verifyCommand?: string };
+  goal?: { objective: string; maxTurns?: number; verifyCommand?: string; /** J2 P1: token budget for the goal engine (server default 5,000,000 pauses long goals). */ budgetTokens?: number };
   preflight?: { paths?: string[]; tools?: string[] };
   parentSessionId?: string;
   agentOsCapture?: 'enabled' | 'disabled';
@@ -56,12 +80,8 @@ export function buildCreateBody(input: CreateInput): Record<string, unknown> {
     if (GOALLESS_RUNTIMES.includes(input.runtime)) {
       throw new Error(`pi-orch: goal is not supported for runtime '${input.runtime}' (server refuses it)`);
     }
-    if (!input.goal.objective || input.goal.objective.length > 4000) {
-      throw new Error('pi-orch: goal.objective must be 1..4000 chars');
-    }
-    if (input.goal.maxTurns !== undefined && (!Number.isInteger(input.goal.maxTurns) || input.goal.maxTurns < 1 || input.goal.maxTurns > 100)) {
-      throw new Error('pi-orch: goal.maxTurns must be an integer in 1..100');
-    }
+    // 02-correction 1: the shared validator (same messages as before).
+    validateGoalFields(input.goal);
     // C3b: goal children are the receipt-less class — the completion template
     // must reach them, but the server caps the objective at 4000 chars and
     // requires it SINGLE-LINE, so the objective carries a flattened pointer
@@ -78,7 +98,14 @@ export function buildCreateBody(input: CreateInput): Record<string, unknown> {
     if (templated.includes('\n')) {
       throw new Error('pi-orch: goal.objective must be a single line (server rule)');
     }
-    body.goal = { ...input.goal, objective: templated };
+    // J2 P1: explicit fields, not a spread — the server schema is .strict(), so
+    // an unexpected caller field must never ride into the request body.
+    body.goal = {
+      objective: templated,
+      ...(input.goal.maxTurns !== undefined ? { maxTurns: input.goal.maxTurns } : {}),
+      ...(input.goal.verifyCommand !== undefined ? { verifyCommand: input.goal.verifyCommand } : {}),
+      ...(input.goal.budgetTokens !== undefined ? { budgetTokens: input.goal.budgetTokens } : {}),
+    };
   }
   if (input.preflight) {
     body.preflight = buildPreflightSpec(input.preflight);

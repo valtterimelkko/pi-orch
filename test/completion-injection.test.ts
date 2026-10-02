@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildCreateBody, buildPromptBody } from '../src/builders.ts';
 import { COMPLETION_REPORT_INSTRUCTION, applyCompletionTemplate } from '../src/completion-template.ts';
+import { tempLedgerPath } from './isolated-ledger.ts';
 
 /**
  * C3b item 1: the template rides by default on every `prompt` message and on a
@@ -97,7 +98,7 @@ test('client.spawn with a goal: delivers the VERBATIM template as a follow_up pr
       return ok({ runId: 'r-follow', sessionId: 's-goal', detached: true, dispatchMode: 'follow_up' });
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
   assert.equal(calls[0]?.path, '/api/v1/sessions');
   // G1: the prompt-side route gate reads the child's detail between create and
@@ -122,7 +123,7 @@ test('client.spawn with a goal and completionTemplate:false: no pointer, no foll
       throw new Error('no second call expected');
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   await client.spawn({ runtime: 'pi', cwd: '/tmp/w', completionTemplate: false, goal: { objective: 'Ship the fix' } });
   assert.equal(calls.length, 1, 'only the create call');
   const goal = (calls[0]?.body as { goal?: { objective?: string } }).goal as { objective: string };
@@ -137,7 +138,7 @@ test('client.spawn without a goal: no follow-up (prompt template unaffected)', a
       return ok({ sessionId: 's3', retention: {} });
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1' });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
   await client.spawn({ runtime: 'pi', cwd: '/tmp/w' });
   assert.equal(calls.length, 1, 'only the create call');
 });
@@ -170,7 +171,7 @@ test('client.spawn retries the template follow-up ONCE when the first delivery f
       return ok({});
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
   const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
   assert.equal(followUpCount, 2, 'exactly one retry');
   assert.equal((spawned as { templateFollowUpRunId?: string }).templateFollowUpRunId, 'r-follow-2');
@@ -212,7 +213,7 @@ async function spawnWithFirstReceiptStatus(firstStatus: Record<string, unknown>)
       return ok({});
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
   const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
   return { followUpCount, spawned: spawned as { templateFollowUpRunId?: string; raw: Record<string, unknown> } };
 }
@@ -295,7 +296,7 @@ test('client.spawn does not retry when the first follow-up run is healthy', asyn
       return ok({ runId: 'r-ok', status: 'completed' });
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
   const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship it' } });
   assert.equal(calls.filter((call) => call.path.endsWith('/prompt')).length, 1);
   assert.equal((spawned as { templateFollowUpRunId?: string }).templateFollowUpRunId, 'r-ok');
@@ -323,7 +324,7 @@ test('I5: the goal template follow-up carries the marker instruction and the fie
       return ok({ runId: 'r-follow', sessionId: 's-goal', detached: true, dispatchMode: 'follow_up' });
     },
   } as never;
-  const client = new PiOrchClient({ transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
+  const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
   await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
   const followUp = calls.find((call) => call.path === '/api/v1/sessions/s-goal/prompt');
   assert.ok(followUp, 'a follow-up prompt followed the create');

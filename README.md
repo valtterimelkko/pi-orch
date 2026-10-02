@@ -59,9 +59,14 @@ pi-orch capacity                         # admission preflight
 pi-orch models --runtime pi [--match sub]  # live selectors; exactly one match
 pi-orch spawn --runtime rt --cwd /dir [--model-selector SEL | --model-match SUB] \
   [--thinking LEVEL] [--owner ID --ttl S [--label L]] \
-  [--goal-objective "..." --goal-max-turns N --goal-verify CMD] \
+  [--goal-objective "..." --goal-max-turns N --goal-verify CMD --goal-budget-tokens N] \
   [--preflight-path P --preflight-tool T] [--agent-os-capture enabled|disabled] \
   [--route-limit 'SEL=N' ...] [--wait-for-slot S]
+pi-orch goal <sessionId> start --goal-objective "..." \
+  [--goal-max-turns N --goal-verify CMD --goal-budget-tokens N]
+pi-orch watch <sessionId> register --conditions agent_end [--label L] [--pin] [--fire-if-settled]
+pi-orch watch <sessionId> list      # read the watch back: status, firingCount
+pi-orch watch <sessionId> delete
 pi-orch prompt <sessionId> --message "..."     # detached + idempotency key -> runId
                                                # [--mode prompt|follow_up|steer] [--owner ID]
 pi-orch wait <sessionId> [--run-id <runId>] [--objective "..."] [--deadline S]
@@ -70,11 +75,14 @@ pi-orch result <runId> [--transcript]          # final text + completion + outpu
 pi-orch verify <sessionId> [--run-id id] [--since ref] [--rerun "cmd"] \
   [--cwd dir] [--repo dir] [--rerun-timeout s] # re-check completion claims
 pi-orch cleanup <sessionId> [--lease id --owner id] [--watch id]
-pi-orch status [--parent <sessionId>] | [<sessionId>]  # children: busy, goal, last run
+pi-orch status [--parent <sessionId>] | [--owner <id>] | [<sessionId>]
+                                               # children: busy, goal, last run
 pi-orch help | --help | -h                     # usage on stdout, exit 0
 ```
 
-`--json` gives machine output; the default is human-readable. `--id-only` prints the bare id for `$(...)` capture: `spawn` prints the session id, `prompt` prints the run id. Never parse the human output — its wording can change at any time.
+`--json` gives machine output; the default is human-readable. `--id-only` prints the bare id for `$(...)` capture: `spawn` prints the session id, `prompt` prints the run id, `watch register`/`watch list` print the watch id. Never parse the human output — its wording can change at any time.
+
+Arming a goal without `--goal-budget-tokens` prints a one-line stderr note naming the server default (5,000,000 tokens — enough to pause a long goal mid-run), so the omission is always visible. Unknown flags are a usage error (exit 2) naming the flag, before any request is sent — a typo can never silently change what a child receives.
 
 `wait` never polls: it registers a watch on the child and blocks in the server's long poll, advancing the cursor and reconciling the run receipt at slice boundaries. `wait --all` settles every named child and `wait --any` returns with the first to settle — one long-poll request covers all watches. Unknown runs or sessions fail fast (exit 16). On a goal child, pass `--objective`; without it, `wait` reads the child's goal projection once and adopts the goal conditions when a goal is active or running. The objective you pass is matched against BOTH forms pi-orch knows: the raw text you gave `spawn --goal-objective` and the stored form the server actually holds (the raw objective plus the flattened completion-report pointer), so the wait settles on the goal whichever form you hold; an objective read from the projection (auto-detect) is already the stored form and registers once. A `goal_end` the server's restart reconciliation synthesises (its event is flagged `interruptedByRestart`) settles as `interrupted` (exit 5), never as a false `goal_failed`.
 
@@ -106,6 +114,20 @@ pi-orch spawn --runtime pi --cwd /task --model-selector zai/glm-5.3-flash \
 ### Counting runs under admission pressure (receipt inflation)
 
 Under admission pressure the server refuses a prompt with `429`/`503` + `Retry-After`; `pi-orch` retries under the SAME idempotency key, and the server — which creates a receipt before the admission check and releases the key on refusal — leaves one cancelled, never-started receipt per refused attempt (typed `ADMISSION_CAPACITY_EXHAUSTED`, `SERVER_DRAINING` or `SESSION_BUSY`; server behaviour at 1.58.x). A refused-then-retried prompt therefore leaves one real receipt **plus one refusal receipt per refused attempt**. Count runs with `countRunAttempts(receipts)` (from the public module surface) — it returns `{ dispatched, refusedBeforeDispatch, other }`, one run per real attempt with refusals reported separately — never with raw receipt totals, and never read run-receipt counts as dispatch counts (`classifyReceipt` marks each refusal receipt `refusedBeforeDispatch: true`).
+
+## Parent patterns (external parents, budgets, goals)
+
+A **Claude Code parent is not a Pi Web UI session**: the server cannot prompt it, and its children carry no parent lineage — only the retention `--owner` id you pass to `spawn`. That has three consequences:
+
+- **Lineage.** Follow the owner-id convention `orch-<programme>-<parentShort8>-<lane>` (for example `orch-j2-01a0fc47-j2lane`): programme tag, the first 8 hex characters of the dispatching parent session id, lane. The fragment makes each real parent countable and keeps owner ids unique per (parent, lane). `status --owner <id>` lists that owner's children (busy, goal state, last run) from the local spawn ledger — the **registered session list**: a child stays listed while it exists on the server, settled-but-retained children included (durable retention keeps idle children listed on purpose); entries are pruned only when the session is DELETED from the server, never when it merely goes idle. `cleanup <sid> --lease <id> --owner <id>` releases and deletes by owner. The ledger is per-host and best-effort — children dispatched by other clients (hand-written curl) never enter it — which is exactly why programmes should dispatch through pi-orch.
+- **Waiting.** Two patterns; pick one per dispatch. *Idle* (interactive parents): register a watch on the child — `pi-orch watch <sid> register --conditions agent_end` (plain children) or the watch-wake mod's own tool — then **end your turn**; the wake arrives while you hold no tokens. Arm a deadline backstop for must-not-miss waits. *In-turn* (scripts, batch parents): `pi-orch wait <sid>` blocks the caller until the child settles (or exit 3 at the deadline). `pi-orch wait` never fits the idle pattern — it holds your turn; `pi-orch watch` never waits.
+- **Budgets.** Whenever a goal child may run long, arm the budget explicitly: `--goal-budget-tokens 60000000` on zai lanes (DeepSeek needed about 40M in one measured lane). The server default is 5,000,000 tokens and pauses long goals mid-run; omitting the flag prints a stderr note so the default is never silent.
+
+`goal <sessionId> start` arms a goal on an already-created session (the create-then-goal order hand-written dispatch scripts use), with the same `--goal-objective`, `--goal-max-turns`, `--goal-verify` and `--goal-budget-tokens` flags as `spawn` — and the same completion-template delivery (the objective carries the flattened pointer, the full report instructions arrive as one follow-up, exit 22 when delivery fails; skip with `--no-completion-template`). Pause, resume and clear stay interactive on the child; pi-orch arms only.
+
+`watch <sessionId> delete` is generation-safe (contract 1.35.0 CAS): it sends `expectedGeneration` from `--generation` or from a fresh read it reports, and a replaced watch is refused (409 `WATCH_GENERATION_MISMATCH`, exit 19 naming both generations) instead of silently deleting a newer watch. When no generation is available (nothing registered, or a read without one) the delete **fails closed** — exit 19, nothing sent — unless you pass `--force-unconditional`, the documented legacy escape and the only unconditional path. The delete acknowledgement is validated (success, watchId, and the exact generation) before anything is reported as deleted; pi-orch's own internal watch cleanup (cleanup, wait-for-slot) uses the same conditional deletes and skips — never deletes — a replaced watch.
+
+Deprecated: `wait --slice S` is accepted as a no-op with a stderr note — it never had any effect (the long-poll slice is chosen internally) and will be removed in a future release.
 
 ## Environment
 
