@@ -21,13 +21,17 @@ import { defaultSocketPath, defaultTokenPath, loadSnapshot, liveContractVersion 
 import { readToken } from './transport.ts';
 
 export interface ClientLike {
+  goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number }): Promise<Record<string, unknown>>;
+  registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; raw: unknown }>;
+  getWatch(sessionId: string): Promise<{ watchId: string; status?: string; label?: string; firingCount?: number; allFired?: boolean; firings?: Array<Record<string, unknown>> } | null>;
+  deleteWatch(sessionId: string): Promise<void>;
   spawn(input: Record<string, unknown>): Promise<{ sessionId: string; leaseId?: string; parentId?: string; resolvedModel?: string; raw?: unknown }>;
   prompt(sessionId: string, input: Record<string, unknown>): Promise<{ runId: string; sessionId: string; detached: boolean; duplicate: boolean; dispatchMode?: string }>;
   wait(options: { sessionId: string; runId?: string; conditions?: WatchConditionSpec[]; objective?: string; deadlineMs?: number; label?: string }): Promise<{ kind: string; [key: string]: unknown }>;
   result(runId: string, options?: { includeTranscript?: boolean }): Promise<Record<string, unknown>>;
   verify(input: { sessionId: string; runId?: string }): Promise<{ implemented: false; plannedBy: string } | { sessionId: string; verdict: string; claims: Array<Record<string, unknown>>; summary: string }>;
   cleanup(sessionId: string, options?: { leaseId?: string; ownerId?: string; watchId?: string }): Promise<{ released: boolean; deleted: boolean; notes: string[] }>;
-  status(target: { parent?: string; sessionId?: string }): Promise<{ parent?: string; children: Array<Record<string, unknown>> }>;
+  status(target: { parent?: string; sessionId?: string; owner?: string }): Promise<{ parent?: string; owner?: string; pruned?: number; children: Array<Record<string, unknown>> }>;
   models(runtime?: string): Promise<Array<Record<string, unknown>>>;
   capabilities(): Promise<Record<string, unknown>>;
   capacity(): Promise<Record<string, unknown>>;
@@ -59,9 +63,9 @@ interface ParsedArgs {
 
 const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool', 'route-limit']);
 /** Flags that never consume the following token (so `--all c1@r1` keeps the id positional). */
-const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template']);
+const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled']);
 
-function parseArgs(argv: string[]): ParsedArgs {
+export function parseArgs(argv: string[]): ParsedArgs {
   const verb = argv[0] ?? '';
   const positional: string[] = [];
   const flags = new Map<string, string | boolean>();
@@ -157,13 +161,18 @@ class UsageError extends Error {}
 
 // ─── verbs ───────────────────────────────────────────────────────────────────
 
-const HELP = `usage: pi-orch <verb> [args] [--json]
+export const HELP = `usage: pi-orch <verb> [args] [--json]
 
 Verbs:
   capabilities                         read /capabilities (contract version)
   capacity                             read /capacity (admission preflight)
   models [--runtime rt] [--match sub]  list live model selectors
   spawn --runtime rt --cwd dir [...]   create a child (retention, goal, preflight)
+  goal <sessionId> start [...]         arm a goal on a CREATED child (H-b parent
+                                       pattern: create, then goal) with budget
+  watch <sessionId> register|list|delete
+                                       server-side watch WITHOUT waiting: register,
+                                       print the watchId, exit (idle-parent pattern)
   prompt <sessionId> --message text    detached dispatch with idempotency key
   wait <sessionId> [--run-id id]       watch-based wait; never polls; deadline
        [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
@@ -177,16 +186,24 @@ Verbs:
                                        contradicted (20) / unverifiable (21)
   cleanup <sessionId> [--lease id --owner id] [--watch id]
                                        release the owned lease, then delete
-  status [--parent id] | [sessionId]   children by parent: busy, goal, last run
+  status [--parent id] | [--owner id] | [sessionId]
+                                       children by parent OR by retention owner
+                                       (Claude Code parents: owner is the only
+                                       lineage): busy, goal, last run
 
 Scripting: use --json for full machine output, or --id-only (spawn: prints the
-sessionId; prompt: prints the runId) for $(...) capture. never parse the human-readable output (its wording can change at any time).
+sessionId; prompt: prints the runId; watch register/list: prints the watchId)
+for $(...) capture. never parse the human-readable output (its wording can change at any time).
 
 Common flags: --socket P --token-path P --api-base URL --parent-session ID --json
+  --snapshot P (compare the live /capabilities against this snapshot copy)
 
 Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
   --owner ID [--ttl S] [--label L] (durable retention with your ownerId),
-  --goal-objective OBJ [--goal-max-turns N] [--goal-verify CMD],
+  --goal-objective OBJ [--goal-max-turns N] [--goal-verify CMD]
+    [--goal-budget-tokens N] (token budget for the goal engine; the server
+    default 5,000,000 pauses long goals mid-run — programme lanes used 60M on
+    zai, ~40M DeepSeek),
   --preflight-path P (repeatable), --preflight-tool T (repeatable),
   --agent-os-capture enabled|disabled,
   --route-limit 'SEL=N' (repeatable; per-call per-route concurrency cap;
@@ -203,7 +220,7 @@ Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
   on a spawn --goal-objective)
 
 Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end+paused matched),
-  --deadline S (default 1800), --slice S, --conditions a,b
+  --deadline S (default 1800), --conditions a,b
   (agent_end|goal_end|paused|question:TEXT|deadline:S),
   --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
   --all settles every child, --any returns the first to settle. Unknown runs
@@ -217,7 +234,41 @@ Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interr
   21 verify unverifiable · 22 template not delivered · 23 credential in repo
   · 24 remote api base refused · 25 route limit (G1: spawn refused before any
   child was created; --wait-for-slot waits instead). Full table: README.md
+
+Parent patterns (J2): a Claude Code parent is not a Pi Web UI session — its
+  children carry only the --owner id (convention:
+  orch-<programme>-<parentShort8>-<lane>). To wait idle, register a watch
+  (watch ... register, or the watch-wake mod) and END THE TURN; pi-orch wait
+  blocks the caller's turn. status --owner and cleanup --owner are the lineage
+  surface; goals need --goal-budget-tokens when the child may run long.
 `;
+
+// J2 P3: every flag a verb reads, name by name. An unknown flag used to be
+// stored by parseArgs and silently dropped (Phase A receipt:
+// --goal-budget-tokens exited 0 while the goal armed with the 5M default) —
+// now a usage error before the client factory runs.
+const COMMON_FLAGS = new Set(['socket', 'token-path', 'api-base', 'parent-session', 'json', 'snapshot']);
+const VERB_FLAGS: Record<string, Set<string>> = {
+  capabilities: new Set([]),
+  capacity: new Set([]),
+  models: new Set(['runtime', 'match']),
+  spawn: new Set(['runtime', 'cwd', 'owner', 'ttl', 'label', 'model-selector', 'model-match', 'thinking', 'goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'wait-for-slot', 'agent-os-capture', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
+  prompt: new Set(['message', 'mode', 'no-detach', 'idempotency-key', 'verbosity', 'require-active-turn', 'owner', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
+  wait: new Set(['deadline', 'objective', 'conditions', 'run-id', 'all', 'any', 'label']),
+  result: new Set(['transcript']),
+  verify: new Set(['run-id', 'since', 'rerun', 'rerun-timeout', 'cwd', 'repo']),
+  cleanup: new Set(['lease', 'owner', 'watch']),
+  status: new Set(['parent', 'owner']),
+  goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens']),
+  watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only']),
+};
+
+/** The full allowed flag set for a verb (connection flags included), or undefined for an unknown verb. */
+export function allowedFlagsFor(verb: string): Set<string> | undefined {
+  const verbFlags = VERB_FLAGS[verb];
+  if (!verbFlags) return undefined;
+  return new Set([...COMMON_FLAGS, ...verbFlags]);
+}
 
 export async function runCli(argv: string[], deps: CliDeps): Promise<CliResult> {
   try {
@@ -290,9 +341,16 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
 
   // Validate the verb BEFORE touching the client factory (a bad command must
   // be a usage error, not a transport error).
-  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status']);
+  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch']);
   if (!KNOWN_VERBS.has(args.verb)) {
     throw new UsageError(`unknown verb '${args.verb}'`);
+  }
+  // J2 P3: unknown flags are a usage error BEFORE anything runs — never a
+  // silent drop (the Phase A footgun). Names the offending flags.
+  const allowedFlags = allowedFlagsFor(args.verb) as Set<string>;
+  const unknownFlags = [...args.flags.keys(), ...args.repeatable.keys()].filter((name) => !allowedFlags.has(name));
+  if (unknownFlags.length > 0) {
+    throw new UsageError(`unknown flag(s) for '${args.verb}': ${unknownFlags.map((name) => `--${name}`).join(', ')}`);
   }
   // Correction 01 item 7: junk --route-limit values must surface as a usage
   // error (exit 2) through runCli — never as an uncaught stack from the real
@@ -338,6 +396,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const cwd = requireString(args, 'cwd', '--cwd');
       const owner = flagString(args, 'owner');
       const goalObjective = flagString(args, 'goal-objective');
+      const goalBudget = flagNumber(args, 'goal-budget-tokens');
       const preflight = preflightFrom(args);
       // G1: validate the flag (cheap usage error) BEFORE the client factory runs.
       const waitForSlotMs = args.flags.has('wait-for-slot') ? waitForSlotSeconds(args) : undefined;
@@ -349,7 +408,12 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         thinkingLevel: flagString(args, 'thinking'),
         retention: owner ? { mode: 'durable', ttlSeconds: flagNumber(args, 'ttl'), ownerId: owner, label: flagString(args, 'label') } : undefined,
         goal: goalObjective
-          ? { objective: goalObjective, maxTurns: flagNumber(args, 'goal-max-turns'), verifyCommand: flagString(args, 'goal-verify') }
+          ? {
+              objective: goalObjective,
+              maxTurns: flagNumber(args, 'goal-max-turns'),
+              verifyCommand: flagString(args, 'goal-verify'),
+              ...(goalBudget !== undefined ? { budgetTokens: goalBudget } : {}),
+            }
           : undefined,
         preflight,
         agentOsCapture: flagString(args, 'agent-os-capture'),
@@ -371,13 +435,84 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       // Correction 01 item 5: a template that could NOT be delivered (both
       // follow-up attempts failed) is a real failure the parent must see —
       // distinct exit 22 + a clear warning; --json keeps the raw fields.
+      // (Checked BEFORE the budget note — the note must never mask a failure.)
       const templateError = ((body as { raw?: { __templateFollowUpError?: unknown } }).raw)?.__templateFollowUpError;
-      if (templateError === undefined) return rendered;
-      return {
-        ...rendered,
-        exitCode: 22,
-        stderr: `pi-orch: TEMPLATE_NOT_DELIVERED — the completion template could not be delivered to ${(body as { sessionId?: string }).sessionId ?? 'the child'}: ${String(templateError)}. The child holds only the pointer objective, not the full report instructions; re-send the template with 'prompt <sessionId> --message <instructions>' or re-dispatch.`,
-      };
+      if (templateError !== undefined) {
+        return {
+          ...rendered,
+          exitCode: 22,
+          stderr: `pi-orch: TEMPLATE_NOT_DELIVERED — the completion template could not be delivered to ${(body as { sessionId?: string }).sessionId ?? 'the child'}: ${String(templateError)}. The child holds only the pointer objective, not the full report instructions; re-send the template with 'prompt <sessionId> --message <instructions>' or re-dispatch.`,
+        };
+      }
+      // J2 P1/P2: an omitted budget must be visible, not silent — the Phase A
+      // receipt armed a 5M goal believing it was 60M. A note, never an error.
+      if (goalObjective && goalBudget === undefined) {
+        return { ...rendered, stderr: DEFAULT_BUDGET_NOTE };
+      }
+      return rendered;
+    }
+    case 'goal': {
+      // J2 P2: the H-b parent pattern's create-then-goal order.
+      const sessionId = args.positional[0];
+      const action = args.positional[1];
+      if (!sessionId) throw new UsageError('goal needs <sessionId>');
+      if (action !== 'start') throw new UsageError("goal supports only 'start' — pause/resume/clear stay interactive (goal <sessionId> start --goal-objective OBJ)");
+      const objective = flagString(args, 'goal-objective');
+      if (!objective) throw new UsageError('goal start needs --goal-objective OBJ');
+      const budget = flagNumber(args, 'goal-budget-tokens');
+      const maxTurns = flagNumber(args, 'goal-max-turns');
+      const verifyCommand = flagString(args, 'goal-verify');
+      const body = await getClient().goalStart(sessionId, {
+        objective,
+        ...(maxTurns !== undefined ? { maxTurns } : {}),
+        ...(verifyCommand !== undefined ? { verifyCommand } : {}),
+        ...(budget !== undefined ? { budgetTokens: budget } : {}),
+      });
+      const rendered = output(json, body, (value) => {
+        const goal = value as { status?: string; objective?: string };
+        return `goal ${goal.status ?? 'unknown'}${goal.objective ? ` — ${goal.objective.slice(0, 80)}` : ''}`;
+      });
+      return budget === undefined ? { ...rendered, stderr: DEFAULT_BUDGET_NOTE } : rendered;
+    }
+    case 'watch': {
+      // J2 P4: register/list/delete WITHOUT waiting — the idle-parent pattern:
+      // register, print the watchId, exit; the wake arrives via the watch-wake
+      // mod (Claude Code) or the server's onFire (Pi sessions).
+      const sessionId = args.positional[0];
+      const sub = args.positional[1];
+      if (!sessionId || !sub) throw new UsageError('watch needs <sessionId> register|list|delete');
+      if (sub === 'register') {
+        const conditionsFlag = flagString(args, 'conditions');
+        if (!conditionsFlag) throw new UsageError('watch register needs --conditions (agent_end|goal_end|paused|question:TEXT|deadline:S)');
+        const conditions = parseConditionList(conditionsFlag, flagString(args, 'objective'));
+        const fireIfSettled = args.flags.has('fire-if-settled') ? true : undefined;
+        const pin = args.flags.has('pin') ? true : undefined;
+        const body = await getClient().registerWatch(sessionId, {
+          conditions,
+          ...(flagString(args, 'label') !== undefined ? { label: flagString(args, 'label') } : {}),
+          ...(fireIfSettled !== undefined ? { fireIfSettled } : {}),
+          ...(pin !== undefined ? { pin } : {}),
+        });
+        return output(json, body, (value) => {
+          const watch = value as { watchId: string; status?: string };
+          if (args.flags.has('id-only')) return watch.watchId;
+          return `watch ${watch.watchId} (${watch.status ?? 'active'})`;
+        });
+      }
+      if (sub === 'list') {
+        const watch = await getClient().getWatch(sessionId);
+        return output(json, { watch }, (value) => {
+          const entry = (value as { watch: Record<string, unknown> | null }).watch;
+          if (!entry) return 'no watch registered';
+          if (args.flags.has('id-only')) return String(entry.watchId);
+          return `watch ${String(entry.watchId)} status=${String(entry.status ?? 'unknown')} firings=${String(entry.firingCount ?? 0)}${entry.allFired ? ' (all fired)' : ''}${entry.label ? ` label=${String(entry.label)}` : ''}`;
+        });
+      }
+      if (sub === 'delete') {
+        await getClient().deleteWatch(sessionId);
+        return output(json, { deleted: true }, () => 'watch deleted');
+      }
+      throw new UsageError(`unknown watch subcommand '${sub}' (register|list|delete — the verb never waits)`);
     }
     case 'prompt': {
       const sessionId = args.positional[0];
@@ -499,7 +634,23 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
     case 'status': {
       const sessionId = args.positional[0];
       const parent = flagString(args, 'parent');
-      if (!sessionId && !parent) throw new UsageError('status needs <sessionId> or --parent <id>');
+      const owner = flagString(args, 'owner');
+      // J2 P5: the external-parent lineage — Claude Code parents' children
+      // carry only the retention ownerId, never a parentSessionId.
+      if (owner) {
+        if (sessionId || parent) throw new UsageError('--owner cannot combine with a sessionId or --parent');
+        const body = await getClient().status({ owner });
+        return output(json, body, (value) => {
+          const status = value as { owner?: string; pruned?: number; children: Array<Record<string, unknown>> };
+          const lines = status.children.map((child) => {
+            const lastRun = child.lastRun as { status?: string } | undefined;
+            return `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String(lastRun?.status)}`;
+          });
+          lines.push(`owner ${String(status.owner)}: ${status.children.length} child(ren), ${String(status.pruned ?? 0)} stale ledger entr(y/ies) pruned`);
+          return lines.join('\n');
+        });
+      }
+      if (!sessionId && !parent) throw new UsageError('status needs <sessionId>, --parent <id> or --owner <id>');
       const body = await getClient().status({ sessionId, parent });
       return output(json, body, (value) => {
         const status = value as { children: Array<Record<string, unknown>> };
@@ -577,6 +728,9 @@ function output<T>(json: boolean, body: T, human: (value: T) => string): CliResu
   return { exitCode: 0, stdout: json ? `${JSON.stringify(body, null, 2)}` : human(body) };
 }
 
+/** J2 P1/P2: printed on stderr (never an error) when a goal is armed without an explicit budget. */
+const DEFAULT_BUDGET_NOTE = 'pi-orch: note — no --goal-budget-tokens given; the server default budget is 5,000,000 tokens, which pauses long goals mid-run';
+
 // ─── process entry ───────────────────────────────────────────────────────────
 
 export function makeClientFactory(argv: string[]): (config: { parentSessionId?: string }) => ClientLike {
@@ -611,8 +765,9 @@ export async function main(processObject: NodeJS.Process): Promise<void> {
   };
   const result = await runCli(argv, deps);
   if (result.stdout !== undefined) deps.stdout(result.stdout);
-  if (result.stderr !== undefined && result.exitCode !== 0 && result.exitCode !== 2) deps.stderr(result.stderr);
-  if (result.stderr !== undefined && result.exitCode === 2) deps.stderr(result.stderr);
+  // J2 P1/P2: stderr prints whenever present — success notes (the 5M default
+  // budget note) must reach the caller, not just errors.
+  if (result.stderr !== undefined) deps.stderr(result.stderr);
   processObject.exitCode = result.exitCode;
 }
 
