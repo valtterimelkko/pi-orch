@@ -11,7 +11,7 @@ test('defaultConditions: goal children get goal_end+paused+auto-continue+deadlin
   // boundary, producing false wakes that read like completion — the wait must
   // not carry one (the real-parent proof hit exactly this: the goal-start
   // turn's agent_end ended the wait before the work was done). Wave K adds
-  // the auto-continue progress condition (paused + dotted autoContinued).
+  // the auto-continue progress condition (paused + top-level autoContinued).
   const goal = defaultConditions('Do the bounded thing', 300_000);
   assert.equal(goal.some((condition) => condition.eventType === 'agent_end'), false);
   assert.deepEqual(

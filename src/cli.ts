@@ -231,10 +231,11 @@ Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
   --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
   --all settles every child, --any returns the first to settle. Unknown runs
   or sessions fail fast (exit 16) instead of sitting out the deadline.
-  Wave K: a server auto-continue of a transiently stopped goal child is
+  Wave K: a server auto-continue of a restart-interrupted goal child is
   progress — the JSON reports autoContinues: <n>; a visible stop the server
   did NOT continue settles as interrupted (exit 5) with the cause, the
-  continueCount and a resume/re-dispatch note; status shows the same facts.
+  continueCount and a resume/re-dispatch note; provider-aborted goals end
+  as before (a failed goal_end); status shows the same facts.
 
 Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interrupted
   6 never started · 7 budget exceeded · 8 cancelled · 9 transport lost

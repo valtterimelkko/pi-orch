@@ -51,7 +51,7 @@ test('client.wait on a goal child (no objective/conditions): watches goal_end/pa
   assert.deepEqual(eventTypes, ['goal_end', 'goal_state', 'goal_state', 'deadline'], `registered: ${JSON.stringify(eventTypes)}`);
   const goalEnd = conditions.find((condition) => condition.eventType === 'goal_end') as { dataMatch?: { objective?: string } };
   assert.equal(goalEnd.dataMatch?.objective, 'Ship it', 'goal_end matched on the projection objective');
-  const autoContinue = conditions.find((condition) => condition.eventType === 'goal_state' && (condition.dataMatch as Record<string, unknown> | undefined)?.['interruption.autoContinued'] === true) as { dataMatch?: Record<string, unknown> } | undefined;
+  const autoContinue = conditions.find((condition) => condition.eventType === 'goal_state' && (condition.dataMatch as Record<string, unknown> | undefined)?.autoContinued === true) as { dataMatch?: Record<string, unknown> } | undefined;
   assert.ok(autoContinue, 'the Wave K auto-continue goal_state condition is registered (auto-detected goal path)');
   assert.equal(autoContinue?.dataMatch?.objective, 'Ship it', 'the auto-continue condition keeps the objective filter');
 });

@@ -19,10 +19,13 @@ import { classifyReceipt, isTerminalReceipt, parseWatchesWait, type Receipt, typ
 /**
  * Wave K (contract 1.60.0): the additive interruption facts the server puts
  * on the goal projection (GET /sessions/:id/goal) and on every goal_state
- * event's data. `cause` is the server's closed vocabulary (restart_interruption,
- * rehydrate_pause, provider_abort, second_transient, limit, question,
- * unsupported_runtime, continue_failed); `autoContinued: true` marks the one
- * automatic continue.
+ * event's data (which also carries top-level `autoContinued` for watch
+ * matching). After K's 03-correction scope cut, a VISIBLE stop (never
+ * auto-continued) has one of exactly these causes: `restart_interruption` or
+ * `rehydrate_pause` that could not be continued, `second_transient`,
+ * `continue_failed` (ambiguous or unverified delivery), or
+ * `unsupported_runtime` (non-Pi goals, boot sweep only). `autoContinued:
+ * true` marks the one automatic continue (restart interruptions only).
  */
 export interface GoalInterruptionFacts {
   cause?: string;
@@ -361,7 +364,7 @@ async function goalEndOutcome(
         if (goal.pausedReason === 'interrupted') return interruptedStopOutcome(goal);
         return { kind: 'paused', evidence, note: `goal paused (${goal.pausedReason ?? 'reason unknown'})` };
       default:
-        // Wave K: a continue visible only on the projection (no dotted wake)
+        // Wave K: a continue visible only on the projection (the wake was missed)
         // still counts — the wait is staying in the loop anyway.
         markAutoContinue(seenAutoContinues, goal.interruption);
         return { kind: 'goal_failed', evidence, note: `goal projection status '${String(goal.status)}' after goal_end` };
@@ -391,10 +394,10 @@ function restartInterruptedOutcome(evidence: string | undefined): WaitOutcome | 
 
 // ─── Wave K (contract 1.60.0): auto-continue progress, visible-stop settlement ──
 
-/** True when the condition is the dotted auto-continue goal_state condition (goalAutoContinue). */
+/** True when the condition is the top-level autoContinued goal_state condition (goalAutoContinue). */
 function isAutoContinueCondition(condition: WatchConditionSpec | undefined): boolean {
   return condition?.eventType === 'goal_state'
-    && (condition.dataMatch as Record<string, unknown> | undefined)?.['interruption.autoContinued'] === true;
+    && (condition.dataMatch as Record<string, unknown> | undefined)?.autoContinued === true;
 }
 
 /** Count one distinct auto-continue, keyed by detectedAt (or the cause when the server sent none). */
@@ -422,9 +425,9 @@ function interruptedStopOutcome(goal: { interruption?: GoalInterruptionFacts }):
 
 /**
  * Wave K: classify a goal_state firing against the live projection.
- * - auto-continued (the projection carries `interruption.autoContinued`, or
- *   the firing came from the dotted auto-continue condition): PROGRESS — the
- *   server carried the child across a transient stop; count it and keep
+ * - auto-continued (the projection carries the continue facts, or the firing
+ *   came from the top-level autoContinued condition): PROGRESS — the server
+ *   carried the child across a restart interruption; count it and keep
  *   waiting in the same poll (null = no settlement).
  * - `paused` + `pausedReason: "interrupted"`: the visible stop — settle
  *   `interrupted` (exit 5) with cause and continueCount in the result.

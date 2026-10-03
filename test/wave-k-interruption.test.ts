@@ -17,17 +17,19 @@ import type { TransportResponse } from '../src/transport.ts';
 import { tempLedgerPath } from './isolated-ledger.ts';
 
 /**
- * Wave K (contract 1.60.0): a Pi goal child whose run hit a TRANSIENT stop is
- * auto-continued by the server exactly once. The auto-continue surfaces as a
- * `goal_state` with `status: "running"` and `interruption.autoContinued: true`
- * — PROGRESS, never a settlement — and a stop the server does NOT continue
- * surfaces as `goal_state` `paused` + `pausedReason: "interrupted"` with the
- * same `interruption` object on the projection. The wait must keep waiting
- * through continues (counting them into `autoContinues`), settle a visible
- * stop as `interrupted` (existing exit 5) with the cause and continueCount in
- * the JSON and a note naming the parent's move (resume or re-dispatch), and
- * leave an ordinary pause exactly as today. Fixtures are shaped exactly like
- * the K contract docs (docs/INTERNAL-API.md § Goal, Wave K section); no live
+ * Wave K (contract 1.60.0, after K's 03-correction scope cut): a Pi goal child
+ * whose run was cut off by a RESTART interruption is auto-continued by the
+ * server exactly once. The verified auto-continue surfaces as a `goal_state`
+ * whose data carries TOP-LEVEL `autoContinued: true` (plus the nested
+ * `interruption` object) — PROGRESS, never a settlement — and a stop the
+ * server does NOT continue surfaces as `goal_state` `paused` + `pausedReason:
+ * "interrupted"` with the same `interruption` object on the projection. The
+ * wait must keep waiting through continues (counting them into `autoContinues`),
+ * settle a visible stop as `interrupted` (existing exit 5) with the cause and
+ * continueCount in the JSON and a note naming the parent's move (resume or
+ * re-dispatch), and leave an ordinary pause exactly as today. Fixtures are
+ * shaped exactly like the K contract docs (docs/INTERNAL-API.md § Goal, Wave K
+ * section); no live
  * server is used.
  */
 
@@ -139,16 +141,16 @@ function ownFiring(state: HarnessState, kind: 'goal_end' | 'auto' | 'paused', ev
 const isGoalStatePaused = (condition: Record<string, unknown>): boolean =>
   condition.eventType === 'goal_state' && (condition.dataMatch as Record<string, unknown> | undefined)?.status === 'paused';
 const isGoalStateAutoContinue = (condition: Record<string, unknown>): boolean =>
-  condition.eventType === 'goal_state' && (condition.dataMatch as Record<string, unknown> | undefined)?.['interruption.autoContinued'] === true;
+  condition.eventType === 'goal_state' && (condition.dataMatch as Record<string, unknown> | undefined)?.autoContinued === true;
 
 // ─── Conditions (item 1: the watch must be ABLE to see the auto-continue) ────
 
-test('goalAutoContinue: goal_state condition carrying the dotted autoContinued match and the objective filter, repeating', () => {
+test('goalAutoContinue: goal_state condition carrying the TOP-LEVEL autoContinued match and the objective filter, repeating', () => {
   const condition = goalAutoContinue('Ship it');
   assert.equal(condition.type, 'event_type');
   assert.equal(condition.eventType, 'goal_state');
   assert.equal(condition.once, false, 'repeats: several continues across one long-lived goal must all be visible');
-  assert.deepEqual(condition.dataMatch, { objective: 'Ship it', 'interruption.autoContinued': true });
+  assert.deepEqual(condition.dataMatch, { objective: 'Ship it', autoContinued: true }, 'K correction C6: the event data carries top-level autoContinued, so the watch matches the top-level key, never a dotted path');
 });
 
 test('defaultConditions on a goal objective registers goal_end + paused + auto-continue + deadline (and no agent_end)', () => {
@@ -188,20 +190,19 @@ test('wait: an auto-continue goal_state firing keeps the wait going and is count
   assert.equal(outcome.kind, 'goal_achieved', `outcome: ${JSON.stringify(outcome)}`);
   assert.equal(state.longPollCalls, 2, 'the auto-continue firing did NOT settle the wait; the goal_end did');
   assert.equal((outcome as { autoContinues?: number }).autoContinues, 1, 'the continue is counted in the result');
-  // The registered conditions include the dotted auto-continue condition, filtered by the exact objective.
+  // The registered conditions include the auto-continue condition, filtered by the exact objective.
   const conditions = (state.registrations[0]?.conditions ?? []) as Array<Record<string, unknown>>;
   const autoCondition = conditionOf(conditions, isGoalStateAutoContinue) as { dataMatch: Record<string, unknown> };
   assert.equal(autoCondition.dataMatch.objective, 'Ship it');
   assert.equal((outcome as { interruption?: unknown }).interruption, undefined, 'an achieved goal is not an interruption');
 });
 
-test('wait: the auto-continue counting works even when the dotted wake never fires (projection scrape at the slice boundary)', async () => {
-  // The server's dataMatch is a shallow top-level match over the event data
-  // (the projection), so the dotted `interruption.autoContinued` key cannot
-  // fire on the current server build. The wait must still COUNT the continue:
-  // the projection read at reconciliation shows it. Run-less goal child (the
-  // receipt-less class), first slice times out, the last run is terminal, the
-  // projection says running + autoContinued → keep waiting, count it.
+test('wait: the auto-continue counting still works when the goal_state wake is missed (projection scrape at the slice boundary)', async () => {
+  // Backstop (kept per the correction): the watch wake may be missed (a late
+  // registration, a restarted ledger) — the projection read at reconciliation
+  // still shows the continue. Run-less goal child (the receipt-less class),
+  // first slice times out, the last run is terminal, the projection says
+  // running + autoContinued → keep waiting, count it.
   const { deps, state } = makeHarness();
   state.evidenceBySession.set('child', { runs: [{ runId: 'r1', status: 'completed' }] });
   state.goalsBySession.set('child', [

@@ -202,16 +202,18 @@ export function goalPaused(objective: string, id: string = nextId('paused')): Wa
 
 /**
  * Wave K (contract 1.60.0): the AUTO-CONTINUE `goal_state` — the server
- * carried a transiently stopped goal child across the stop, the projection
- * stays `running` and carries `interruption.autoContinued: true` — is
- * PROGRESS, never a settlement. Filtered by the EXACT objective (the same
- * stale-goal rule goalEnd carries) so an old goal's continue cannot wake a
- * new wait; repeats (`once: false`) so several continues over one long-lived
- * goal are all visible. Keyed exactly as the contract documents the watch
- * form: `dataMatch {"interruption.autoContinued": true}` plus the objective.
+ * carried a restart-interrupted goal child across the stop, the projection
+ * stays `running` and carries `autoContinued: true` — is PROGRESS, never a
+ * settlement. Filtered by the EXACT objective (the same stale-goal rule
+ * goalEnd carries) so an old goal's continue cannot wake a new wait; repeats
+ * (`once: false`) so several continues over one long-lived goal are all
+ * visible. Keyed exactly as the contract documents the watch form: the
+ * event's data carries TOP-LEVEL `autoContinued: true` (K correction C6 —
+ * the evaluator's dataMatch is a shallow top-level match, so a dotted key
+ * would never fire), plus the objective.
  */
 export function goalAutoContinue(objective: string, id: string = nextId('cont')): WatchConditionSpec {
-  return { id, type: 'event_type', eventType: 'goal_state', dataMatch: { objective, 'interruption.autoContinued': true }, once: false };
+  return { id, type: 'event_type', eventType: 'goal_state', dataMatch: { objective, autoContinued: true }, once: false };
 }
 
 /** Question sentinel: the brief must name the exact standalone line. */
