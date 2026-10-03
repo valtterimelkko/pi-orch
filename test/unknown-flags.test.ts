@@ -306,11 +306,16 @@ test('04-correction C: alias invocations ($PO, ${PO}) in the canonical skills pa
       }
     }
   }
-  // The parent's count: the eight current $PO examples must all parse.
+  // K4 item 3 (robust assertion, no magic count): the skill's set of $PO
+  // examples grows and shrinks with the skill's own edits — the invariant the
+  // client owns is that EVERY alias command line parses with 0 unknown
+  // verbs/flags, and that the scan actually saw at least one. The skill is
+  // never edited to satisfy this test.
   const parsed = aliasCommands.filter((command) => !command.verb.startsWith('UNKNOWN-') && !command.verb.startsWith('OFFENDER-'));
-  console.error(`PI-ORCH SKILLS ALIAS SCAN: parsed ${parsed.length} alias command(s); offenders: ${aliasCommands.length - parsed.length}`);
+  const offenders = aliasCommands.filter((command) => command.verb.startsWith('UNKNOWN-') || command.verb.startsWith('OFFENDER-'));
+  console.error(`PI-ORCH SKILLS ALIAS SCAN: parsed ${parsed.length} alias command(s); offenders: ${offenders.length}`);
   if (scanned > 0) {
-    assert.ok(parsed.length >= 8, `expected the eight current $PO examples to parse, got ${parsed.length}`);
-    assert.equal(aliasCommands.length - parsed.length, 0, `alias lines with unknown verbs/flags: ${JSON.stringify(aliasCommands.filter((c) => c.verb.startsWith('UNKNOWN-') || c.verb.startsWith('OFFENDER-')))}`);
+    assert.ok(parsed.length >= 1, `expected at least one $PO alias example in the canonical skill to scan and parse, got ${parsed.length}`);
+    assert.equal(offenders.length, 0, `alias lines with unknown verbs/flags: ${JSON.stringify(offenders)}`);
   }
 });

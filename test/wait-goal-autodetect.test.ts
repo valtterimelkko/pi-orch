@@ -103,7 +103,7 @@ test('no --objective + a RUNNING goal: goal conditions are registered, settlemen
 
   const body = state.lastRegistrationBody as { conditions: WatchConditionSpec[] };
   const kinds = body.conditions.map((condition) => condition.eventType ?? 'deadline');
-  assert.deepEqual(kinds, ['goal_end', 'goal_state', 'deadline'], 'goal_end + paused matched on the objective, plus the deadline backstop');
+  assert.deepEqual(kinds, ['goal_end', 'goal_state', 'goal_state', 'deadline'], 'goal_end + paused + the Wave K auto-continue, matched on the objective, plus the deadline backstop');
   assert.equal(body.conditions.some((condition) => condition.eventType === 'agent_end'), false, 'no per-turn agent_end on the auto-detected goal path');
   const goalEndCondition = body.conditions.find((condition) => condition.eventType === 'goal_end') as { dataMatch?: { objective?: string } };
   assert.equal(goalEndCondition.dataMatch?.objective, 'Ship the widget', 'goal_end matched on the projection objective');

@@ -39,7 +39,7 @@ function templateReceiptWantsRetry(status: string | undefined, startedAt: string
   return false;
 }
 import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, type CompletionLoad } from './verify.ts';
-import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild } from './wait.ts';
+import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild, type GoalInterruptionFacts } from './wait.ts';
 import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError } from './route-limits.ts';
 import { SpawnLedger, defaultLedgerPath } from './spawn-ledger.ts';
 import { validateGoalFields, GoalFieldValidationError } from './builders.ts';
@@ -863,8 +863,14 @@ export class PiOrchClient {
       },
       getGoal: async (sessionId) => {
         const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() });
-        const body = response.body as { status?: string; objective?: string; pausedReason?: string | null; lastReason?: string | null };
-        return { status: body.status, objective: body.objective, pausedReason: body.pausedReason, lastReason: body.lastReason };
+        const body = response.body as { status?: string; objective?: string; pausedReason?: string | null; lastReason?: string | null; interruption?: GoalInterruptionFacts };
+        return {
+          status: body.status,
+          objective: body.objective,
+          pausedReason: body.pausedReason,
+          lastReason: body.lastReason,
+          ...(body.interruption ? { interruption: body.interruption } : {}),
+        };
       },
       registerWatch: async (sessionId_, body) => {
         const registered = await this.registerWatch(sessionId_, body as { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean });
@@ -1036,6 +1042,7 @@ export class PiOrchClient {
       status?: string;
       goalStatus?: string;
       goalObjective?: string;
+      goalInterruption?: GoalInterruptionFacts;
       lastRun?: { runId?: string; status?: string; errorCode?: string };
     }>;
   }> {
@@ -1094,6 +1101,7 @@ export class PiOrchClient {
     status?: string;
     goalStatus?: string;
     goalObjective?: string;
+    goalInterruption?: GoalInterruptionFacts;
     lastRun?: { runId?: string; status?: string; errorCode?: string };
   }> {
     // Correction 04 item 6: direct reads derive busy from the session detail.
@@ -1104,8 +1112,8 @@ export class PiOrchClient {
     const [goal, evidence] = await Promise.all([
       this.transport
         .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() })
-        .then((response) => response.body as { status?: string; objective?: string })
-        .catch(() => ({ status: 'unknown' as string | undefined, objective: undefined as string | undefined })),
+        .then((response) => response.body as { status?: string; objective?: string; interruption?: GoalInterruptionFacts })
+        .catch(() => ({ status: 'unknown' as string | undefined, objective: undefined as string | undefined, interruption: undefined as GoalInterruptionFacts | undefined })),
       this.transport
         .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/evidence`, { headers: this.headers() })
         .then((response) => response.body as { runChronology?: Array<{ runId?: string; status?: string; errorCode?: string }>; status?: string })
@@ -1119,6 +1127,8 @@ export class PiOrchClient {
       status: detail.status ?? evidence.status,
       goalStatus: goal?.status,
       goalObjective: goal?.objective,
+      // Wave K (additive): present only when the server holds interruption facts.
+      ...(goal?.interruption ? { goalInterruption: goal.interruption } : {}),
       lastRun: last ? { runId: last.runId, status: last.status, errorCode: last.errorCode ?? undefined } : undefined,
     };
   }
