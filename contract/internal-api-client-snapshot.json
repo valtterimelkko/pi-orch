@@ -1,6 +1,6 @@
 {
   "$schema": "pi-orch-contract-snapshot/v1",
-  "contractVersion": "1.59.0",
+  "contractVersion": "1.60.0",
   "source": {
     "typeFiles": [
       "server/src/internal-api/types.ts",
@@ -1500,6 +1500,14 @@
           "type": "boolean",
           "optional": true
         },
+        "interruption": {
+          "type": "GoalInterruptionInfo",
+          "optional": true
+        },
+        "autoContinued": {
+          "type": "boolean",
+          "optional": true
+        },
         "runtimeState": {
           "type": "unknown",
           "optional": true
@@ -2234,6 +2242,36 @@
         },
         "message": {
           "type": "string | null",
+          "optional": true
+        }
+      }
+    },
+    "GoalInterruptionInfo": {
+      "kind": "interface",
+      "fields": {
+        "cause": {
+          "type": "GoalInterruptionCause"
+        },
+        "source": {
+          "type": "'receipt' | 'drain' | 'boot_orphan' | 'rehydrate_pause' | 'provider_abort'"
+        },
+        "detectedAt": {
+          "type": "number"
+        },
+        "continueCount": {
+          "type": "number",
+          "optional": true
+        },
+        "autoContinued": {
+          "type": "boolean",
+          "optional": true
+        },
+        "continueNote": {
+          "type": "string",
+          "optional": true
+        },
+        "inFlightToolCall": {
+          "type": "{ name: string; argsSummary: string } | null",
           "optional": true
         }
       }
