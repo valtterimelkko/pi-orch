@@ -6,16 +6,17 @@ import { ApiError } from '../src/parsers.ts';
 import type { TransportResponse } from '../src/transport.ts';
 import { tempLedgerPath } from './isolated-ledger.ts';
 
-test('defaultConditions: goal children get goal_end+paused+deadline and NO per-turn agent_end', () => {
+test('defaultConditions: goal children get goal_end+paused+auto-continue+deadline and NO per-turn agent_end', () => {
   // goals.md: a per-turn agent_end on a goal-armed child fires at every turn
   // boundary, producing false wakes that read like completion — the wait must
   // not carry one (the real-parent proof hit exactly this: the goal-start
-  // turn's agent_end ended the wait before the work was done).
+  // turn's agent_end ended the wait before the work was done). Wave K adds
+  // the auto-continue progress condition (paused + top-level autoContinued).
   const goal = defaultConditions('Do the bounded thing', 300_000);
   assert.equal(goal.some((condition) => condition.eventType === 'agent_end'), false);
   assert.deepEqual(
     goal.filter((condition) => condition.type !== 'deadline').map((condition) => condition.eventType),
-    ['goal_end', 'goal_state'],
+    ['goal_end', 'goal_state', 'goal_state'],
   );
   const plain = defaultConditions(undefined, 300_000);
   assert.deepEqual(

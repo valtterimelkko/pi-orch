@@ -198,14 +198,16 @@ test('I1: goalObjectiveConditionForms passes an already-templated objective thro
   assert.deepEqual(goalObjectiveConditionForms(stored), [stored], 'the stored form must not grow a second pointer');
 });
 
-test('I1: callerObjectiveConditions registers goal_end + paused for BOTH forms plus the deadline', () => {
+test('I1: callerObjectiveConditions registers goal_end + paused + auto-continue for BOTH forms plus the deadline', () => {
   const raw = 'Ship the fix';
   const conditions = callerObjectiveConditions(raw, 120_000);
   const goalEnds = conditions.filter((condition) => condition.eventType === 'goal_end');
-  const paused = conditions.filter((condition) => condition.eventType === 'goal_state');
+  const paused = conditions.filter((condition) => condition.eventType === 'goal_state' && (condition.dataMatch as Record<string, unknown>).status === 'paused');
+  const autoContinue = conditions.filter((condition) => condition.eventType === 'goal_state' && (condition.dataMatch as Record<string, unknown>).autoContinued === true);
   const deadlines = conditions.filter((condition) => condition.type === 'deadline');
   assert.deepEqual(goalEnds.map((condition) => (condition.dataMatch as { objective: string }).objective), [raw, applyGoalObjectiveTemplate(raw)]);
   assert.deepEqual(paused.map((condition) => (condition.dataMatch as { objective: string }).objective), [raw, applyGoalObjectiveTemplate(raw)]);
+  assert.deepEqual(autoContinue.map((condition) => (condition.dataMatch as { objective: string }).objective), [raw, applyGoalObjectiveTemplate(raw)], 'one Wave K auto-continue condition per objective form');
   assert.equal(deadlines.length, 1, 'one deadline backstop');
   assert.equal(goalEnds[0]?.once, false, 'goal conditions repeat, as before');
 });

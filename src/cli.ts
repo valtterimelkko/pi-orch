@@ -224,12 +224,18 @@ Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
   REPORT instruction, which rides by default on every dispatched message and
   on a create-time goal objective)
 
-Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end+paused matched),
-  --deadline S (default 1800), --conditions a,b
+Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
+  the Wave K auto-continue progress matched), --deadline S (default 1800),
+  --label L, --conditions a,b
   (agent_end|goal_end|paused|question:TEXT|deadline:S),
   --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
   --all settles every child, --any returns the first to settle. Unknown runs
   or sessions fail fast (exit 16) instead of sitting out the deadline.
+  Wave K: a server auto-continue of a restart-interrupted goal child is
+  progress — the JSON reports autoContinues: <n>; a visible stop the server
+  did NOT continue settles as interrupted (exit 5) with the cause, the
+  continueCount and a resume/re-dispatch note; provider-aborted goals end
+  as before (a failed goal_end); status shows the same facts.
 
 Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interrupted
   6 never started · 7 budget exceeded · 8 cancelled · 9 transport lost
@@ -728,10 +734,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         const body = await getClient().status({ owner });
         return output(json, body, (value) => {
           const status = value as { owner?: string; pruned?: number; children: Array<Record<string, unknown>> };
-          const lines = status.children.map((child) => {
-            const lastRun = child.lastRun as { status?: string } | undefined;
-            return `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String(lastRun?.status)}`;
-          });
+          const lines = status.children.map((child) => `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String((child.lastRun as { status?: string } | undefined)?.status)}${interruptionSuffix(child)}`);
           lines.push(`owner ${String(status.owner)}: ${status.children.length} child(ren), ${String(status.pruned ?? 0)} stale ledger entr(y/ies) pruned`);
           return lines.join('\n');
         });
@@ -741,16 +744,23 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       return output(json, body, (value) => {
         const status = value as { children: Array<Record<string, unknown>> };
         return status.children
-          .map((child) => {
-            const lastRun = child.lastRun as { status?: string } | undefined;
-            return `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String(lastRun?.status)}`;
-          })
+          .map((child) => `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String((child.lastRun as { status?: string } | undefined)?.status)}${interruptionSuffix(child)}`)
           .join('\n');
       });
     }
     default:
       throw new UsageError(`unknown verb '${args.verb}'`);
   }
+}
+
+/**
+ * Wave K: the interruption suffix on a status child line, present only when
+ * the server holds interruption facts for the child's goal.
+ */
+function interruptionSuffix(child: Record<string, unknown>): string {
+  const facts = child.goalInterruption as { cause?: string; continueCount?: number; autoContinued?: boolean } | undefined;
+  if (!facts) return '';
+  return ` interrupted cause=${facts.cause ?? 'unknown'} continueCount=${facts.continueCount ?? 0} autoContinued=${facts.autoContinued === true}`;
 }
 
 function renderVerifyHuman(body: { verdict: string; claims: Array<{ kind: string; claim: string; result: string; detail?: string }>; summary: string }): string {

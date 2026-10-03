@@ -16,21 +16,49 @@ import type { WatchConditionSpec } from './parsers.ts';
 import { OUTCOME_EXIT_CODES } from './exit-codes.ts';
 import { classifyReceipt, isTerminalReceipt, parseWatchesWait, type Receipt, type ReceiptClassification } from './parsers.ts';
 
+/**
+ * Wave K (contract 1.60.0): the additive interruption facts the server puts
+ * on the goal projection (GET /sessions/:id/goal) and on every goal_state
+ * event's data (which also carries top-level `autoContinued` for watch
+ * matching). After K's 03-correction scope cut, a VISIBLE stop (never
+ * auto-continued) has one of exactly these causes: `restart_interruption` or
+ * `rehydrate_pause` that could not be continued, `second_transient`,
+ * `continue_failed` (ambiguous or unverified delivery), or
+ * `unsupported_runtime` (non-Pi goals, boot sweep only). `autoContinued:
+ * true` marks the one automatic continue (restart interruptions only).
+ */
+export interface GoalInterruptionFacts {
+  cause?: string;
+  source?: string;
+  detectedAt?: number;
+  continueCount?: number;
+  autoContinued?: boolean;
+  continueNote?: string;
+  inFlightToolCall?: { name: string; argsSummary: string } | null;
+}
+
 export interface WaitDeps {
   longPoll(input: { ids: string[]; cursor?: string; timeoutMs: number }): Promise<{ kind: 'fired'; body: unknown } | { kind: 'timeout' }>;
   getReceipt(runId: string): Promise<Receipt>;
   getSessionEvidence(sessionId: string): Promise<{ runs: Array<{ runId?: string; status?: string; errorCode?: string }> }>;
   /** Existence preflight: null when the registry has no such session (404). */
   getSession(sessionId: string): Promise<{ sessionId: string; status?: string } | null>;
-  /** Goal projection for goal_end classification (correction 04 item 1). */
-  getGoal(sessionId: string): Promise<{ status?: string; objective?: string; pausedReason?: string | null; lastReason?: string | null }>;
+  /** Goal projection for goal_end classification (correction 04 item 1) and Wave K interruption facts. */
+  getGoal(sessionId: string): Promise<{ status?: string; objective?: string; pausedReason?: string | null; lastReason?: string | null; interruption?: GoalInterruptionFacts }>;
   registerWatch(sessionId: string, body: Record<string, unknown>): Promise<{ watchId: string; status?: string }>;
   getWatch(sessionId: string): Promise<{ watchId: string; status?: string; conditions?: Array<{ id?: string; spec?: Record<string, unknown> }>; label?: string } | null>;
   sleep(ms: number): Promise<void>;
   now(): number;
 }
 
-export type WaitOutcome =
+/**
+ * Wave K: `autoContinues` rides on every GOAL wait's result (0 when none); a
+ * visible stop (not auto-continued) carries the projection's `interruption`
+ * facts on the `interrupted` outcome.
+ */
+export type WaitOutcome = WaitOutcomeBody & { autoContinues?: number };
+
+type WaitOutcomeBody =
   | { kind: 'completed'; receipt?: Receipt; note?: string }
   | { kind: 'failed'; receipt?: Receipt; note?: string }
   | { kind: 'never_started'; receipt?: Receipt; note?: string }
@@ -38,7 +66,7 @@ export type WaitOutcome =
   | { kind: 'transport_lost'; receipt?: Receipt; note?: string }
   | { kind: 'prompt_not_executed'; receipt?: Receipt; note?: string }
   | { kind: 'turn_stalled'; receipt?: Receipt; note?: string }
-  | { kind: 'interrupted'; receipt?: Receipt; interruptedByRestart: boolean; note?: string }
+  | { kind: 'interrupted'; receipt?: Receipt; interruptedByRestart: boolean; interruption?: GoalInterruptionFacts; note?: string }
   | { kind: 'cancelled'; receipt?: Receipt; note?: string }
   | { kind: 'paused'; evidence?: string; note?: string }
   | { kind: 'question'; evidence?: string; note?: string }
@@ -108,7 +136,7 @@ async function preflightWait(
     // Correction 04 (run-5 lesson): an OBJECTIVE-ARMED wait does not complete
     // on the brief run's receipt while the goal is unsettled — the classified
     // goal outcome is the result (goals.md: prefer goal_end).
-    if (classified?.kind === 'completed' && child.objective) {
+  if (classified?.kind === 'completed' && child.objective) {
       const settled = await settledGoalOutcome(child.sessionId, deps);
       if (settled) return settled;
       return null; // goal unsettled: fall through into the watch loop
@@ -159,7 +187,20 @@ export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
   return waitOnChildCore(options);
 }
 
+/**
+ * Wave K: every GOAL wait (objective armed, caller-supplied or auto-detected)
+ * counts the distinct auto-continues it observed and reports them as
+ * `autoContinues` on the result (0 when none). A plain wait has no goal
+ * conditions to see a continue with and reports nothing.
+ */
 async function waitOnChildCore(options: WaitOptions): Promise<WaitOutcome> {
+  if (!options.objective) return waitLoop(options);
+  const seen = new Set<string | number>();
+  const outcome = await waitLoop(options, seen);
+  return { autoContinues: seen.size, ...outcome };
+}
+
+async function waitLoop(options: WaitOptions, seenAutoContinues?: Set<string | number>): Promise<WaitOutcome> {
   const { deps } = options;
   const fast = await preflightWait({ sessionId: options.sessionId, runId: options.runId, objective: options.objective }, deps);
   if (fast) return fast;
@@ -216,14 +257,17 @@ async function waitOnChildCore(options: WaitOptions): Promise<WaitOutcome> {
       const outcome = await outcomeFromFirings(parsed.watches.flatMap((watch_) => watch_.firings), options, deps, conditionsById, () => {
         receiptChecks += 1;
         return receiptChecks;
-      });
+      }, seenAutoContinues);
       if (outcome) return outcome;
       continue;
     }
 
     // Slice timed out: one bounded receipt reconciliation (catches
     // receipt-only terminals), then loop back into the long poll.
-    const outcome = await reconcileReceipt(options, deps);
+    const outcome = await reconcileReceipt(options, deps, () => {
+      receiptChecks += 1;
+      return receiptChecks;
+    }, seenAutoContinues);
     if (outcome) return outcome;
   }
 }
@@ -294,6 +338,7 @@ async function goalEndOutcome(
   sessionId: string,
   evidence: string,
   deps: WaitDeps,
+  seenAutoContinues?: Set<string | number>,
 ): Promise<WaitOutcome> {
   // I1 (H2 item 7, restart edge): the server's B4 restart reconciliation emits
   // a SYNTHETIC goal_end — data carries interruptedByRestart: true and no
@@ -314,8 +359,14 @@ async function goalEndOutcome(
       case 'cleared':
         return { kind: 'goal_cleared', evidence, note: 'goal cleared — not achieved; read the session before re-arming' };
       case 'paused':
+        // Wave K: a projection reading paused+interrupted is the visible stop,
+        // whether it arrives via goal_state (the normal path) or is read here.
+        if (goal.pausedReason === 'interrupted') return interruptedStopOutcome(goal);
         return { kind: 'paused', evidence, note: `goal paused (${goal.pausedReason ?? 'reason unknown'})` };
       default:
+        // Wave K: a continue visible only on the projection (the wake was missed)
+        // still counts — the wait is staying in the loop anyway.
+        markAutoContinue(seenAutoContinues, goal.interruption);
         return { kind: 'goal_failed', evidence, note: `goal projection status '${String(goal.status)}' after goal_end` };
     }
   } catch {
@@ -341,12 +392,81 @@ function restartInterruptedOutcome(evidence: string | undefined): WaitOutcome | 
   };
 }
 
+// ─── Wave K (contract 1.60.0): auto-continue progress, visible-stop settlement ──
+
+/** True when the condition is the top-level autoContinued goal_state condition (goalAutoContinue). */
+function isAutoContinueCondition(condition: WatchConditionSpec | undefined): boolean {
+  return condition?.eventType === 'goal_state'
+    && (condition.dataMatch as Record<string, unknown> | undefined)?.autoContinued === true;
+}
+
+/** Count one distinct auto-continue, keyed by detectedAt (or the cause when the server sent none). */
+function markAutoContinue(seen: Set<string | number> | undefined, interruption: GoalInterruptionFacts | undefined): void {
+  if (!seen || !interruption?.autoContinued) return;
+  seen.add(interruption.detectedAt ?? `cause:${interruption.cause ?? 'unknown'}`);
+}
+
+/**
+ * The visible-stop outcome (Wave K): the server did NOT continue the child.
+ * Exit 5; the projection's interruption facts ride on the result; the note is
+ * the parent's move in one line (resume or re-dispatch).
+ */
+function interruptedStopOutcome(goal: { interruption?: GoalInterruptionFacts }): WaitOutcome {
+  const interruption = goal.interruption;
+  const cause = interruption?.cause ?? 'unknown';
+  const continues = interruption?.continueCount ?? 0;
+  return {
+    kind: 'interrupted',
+    interruptedByRestart: false,
+    ...(interruption ? { interruption } : {}),
+    note: `visible stop, not continued (cause ${cause}, continueCount ${continues}) — resume with goal resume / POST /goal {"action":"resume"}, or re-dispatch`,
+  };
+}
+
+/**
+ * Wave K: classify a goal_state firing against the live projection.
+ * - auto-continued (the projection carries the continue facts, or the firing
+ *   came from the top-level autoContinued condition): PROGRESS — the server
+ *   carried the child across a restart interruption; count it and keep
+ *   waiting in the same poll (null = no settlement).
+ * - `paused` + `pausedReason: "interrupted"`: the visible stop — settle
+ *   `interrupted` (exit 5) with cause and continueCount in the result.
+ * - anything else: the ordinary pause, exactly as before this contract.
+ */
+async function goalStateFiringOutcome(
+  sessionId: string,
+  firing: { conditionId: string; eventType: string; evidence?: string },
+  condition: WatchConditionSpec | undefined,
+  deps: WaitDeps,
+  seen?: Set<string | number>,
+): Promise<WaitOutcome | null> {
+  const fromAutoContinueCondition = isAutoContinueCondition(condition);
+  try {
+    const goal = await deps.getGoal(sessionId);
+    if (goal.interruption?.autoContinued) {
+      markAutoContinue(seen, goal.interruption);
+      return null; // progress, never a settlement
+    }
+    if (goal.status === 'paused' && goal.pausedReason === 'interrupted') {
+      return interruptedStopOutcome(goal);
+    }
+    if (fromAutoContinueCondition) return null; // the wake says continue; never turn it into a settlement
+    return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
+  } catch {
+    // Projection unreadable: an auto-continue wake stays progress; any other
+    // goal_state firing keeps today's behaviour.
+    if (fromAutoContinueCondition) return null;
+    return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
+  }
+}
+
 async function outcomeFromFirings(
   firings: Array<{ conditionId: string; eventType: string; evidence?: string }>,
   options: WaitOptions,
   deps: WaitDeps,
   conditionsById: Map<string, WatchConditionSpec>,
   countReceiptCheck: () => void,
+  seenAutoContinues?: Set<string | number>,
 ): Promise<WaitOutcome | null> {
   for (const firing of firings) {
     // Correction 04 item 2: classify by the condition ID we registered —
@@ -357,13 +477,15 @@ async function outcomeFromFirings(
       return { kind: 'question', evidence: firing.evidence, note: 'question sentinel matched' };
     }
     if (firing.eventType === 'goal_state' || condition?.eventType === 'goal_state') {
-      return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
+      const outcome = await goalStateFiringOutcome(options.sessionId, firing, condition, deps, seenAutoContinues);
+      if (outcome) return outcome;
+      continue; // auto-continue: progress — keep waiting in the same poll
     }
     if (firing.eventType === 'goal_end' || condition?.eventType === 'goal_end') {
-      return goalEndOutcome(options.sessionId, firing.evidence ?? '', deps);
+      return goalEndOutcome(options.sessionId, firing.evidence ?? '', deps, seenAutoContinues);
     }
     if (firing.eventType === 'agent_end' || firing.eventType === 'deadline') {
-      const outcome = await reconcileReceipt(options, deps, countReceiptCheck);
+      const outcome = await reconcileReceipt(options, deps, countReceiptCheck, seenAutoContinues);
       if (outcome) return outcome;
       if (firing.eventType === 'deadline') return { kind: 'deadline', note: 'server-side deadline condition fired; child still not terminal' };
       // agent_end without a readable receipt (e.g. no runId and no evidence
@@ -373,7 +495,7 @@ async function outcomeFromFirings(
       // the carried-over acceptance item exists to kill).
       if (!options.runId) {
         if (!options.objective) {
-          const guard = await runlessGoalGuard(options.sessionId, deps);
+          const guard = await runlessGoalGuard(options.sessionId, deps, seenAutoContinues);
           if (guard === 'keep-waiting') continue;
           if (guard) return withAutoGoalNote(guard);
         }
@@ -388,6 +510,7 @@ async function reconcileReceipt(
   options: WaitOptions,
   deps: WaitDeps,
   countReceiptCheck: () => void = () => undefined,
+  seenAutoContinues?: Set<string | number>,
 ): Promise<WaitOutcome | null> {
   countReceiptCheck();
   try {
@@ -399,7 +522,7 @@ async function reconcileReceipt(
       // While the projection is still unsettled, keep waiting for the
       // classified goal result; when it is settled, return it classified.
       if (classified?.kind === 'completed' && options.objective) {
-        return await settledGoalOutcome(options.sessionId, deps) ?? null;
+        return await settledGoalOutcome(options.sessionId, deps, seenAutoContinues) ?? null;
       }
       return classified;
     }
@@ -415,7 +538,7 @@ async function reconcileReceipt(
       // settlement as the run-id path — an objective-armed wait does not
       // complete on a terminal last run while the goal is unsettled.
       if (classified?.kind === 'completed' && options.objective) {
-        return await settledGoalOutcome(options.sessionId, deps) ?? null;
+        return await settledGoalOutcome(options.sessionId, deps, seenAutoContinues) ?? null;
       }
       // C3b live-found race: the one-shot goal probe can run BEFORE the goal
       // engine registers (fresh spawn), so a run-less wait without --objective
@@ -423,7 +546,7 @@ async function reconcileReceipt(
       // last run then must NOT end the wait — re-check the goal here (bounded:
       // once per long-poll slice) and let the goal settle it instead.
       if (classified && !options.objective && !options.runId) {
-        const guard = await runlessGoalGuard(options.sessionId, deps);
+        const guard = await runlessGoalGuard(options.sessionId, deps, seenAutoContinues);
         if (guard === 'keep-waiting') return null;
         if (guard) return withAutoGoalNote(guard);
       }
@@ -441,12 +564,16 @@ async function reconcileReceipt(
  * not end the wait); a settled goal outcome when the projection has settled;
  * null when there is genuinely no goal (plain children keep their path).
  */
-async function runlessGoalGuard(sessionId: string, deps: WaitDeps): Promise<WaitOutcome | 'keep-waiting' | null> {
+async function runlessGoalGuard(sessionId: string, deps: WaitDeps, seenAutoContinues?: Set<string | number>): Promise<WaitOutcome | 'keep-waiting' | null> {
   try {
     const goal = await deps.getGoal(sessionId);
-    if (goal.status === 'running' || goal.status === 'wrapping_up') return 'keep-waiting';
+    if (goal.status === 'running' || goal.status === 'wrapping_up') {
+      // Wave K: a continue visible only on the projection still counts.
+      markAutoContinue(seenAutoContinues, goal.interruption);
+      return 'keep-waiting';
+    }
     if (['achieved', 'failed', 'cleared', 'paused'].includes(goal.status ?? '')) {
-      return goalEndOutcome(sessionId, '', deps);
+      return goalEndOutcome(sessionId, '', deps, seenAutoContinues);
     }
   } catch {
     // unreadable projection: plain path
@@ -455,7 +582,7 @@ async function runlessGoalGuard(sessionId: string, deps: WaitDeps): Promise<Wait
 }
 
 /** Read the live projection and classify it; null when the goal is still unsettled. */
-async function settledGoalOutcome(sessionId: string, deps: WaitDeps): Promise<WaitOutcome | null> {
+async function settledGoalOutcome(sessionId: string, deps: WaitDeps, seenAutoContinues?: Set<string | number>): Promise<WaitOutcome | null> {
   try {
     const goal = await deps.getGoal(sessionId);
     switch (goal.status) {
@@ -466,8 +593,12 @@ async function settledGoalOutcome(sessionId: string, deps: WaitDeps): Promise<Wa
       case 'cleared':
         return { kind: 'goal_cleared', note: 'classified from the goal projection (cleared — not achieved)' };
       case 'paused':
+        // Wave K: the visible stop read on the projection settles interrupted.
+        if (goal.pausedReason === 'interrupted') return interruptedStopOutcome(goal);
         return { kind: 'paused', note: `classified from the goal projection (paused: ${goal.pausedReason ?? 'reason unknown'})` };
       default:
+        // Wave K: a continue visible only on the projection still counts.
+        markAutoContinue(seenAutoContinues, goal.interruption);
         return null; // running / wrapping_up / unknown: keep waiting
     }
   } catch {
@@ -557,15 +688,32 @@ export async function waitOnChildren(options: {
     const child = options.children[index] as { sessionId: string; runId?: string };
     return { ...child, ...(results.has(index) ? { outcome: results.get(index) } : {}) };
   };
+  // Wave K: per-child auto-continue counting, reported on each goal child's
+  // outcome (a child with no objective has no goal conditions to see one with).
+  const seenByChild = new Map<number, Set<string | number>>();
+  const seenFor = (index: number): Set<string | number> => {
+    let set = seenByChild.get(index);
+    if (!set) {
+      set = new Set();
+      seenByChild.set(index, set);
+    }
+    return set;
+  };
+  const withAutoContinues = (index: number, entry: WaitOnChildrenResult['children'][number], objective: string | undefined, seen: Set<string | number>): WaitOnChildrenResult['children'][number] => {
+    if (entry.outcome && objective !== undefined) {
+      return { ...entry, outcome: { autoContinues: seen.size, ...entry.outcome } };
+    }
+    return entry;
+  };
 
   if (options.mode === 'any' && results.size > 0) {
     const first = options.children.findIndex((_, index) => results.has(index));
-    return { mode: 'any', children: [resultFor(first)], exitCode: exitCodeForChild(results.get(first)) };
+    return { mode: 'any', children: [withAutoContinues(first, resultFor(first), objectiveFor(first), seenFor(first))], exitCode: exitCodeForChild(results.get(first)) };
   }
-  if (options.mode === 'all' && results.size === options.children.length) {
-    const children = options.children.map((_, index) => resultFor(index));
-    return { mode: 'all', children, exitCode: allExitCode(children) };
-  }
+    if (options.mode === 'all' && results.size === options.children.length) {
+      const children = options.children.map((_, index) => withAutoContinues(index, resultFor(index), objectiveFor(index), seenFor(index)));
+      return { mode: 'all', children, exitCode: allExitCode(children) };
+    }
 
   const unsettled = new Map<number, { watchId: string }>();
   for (const [index, child] of options.children.entries()) {
@@ -628,7 +776,7 @@ export async function waitOnChildren(options: {
         if (index === undefined || !child) continue;
         const conditionsById = new Map(childConditions(options, child, detectedByChild.get(index)).flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
         for (const firing of watch.firings) {
-          const outcome = await firingOutcome(firing, child, deps, conditionsById, objectiveFor(index));
+          const outcome = await firingOutcome(firing, child, deps, conditionsById, objectiveFor(index), seenFor(index));
           if (outcome) {
             results.set(index, outcome);
             unsettled.delete(index);
@@ -641,7 +789,7 @@ export async function waitOnChildren(options: {
       for (const [index] of [...unsettled.entries()]) {
         const child = options.children[index];
         if (!child) continue;
-        const outcome = await reconcileChildReceipt(child, deps, objectiveFor(index));
+        const outcome = await reconcileChildReceipt(child, deps, objectiveFor(index), seenFor(index));
         if (outcome) {
           results.set(index, outcome);
           unsettled.delete(index);
@@ -651,12 +799,12 @@ export async function waitOnChildren(options: {
 
     if (options.mode === 'any' && results.size > 0) {
       const first = options.children.findIndex((_, index) => results.has(index));
-      return { mode: 'any', children: [resultFor(first)], exitCode: exitCodeForChild(results.get(first)) };
+      return { mode: 'any', children: [withAutoContinues(first, resultFor(first), objectiveFor(first), seenFor(first))], exitCode: exitCodeForChild(results.get(first)) };
     }
   }
 
   const children = options.children.map((_, index) => {
-    const entry = resultFor(index);
+    const entry = withAutoContinues(index, resultFor(index), objectiveFor(index), seenFor(index));
     if (entry.outcome && detectedByChild.has(index)) {
       return { ...entry, outcome: withAutoGoalNote(entry.outcome) };
     }
@@ -689,24 +837,27 @@ async function firingOutcome(
   deps: WaitDeps,
   conditionsById: Map<string, WatchConditionSpec> = new Map(),
   objective?: string,
+  seenAutoContinues?: Set<string | number>,
 ): Promise<WaitOutcome | null> {
   const condition = conditionsById.get(firing.conditionId);
   if (condition?.type === 'text') {
     return { kind: 'question', evidence: firing.evidence, note: 'question sentinel matched' };
   }
   if (firing.eventType === 'goal_state' || condition?.eventType === 'goal_state') {
-    return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
+    const outcome = await goalStateFiringOutcome(child.sessionId, firing, condition, deps, seenAutoContinues);
+    if (outcome) return outcome;
+    return null; // auto-continue: progress — the child stays unsettled
   }
   if (firing.eventType === 'goal_end' || condition?.eventType === 'goal_end') {
-    return goalEndOutcome(child.sessionId, firing.evidence ?? '', deps);
+    return goalEndOutcome(child.sessionId, firing.evidence ?? '', deps, seenAutoContinues);
   }
   if (firing.eventType === 'agent_end' || firing.eventType === 'deadline') {
-    const outcome = await reconcileChildReceipt(child, deps, objective);
+    const outcome = await reconcileChildReceipt(child, deps, objective, seenAutoContinues);
     if (outcome) return outcome;
     if (firing.eventType === 'deadline') return { kind: 'deadline', note: 'server-side deadline condition fired; child still not terminal' };
     if (!child.runId) {
       if (!objective) {
-        const guard = await runlessGoalGuard(child.sessionId, deps);
+        const guard = await runlessGoalGuard(child.sessionId, deps, seenAutoContinues);
         if (guard === 'keep-waiting') return null; // keep the child unsettled; the goal settles it
         if (guard) return withAutoGoalNote(guard);
       }
@@ -716,13 +867,13 @@ async function firingOutcome(
   return null;
 }
 
-async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps, objective?: string): Promise<WaitOutcome | null> {
+async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps, objective?: string, seenAutoContinues?: Set<string | number>): Promise<WaitOutcome | null> {
   try {
     if (child.runId) {
       const receipt = await deps.getReceipt(child.runId);
       const classified = fromClassification(classifyReceipt(receipt), receipt);
       if (classified?.kind === 'completed' && objective) {
-        return await settledGoalOutcome(child.sessionId, deps) ?? null;
+        return await settledGoalOutcome(child.sessionId, deps, seenAutoContinues) ?? null;
       }
       return classified;
     }
@@ -736,12 +887,12 @@ async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps, objective
       );
       // Correction 05 item 2: same settlement for the multi-child path.
       if (classified?.kind === 'completed' && objective) {
-        return await settledGoalOutcome(child.sessionId, deps) ?? null;
+        return await settledGoalOutcome(child.sessionId, deps, seenAutoContinues) ?? null;
       }
       // C3b live-found race guard (run-less, no explicit objective): a goal the
       // probe missed must settle the child, not a receipt-only terminal.
       if (classified && !objective && !child.runId) {
-        const guard = await runlessGoalGuard(child.sessionId, deps);
+        const guard = await runlessGoalGuard(child.sessionId, deps, seenAutoContinues);
         if (guard === 'keep-waiting') return null;
         if (guard) return withAutoGoalNote(guard);
       }

@@ -200,6 +200,22 @@ export function goalPaused(objective: string, id: string = nextId('paused')): Wa
   return { id, type: 'event_type', eventType: 'goal_state', dataMatch: { objective, status: 'paused' }, once: false };
 }
 
+/**
+ * Wave K (contract 1.60.0): the AUTO-CONTINUE `goal_state` — the server
+ * carried a restart-interrupted goal child across the stop, the projection
+ * stays `running` and carries `autoContinued: true` — is PROGRESS, never a
+ * settlement. Filtered by the EXACT objective (the same stale-goal rule
+ * goalEnd carries) so an old goal's continue cannot wake a new wait; repeats
+ * (`once: false`) so several continues over one long-lived goal are all
+ * visible. Keyed exactly as the contract documents the watch form: the
+ * event's data carries TOP-LEVEL `autoContinued: true` (K correction C6 —
+ * the evaluator's dataMatch is a shallow top-level match, so a dotted key
+ * would never fire), plus the objective.
+ */
+export function goalAutoContinue(objective: string, id: string = nextId('cont')): WatchConditionSpec {
+  return { id, type: 'event_type', eventType: 'goal_state', dataMatch: { objective, autoContinued: true }, once: false };
+}
+
 /** Question sentinel: the brief must name the exact standalone line. */
 export function questionSentinel(text: string, id: string = nextId('question')): WatchConditionSpec {
   if (!text) throw new Error('pi-orch: question sentinel text must be non-empty');
@@ -220,8 +236,9 @@ function defaultRandomId(): string {
 
 /**
  * Default conditions. Plain child: agent_end + a server-side deadline backstop.
- * Goal-armed child (objective given): goal_end + paused, matched on the EXACT
- * objective, plus the deadline — and deliberately NO per-turn agent_end
+ * Goal-armed child (objective given): goal_end + paused + the Wave K
+ * auto-continue progress condition, all matched on the EXACT objective, plus
+ * the deadline — and deliberately NO per-turn agent_end
  * (goals.md: on a goal child it fires at every turn boundary, producing false
  * wakes that read like completion and burn the wake budget).
  *
@@ -232,7 +249,7 @@ function defaultRandomId(): string {
  */
 export function defaultConditions(objective: string | undefined, deadlineMs: number): WatchConditionSpec[] {
   const conditions: WatchConditionSpec[] = objective
-    ? [goalEnd(objective), goalPaused(objective)]
+    ? [goalEnd(objective), goalPaused(objective), goalAutoContinue(objective)]
     : [agentEnd()];
   return withDeadlineBackstop(conditions, deadlineMs);
 }
@@ -256,7 +273,7 @@ export function defaultConditions(objective: string | undefined, deadlineMs: num
  */
 export function callerObjectiveConditions(objective: string | undefined, deadlineMs: number): WatchConditionSpec[] {
   if (!objective) return defaultConditions(undefined, deadlineMs);
-  const conditions: WatchConditionSpec[] = goalObjectiveConditionForms(objective).flatMap((form) => [goalEnd(form), goalPaused(form)]);
+  const conditions: WatchConditionSpec[] = goalObjectiveConditionForms(objective).flatMap((form) => [goalEnd(form), goalPaused(form), goalAutoContinue(form)]);
   return withDeadlineBackstop(conditions, deadlineMs);
 }
 
