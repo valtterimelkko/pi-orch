@@ -83,7 +83,7 @@ export class LaneConfigError extends Error {
 export interface LaneRoute {
   runtime: string;
   selector: string;
-  thinking: string;
+  thinking?: string;
 }
 
 export interface LaneConfig {
@@ -128,6 +128,8 @@ function parseRoute(raw: unknown, name: string): LaneRoute {
   if (!RUNTIMES.includes(runtime)) throw new LaneConfigError(`lane.json: ${name}.runtime must be one of ${RUNTIMES.join(', ')} (got ${runtime})`);
   const selector = requireNonEmptyString(record, 'selector', `${name}.`);
   if (selector.length > 200) throw new LaneConfigError(`lane.json: ${name}.selector must be 1..200 chars`);
+  // Antigravity routes carry the thinking level in the selector (e.g. gemini-3.8-flash-medium): no separate level.
+  if (runtime === 'antigravity' && record.thinking === undefined) return { runtime, selector };
   const thinking = requireNonEmptyString(record, 'thinking', `${name}.`);
   if (!THINKING.includes(thinking)) throw new LaneConfigError(`lane.json: ${name}.thinking must be one of ${THINKING.join(', ')} (got ${thinking})`);
   return { runtime, selector, thinking };
@@ -653,7 +655,7 @@ async function drive(ctx: Ctx): Promise<LaneExit> {
         runtime: route.runtime,
         cwd: config.cwd,
         modelSelector: route.selector,
-        thinkingLevel: route.thinking,
+        ...(route.thinking !== undefined ? { thinkingLevel: route.thinking } : {}),
         retention: { mode: 'durable', ttlSeconds: config.ttlSeconds, ownerId: config.owner, label: `${config.lane}-${role === 'implementer' ? 'impl' : 'review'}` },
       });
       return { sessionId: spawned.sessionId, ...(spawned.leaseId !== undefined ? { leaseId: spawned.leaseId } : {}), outcome: 'spawned' };
@@ -821,13 +823,13 @@ async function drive(ctx: Ctx): Promise<LaneExit> {
 const PLAN_STEPS = (lane: LoadedLane): Array<{ step: string; detail: string }> => {
   const { config } = lane;
   return [
-    { step: 'spawn_implementer', detail: `${config.implementer.runtime} ${config.implementer.selector} (thinking ${config.implementer.thinking}) in ${config.cwd}, owner ${config.owner}, ttl ${config.ttlSeconds}s — a route-cap refusal exits 25 with the overflow hint` },
+    { step: 'spawn_implementer', detail: `${config.implementer.runtime} ${config.implementer.selector} (thinking ${config.implementer.thinking ?? 'in selector'}) in ${config.cwd}, owner ${config.owner}, ttl ${config.ttlSeconds}s — a route-cap refusal exits 25 with the overflow hint` },
     { step: 'watch_implementer', detail: `register the watch (${config.mode === 'goal' ? 'goal_end/paused/stalled' : 'agent_end'} + question sentinel + deadline)` },
     { step: 'dispatch', detail: config.mode === 'goal' ? `goal start (one-line objective pointing at brief.md${config.budgetTokens ? `, budget ${config.budgetTokens} tokens` : ''})` : 'prompt: child directive + brief.md' },
     { step: 'wait', detail: 'long-poll wait (this process is the waiter); a child question (NN-question.md or the sentinel) → exit 40; a deadline → exit 3' },
     { step: 'gates', detail: `re-run the ${lane.gates.length} GATES from brief.md in ${config.cwd} (verify --gates-file logic)` },
     { step: 'correction', detail: config.maxCorrections > 0 ? 'only if a gate is red: ONE bounded correction to the SAME implementer → wait_correction → gates_correction; still red → exit 41' : 'maxCorrections is 0: a red gate exits 41 at once' },
-    { step: 'spawn_reviewer', detail: `${config.reviewer.runtime} ${config.reviewer.selector} (thinking ${config.reviewer.thinking}), fresh session` },
+    { step: 'spawn_reviewer', detail: `${config.reviewer.runtime} ${config.reviewer.selector} (thinking ${config.reviewer.thinking ?? 'in selector'}), fresh session` },
     { step: 'watch_reviewer', detail: 'register the reviewer watch' },
     { step: 'dispatch_review', detail: `prompt: child directive + review-brief.md (verdict file ${lane.verdictFile})` },
     { step: 'wait_review', detail: 'wait for the reviewer' },

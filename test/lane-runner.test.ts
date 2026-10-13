@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runLane, loadLane, LaneConfigError, QUESTION_SENTINEL, CHILD_DIRECTIVE, type LaneDeps } from '../src/lane-runner.ts';
 import { makeLaneDir, FakeWorld, routeLimitError, type Scenario } from './lane-runner-helpers.ts';
@@ -491,4 +492,15 @@ test('the wait deadline option reaches the client wait', async () => {
   const world = new FakeWorld(dir);
   await runLane({ laneDir: dir, deadlineMs: 12_345_000 }, deps(world));
   assert.ok(world.waitCalls.every((call) => call.options.deadlineMs === 12_345_000));
+});
+
+test('W4a review: an antigravity route needs no thinking (the level is in the selector); other runtimes still do', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lane-agy-'));
+  writeFileSync(join(dir, 'brief.md'), '# b\n\nGATES:\n- true → 0\n');
+  writeFileSync(join(dir, 'review-brief.md'), '# r\n');
+  const base = { lane: 'l', cwd: dir, owner: 'o', mode: 'prompt', ttlSeconds: 600, parentSessionId: 'p', maxCorrections: 1, implementer: { runtime: 'pi', selector: 'x/y', thinking: 'high' } };
+  writeFileSync(join(dir, 'lane.json'), JSON.stringify({ ...base, reviewer: { runtime: 'antigravity', selector: 'gemini-3.8-flash-medium' } }));
+  assert.equal(loadLane(dir).config.reviewer.thinking, undefined);
+  writeFileSync(join(dir, 'lane.json'), JSON.stringify({ ...base, reviewer: { runtime: 'pi', selector: 'x/z' } }));
+  assert.throws(() => loadLane(dir), LaneConfigError);
 });
