@@ -1,3 +1,4 @@
+import { SpawnLedger } from '../src/spawn-ledger.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
@@ -459,7 +460,7 @@ test('bare CLI: counts live children of the same --owner through the spawn ledge
     retention: { mode: 'durable', ownerId: 'o1' },
   });
   assert.ok(first.sessionId.startsWith('new-'));
-  const onDisk = JSON.parse(readFileSync(ledger, 'utf8')) as Array<{ sessionId: string; ownerId?: string; route?: string }>;
+  const onDisk = new SpawnLedger(ledger).entries() as Array<{ sessionId: string; ownerId?: string; route?: string }>;
   assert.equal(onDisk.length, 1);
   assert.equal(onDisk[0]?.ownerId, 'o1');
   assert.equal(onDisk[0]?.route, ZAI);
@@ -487,7 +488,7 @@ test('bare CLI: a ledger entry whose session is gone no longer counts and is pru
   // The server list is empty (session deleted elsewhere): the stale entry must not count…
   await client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, retention: { mode: 'durable', ownerId: 'o1' } });
   // …and the read prunes it from the ledger, keeping only the still-registered child.
-  const onDisk = JSON.parse(readFileSync(ledger, 'utf8')) as Array<unknown>;
+  const onDisk = new SpawnLedger(ledger).entries() as Array<unknown>;
   assert.equal(onDisk.length, 1);
 });
 
@@ -791,7 +792,7 @@ test('correction03/2: repeated sequential spawns after the 404 fallback at cap 1
   const first = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', modelSelector: ZAI, retention: { mode: 'durable', ownerId: 'o1' } });
   assert.ok(first.sessionId.startsWith('c-'));
   // The create must be recorded in the owner's ledger (the effective counting domain).
-  const onDisk = JSON.parse(readFileSync(ledger, 'utf8')) as Array<{ sessionId: string; ownerId?: string }>;
+  const onDisk = new SpawnLedger(ledger).entries() as Array<{ sessionId: string; ownerId?: string }>;
   assert.equal(onDisk.length, 1, 'the fallback create is recorded in the owner ledger');
   assert.equal(onDisk[0]?.ownerId, 'o1');
   // Second sequential spawn: the owner count now sees the first child → refused.

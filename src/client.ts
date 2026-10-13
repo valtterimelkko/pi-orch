@@ -1365,6 +1365,7 @@ export class PiOrchClient {
           headers: this.headers(),
         });
         released = true;
+        this.spawnLedger.noteLease(sessionId, leaseId, 'released');
       } catch (error) {
         notes.push(`lease release failed: ${(error as Error).message}`);
       }
@@ -1417,6 +1418,7 @@ export class PiOrchClient {
             body: { action: 'release_retention', retentionLeaseId: leaseId, ownerId },
             headers: this.headers(),
           });
+          this.spawnLedger.noteLease(sessionId, leaseId, 'released');
         } catch (error) {
           releasedAll = false;
           if (gone(error)) {

@@ -73,7 +73,7 @@ test('client.status({owner}) lists the ledger children, prunes dead ones, enrich
   assert.equal(listed.lastRun?.status, 'completed');
   assert.equal(body.pruned, 1, 'the dead ledger entry is pruned');
   // The prune is durable: the ledger on disk no longer names s-dead.
-  const onDisk = JSON.parse(readFileSync(ledgerPath, 'utf8')) as Array<{ sessionId: string }>;
+  const onDisk = new SpawnLedger(ledgerPath).entries() as Array<{ sessionId: string }>;
   assert.equal(onDisk.some((entry) => entry.sessionId === 's-dead'), false);
 });
 

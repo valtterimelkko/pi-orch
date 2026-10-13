@@ -126,7 +126,7 @@ test('W2c status --owner: a child missing from GET /sessions (limited list) is s
   assert.equal(body.children[0]?.sessionId, 's-hidden');
   assert.equal(body.children[0]?.lastRun?.status, 'completed');
   assert.equal(body.pruned, 0);
-  assert.ok(JSON.parse(readFileSync(ledger, 'utf8')).some((entry: { sessionId: string }) => entry.sessionId === 's-hidden'), 'ledger entry survives');
+  assert.ok(new SpawnLedger(ledger).entries().some((entry: { sessionId: string }) => entry.sessionId === 's-hidden'), 'ledger entry survives');
 });
 
 test('W2c status --owner: only a 404 on the detail read prunes (the session is really gone)', async () => {
@@ -143,7 +143,7 @@ test('W2c status --owner: only a 404 on the detail read prunes (the session is r
   const body = await client(transport, ledger).status({ owner: 'o' });
   assert.deepEqual(body.children.map((child) => child.sessionId), ['s-alive']);
   assert.equal(body.pruned, 1);
-  assert.deepEqual((JSON.parse(readFileSync(ledger, 'utf8')) as Array<{ sessionId: string }>).map((entry) => entry.sessionId), ['s-alive']);
+  assert.deepEqual((new SpawnLedger(ledger).entries() as Array<{ sessionId: string }>).map((entry) => entry.sessionId), ['s-alive']);
 });
 
 test('W2c status --owner: a transient detail failure keeps the child listed (with readErrors) and keeps the ledger entry', async () => {
@@ -167,7 +167,7 @@ test('W2c ledger: an owner-tagged spawn is recorded WITH its leaseId even when t
   const c = client(transport, ledger, { parentSessionId: 'claude-code-parent' });
   const spawned = await c.spawn({ runtime: 'claude', cwd: '/w', retention: { mode: 'durable', ownerId: 'orch-r1', ttlSeconds: 600 } });
   assert.equal(spawned.leaseId, 'lease-77');
-  const entries = JSON.parse(readFileSync(ledger, 'utf8')) as Array<{ sessionId: string; ownerId?: string; leaseId?: string }>;
+  const entries = new SpawnLedger(ledger).entries() as Array<{ sessionId: string; ownerId?: string; leaseId?: string }>;
   assert.deepEqual(entries.map((entry) => [entry.sessionId, entry.ownerId, entry.leaseId]), [['s-new', 'orch-r1', 'lease-77']]);
 });
 
