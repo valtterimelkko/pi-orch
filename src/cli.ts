@@ -4,7 +4,9 @@
  * factory) so no test needs a server or a real process.
  */
 
+import { readFileSync } from 'node:fs';
 import { PiOrchClient } from './client.ts';
+import { parseGatesBlock, type Gate } from './gates.ts';
 import { COMPLETION_REPORT_INSTRUCTION, GOAL_REPORT_INSTRUCTION } from './completion-template.ts';
 import {
   agentEnd,
@@ -38,7 +40,7 @@ export interface ClientLike {
   prompt(sessionId: string, input: Record<string, unknown>): Promise<{ runId: string; sessionId: string; detached: boolean; duplicate: boolean; dispatchMode?: string; queueDepth?: number; deliver?: { chosen: string; busy: boolean; reason: string } }>;
   wait(options: { sessionId: string; runId?: string; conditions?: WatchConditionSpec[]; objective?: string; deadlineMs?: number; label?: string }): Promise<{ kind: string; [key: string]: unknown }>;
   result(runId: string, options?: { includeTranscript?: boolean; final?: boolean }): Promise<Record<string, unknown>>;
-  verify(input: { sessionId: string; runId?: string }): Promise<{ implemented: false; plannedBy: string } | { sessionId: string; verdict: string; claims: Array<Record<string, unknown>>; summary: string }>;
+  verify(input: { sessionId: string; runId?: string; gates?: Gate[]; gateTimeoutMs?: number; [key: string]: unknown }): Promise<{ implemented: false; plannedBy: string } | { sessionId: string; verdict: string; claims: Array<Record<string, unknown>>; summary: string }>;
   cleanup(sessionId: string, options?: { leaseId?: string; ownerId?: string; watchId?: string }): Promise<{ released: boolean; deleted: boolean; notes: string[] }>;
   status(target: { parent?: string; sessionId?: string; owner?: string }): Promise<{ parent?: string; owner?: string; pruned?: number; children: Array<Record<string, unknown>> }>;
   models(runtime?: string): Promise<Array<Record<string, unknown>>>;
@@ -216,6 +218,13 @@ Verbs:
                                        --rerun runs ONLY the command you name, in
                                        the child's cwd. Verdicts: verified (0) /
                                        contradicted (20) / unverifiable (21)
+       [--gates-file brief.md]         re-run the GATES: block ('- <cmd> → <exit>' lines)
+       [--gate-timeout S]              of a brief in the child's cwd (or --cwd), default
+                                       1800s per gate; a gate whose exit differs →
+                                       contradicted (20) with expected/actual and the
+                                       last 20 output lines; a gate that pushes, hard-resets,
+                                       runs rm -rf at the root, or npm ci/install is
+                                       REFUSED (not run) → unverifiable (21)
   cleanup <sessionId> [--lease id --owner id] [--watch id]
                                        release the owned lease (the spawn ledger's lease
                                        when --lease is omitted), then delete
@@ -305,7 +314,7 @@ const VERB_FLAGS: Record<string, Set<string>> = {
   prompt: new Set(['message', 'mode', 'no-detach', 'idempotency-key', 'verbosity', 'require-active-turn', 'owner', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
   wait: new Set(['deadline', 'objective', 'conditions', 'run-id', 'all', 'any', 'label', 'slice']),
   result: new Set(['transcript', 'final']),
-  verify: new Set(['run-id', 'since', 'rerun', 'rerun-timeout', 'cwd', 'repo']),
+  verify: new Set(['run-id', 'since', 'rerun', 'rerun-timeout', 'cwd', 'repo', 'gates-file', 'gate-timeout']),
   cleanup: new Set(['lease', 'owner', 'watch']),
   status: new Set(['parent', 'owner']),
   goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template', 'template-follow-up', 'reason', 'note']),
@@ -788,7 +797,28 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const sessionId = args.positional[0];
       if (!sessionId) throw new UsageError('verify needs <sessionId>');
       const rerunTimeout = flagNumber(args, 'rerun-timeout');
+      // W2-g: the brief's GATES block, parsed BEFORE the client factory runs.
+      let gates: Gate[] | undefined;
+      const gatesFile = flagString(args, 'gates-file');
+      if (args.flags.has('gates-file') && gatesFile === undefined) throw new UsageError('--gates-file needs a path');
+      if (gatesFile !== undefined) {
+        let text: string;
+        try {
+          text = readFileSync(gatesFile, 'utf8');
+        } catch (error) {
+          throw new UsageError(`--gates-file ${gatesFile}: ${(error as Error).message}`);
+        }
+        const parsed = parseGatesBlock(text);
+        if (!parsed.found) throw new UsageError(`--gates-file ${gatesFile}: no 'GATES:' block found (a line 'GATES:' followed by '- <command> → <expected exit>' lines)`);
+        if (parsed.malformed.length > 0) throw new UsageError(`--gates-file ${gatesFile}: malformed gate line(s): ${parsed.malformed.join(' | ')} (expected '- <command> → <expected exit>')`);
+        if (parsed.gates.length === 0) throw new UsageError(`--gates-file ${gatesFile}: the GATES: block has no gates`);
+        gates = parsed.gates;
+      }
+      const gateTimeout = flagNumber(args, 'gate-timeout');
+      if (args.flags.has('gate-timeout') && (gateTimeout === undefined || !(gateTimeout > 0))) throw new UsageError('--gate-timeout must be a positive number of seconds');
       const body = await getClient().verify({
+        ...(gates !== undefined ? { gates } : {}),
+        ...(gateTimeout !== undefined ? { gateTimeoutMs: gateTimeout * 1000 } : {}),
         sessionId,
         ...(flagString(args, 'run-id') !== undefined ? { runId: flagString(args, 'run-id') } : {}),
         ...(flagString(args, 'since') !== undefined ? { since: flagString(args, 'since') } : {}),

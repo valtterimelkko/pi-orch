@@ -1325,7 +1325,17 @@ export class PiOrchClient {
         ? { ...(resolvedSurface.completion !== undefined ? { block: resolvedSurface.completion } : {}), ...(resolvedSurface.error !== undefined ? { error: resolvedSurface.error } : {}), source: resolvedSurface.source }
         : {};
     };
-    return verifyChild(input, deps, loadCompletion);
+    // W2-g: gates run in the child's cwd — --cwd when given, else the session's own.
+    let effective = input;
+    if (input.gates !== undefined && input.cwd === undefined) {
+      try {
+        const detail = (await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(input.sessionId)}`, { headers: this.headers() })).body as { cwd?: unknown };
+        if (typeof detail?.cwd === 'string' && detail.cwd.length > 0) effective = { ...input, cwd: detail.cwd };
+      } catch {
+        // unreadable detail: the gates report 'no cwd available' rather than guess
+      }
+    }
+    return verifyChild(effective, deps, loadCompletion);
   }
 
   async cleanup(sessionId: string, options: { leaseId?: string; ownerId?: string; watchId?: string } = {}): Promise<{

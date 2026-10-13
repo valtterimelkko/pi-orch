@@ -20,6 +20,7 @@ import { statSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 
 import type { CompletionBlock, CompletionParseError } from './completion.ts';
+import { DEFAULT_GATE_TIMEOUT_MS, gateRefusal, outputTail, type Gate, type GateResult } from './gates.ts';
 
 export interface VerifyInput {
   sessionId: string;
@@ -33,12 +34,17 @@ export interface VerifyInput {
   cwd?: string;
   /** Explicit repo override for filesChanged resolution. */
   repo?: string;
+  /** W2-g: the brief's GATES, re-run in the child's cwd; a red gate contradicts. */
+  gates?: Gate[];
+  gateTimeoutMs?: number;
 }
+
+export type { Gate, GateResult };
 
 export type VerifyClaimResult = 'verified' | 'contradicted' | 'unverifiable' | 'recorded';
 
 export interface VerifyClaim {
-  kind: 'commit' | 'file' | 'command' | 'test' | 'status';
+  kind: 'commit' | 'file' | 'command' | 'test' | 'status' | 'gate';
   claim: string;
   check: string;
   result: VerifyClaimResult;
@@ -51,6 +57,8 @@ export interface VerifyResult {
   verdict: 'verified' | 'contradicted' | 'unverifiable';
   completionSource?: 'receipt' | 'session_surface';
   claims: VerifyClaim[];
+  /** W2-g: one entry per gate when verify ran with a GATES block. */
+  gates?: GateResult[];
   summary: string;
 }
 
@@ -161,14 +169,19 @@ export async function verifyChild(
     ...(loaded.source !== undefined ? { completionSource: loaded.source } : {}),
     claims,
   } as const;
-  if (!loaded.block) {
+  if (!loaded.block && input.gates === undefined) {
     const reason = loaded.error ? `${loaded.error.code} from the ${loaded.source ?? 'unknown'} record` : 'no completion was captured (neither on the receipt nor on the session surface)';
     return { ...base, verdict: 'unverifiable', summary: `unverifiable: ${reason}` };
   }
-  const block = loaded.block;
+  // W2-g: with gates, a missing completion block no longer ends the verify —
+  // the gates are the evidence; the block-derived claims are simply empty.
+  const block: CompletionBlock = loaded.block ?? { schema: 'pi-completion/v1', status: 'done' };
+  const noBlock = loaded.block === undefined;
 
   // ── status structure ────────────────────────────────────────────────────────
-  if (block.status === 'blocked') {
+  if (noBlock) {
+    // gates-only verify: nothing to say about status
+  } else if (block.status === 'blocked') {
     if (block.blockedReason && block.blockedReason.length > 0) {
       claims.push(claimRow('status', 'blocked', 'blocked status carries blockedReason', 'verified', block.blockedReason));
     } else {
@@ -306,6 +319,42 @@ export async function verifyChild(
   void passClaims;
   void failClaims;
 
+  // ── W2-g gates: re-run the brief's GATES in the child's cwd ────────────────
+  let gateResults: GateResult[] | undefined;
+  if (input.gates !== undefined) {
+    gateResults = [];
+    const gateCwd = input.cwd ?? filesRepo;
+    const timeoutMs = input.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
+    for (const gate of input.gates) {
+      const check = `gate '${gate.command}' → expected exit ${gate.expectedExit}`;
+      const refused = gateRefusal(gate.command);
+      if (refused !== undefined) {
+        gateResults.push({ command: gate.command, expectedExit: gate.expectedExit, result: 'unverifiable', refused, outputTail: [] });
+        claims.push(claimRow('gate', gate.command, check, 'unverifiable', refused));
+        continue;
+      }
+      if (!gateCwd) {
+        const reason = 'no cwd available to run the gate in (pass --cwd)';
+        gateResults.push({ command: gate.command, expectedExit: gate.expectedExit, result: 'unverifiable', refused: reason, outputTail: [] });
+        claims.push(claimRow('gate', gate.command, check, 'unverifiable', reason));
+        continue;
+      }
+      const run = await deps.runCommand(gate.command, { cwd: gateCwd, timeoutMs });
+      const tail = outputTail(run.stdout, run.stderr);
+      const matched = !run.timedOut && run.exitCode === gate.expectedExit;
+      gateResults.push({
+        command: gate.command,
+        expectedExit: gate.expectedExit,
+        actualExit: run.exitCode,
+        result: matched ? 'verified' : 'contradicted',
+        ...(run.timedOut ? { timedOut: true } : {}),
+        outputTail: tail,
+      });
+      const detail = run.timedOut ? `TIMED OUT after ${timeoutMs}ms (expected exit ${gate.expectedExit}) in ${gateCwd}` : `expected exit ${gate.expectedExit}, actual exit ${run.exitCode} in ${gateCwd}`;
+      claims.push(claimRow('gate', gate.command, check, matched ? 'verified' : 'contradicted', matched ? detail : `${detail}${tail.length > 0 ? `\n${tail.map((line) => `    | ${line}`).join('\n')}` : ''}`));
+    }
+  }
+
   // ── verdict ────────────────────────────────────────────────────────────────
   const contradicted = claims.filter((entry) => entry.result === 'contradicted');
   const unverifiable = claims.filter((entry) => entry.result === 'unverifiable');
@@ -314,7 +363,7 @@ export async function verifyChild(
   let summary: string;
   if (contradicted.length > 0) {
     verdict = 'contradicted';
-    summary = `contradicted: ${contradicted.length} claim(s) contradicted, ${verified.length} verified, ${unverifiable.length} unverifiable, ${claims.length - contradicted.length - verified.length - unverifiable.length} recorded — first: ${contradicted[0]?.kind} '${contradicted[0]?.claim}': ${contradicted[0]?.detail ?? contradicted[0]?.check ?? ''}`;
+    summary = `contradicted: ${contradicted.length} claim(s) contradicted, ${verified.length} verified, ${unverifiable.length} unverifiable, ${claims.length - contradicted.length - verified.length - unverifiable.length} recorded — first: ${contradicted[0]?.kind} '${contradicted[0]?.claim}': ${(contradicted[0]?.detail ?? contradicted[0]?.check ?? '').split('\n')[0]}`;
   } else if (verified.length === 0 || unverifiable.length > 0) {
     verdict = 'unverifiable';
     summary = `unverifiable: ${verified.length} verified, ${unverifiable.length} unverifiable, ${claims.length - verified.length - unverifiable.length} recorded${unverifiable.length > 0 ? ` — first: ${unverifiable[0]?.kind} '${unverifiable[0]?.claim}': ${unverifiable[0]?.detail ?? ''}` : ' — nothing independently checkable in the block'}`;
@@ -322,5 +371,6 @@ export async function verifyChild(
     verdict = 'verified';
     summary = `verified: ${verified.length} claim(s) verified against the filesystem, ${claims.length - verified.length} recorded, 0 contradicted`;
   }
-  return { ...base, verdict, summary };
+  if (noBlock) summary = `${summary} (no completion block was captured; verdict from the gates alone)`;
+  return { ...base, ...(gateResults !== undefined ? { gates: gateResults } : {}), verdict, summary };
 }
