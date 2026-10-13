@@ -98,7 +98,7 @@ test('docs guard: every README command line parses for its verb with no unknown 
 
 test('docs guard: every flag named in HELP is accepted by some verb', () => {
   const everyFlag = new Set<string>();
-  for (const verb of ['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'template']) {
+  for (const verb of ['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'template', 'lane']) {
     for (const name of allowedFlagsFor(verb) as Set<string>) everyFlag.add(name);
   }
   const named = [...HELP.matchAll(/--([a-z][a-z0-9-]+)/g)].map((match) => match[1] as string);
@@ -141,7 +141,7 @@ test('02-correction 5: HELP no longer documents --slice', () => {
 type HelpVerbs = Map<string, Set<string>>;
 
 function helpFlagsPerVerb(help: string): HelpVerbs {
-  const known = ['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template'];
+  const known = ['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template', 'lane'];
   const perVerb: HelpVerbs = new Map(known.map((verb) => [verb, new Set<string>()]));
   const lines = help.split('\n');
   let currentVerbBlock: string | null = null;

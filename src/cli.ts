@@ -30,6 +30,7 @@ import { ERROR_CODE_EXIT_CODES, exitCodeFor, VERIFY_EXIT_CODES } from './exit-co
 import { resolveRouteLimits, profileCapacityRefusalLine, type RouteLimitProfile } from './route-limits.ts';
 import { defaultSocketPath, defaultTokenPath, loadSnapshot, liveContractVersion } from './snapshot.ts';
 import { readToken } from './transport.ts';
+import { loadLane, runLane, LaneConfigError, type LaneClient } from './lane-runner.ts';
 
 export interface ClientLike {
   goalPause(sessionId: string, input: { reason?: string }): Promise<Record<string, unknown>>;
@@ -79,7 +80,7 @@ interface ParsedArgs {
 
 const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool', 'route-limit']);
 /** Flags that never consume the following token (so `--all c1@r1` keeps the id positional). */
-const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled', 'force-unconditional', 'final', 'template-follow-up', 'goal']);
+const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled', 'force-unconditional', 'final', 'template-follow-up', 'goal', 'dry-run']);
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const verb = argv[0] ?? '';
@@ -230,6 +231,20 @@ Verbs:
                                        last 20 output lines; a gate that pushes, hard-resets,
                                        runs rm -rf at the root, or npm ci/install is
                                        REFUSED (not run) → unverifiable (21)
+  lane run <lane-dir> [--dry-run]      the lane runner: for ONE lane, spawn the implementer,
+       [--continue correction]         register the watch, dispatch (goal or prompt) from
+       [--deadline S]                  brief.md, wait, run the brief's GATES, spawn a
+                                       cross-family reviewer (review-brief.md), read its
+                                       VERDICT, and EXIT ONLY at judgement events. Keeps
+                                       runner-journal.jsonl + runner-state.json in the lane
+                                       dir (re-running resumes; nothing is re-spawned or
+                                       re-sent) and writes runner-exit.json. Exits: 0 done ·
+                                       3 deadline · 25 capacity · 40 question · 41 gates red
+                                       after the one correction · 42 verdict to adjudicate ·
+                                       43 runner error. --dry-run validates and prints the
+                                       plan with no API call; --continue correction (after
+                                       42) sends the reviewer's findings as ONE correction
+                                       and runs a closure review on the same reviewer
   cleanup <sessionId> [--lease id --owner id] [--watch id]
                                        release the owned lease (the spawn ledger's lease
                                        when --lease is omitted), then delete
@@ -303,6 +318,7 @@ Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interr
   executed · 15 turn stalled · 16 wait target not found · 17 goal cleared
   18 create unknown · 19 watch conflict · 20 verify contradicted
   21 verify unverifiable · 22 template not delivered · 23 credential in repo
+  · 40 lane question · 41 lane gates red · 42 lane verdict · 43 lane runner error
   · 24 remote api base refused · 25 route limit (G1/W0d: spawn refused before any
   child was created; a Claude profile route defaults to the server-advertised
   cap, and the message names the cap and the owner-authorised PAYG overflow
@@ -335,6 +351,7 @@ const VERB_FLAGS: Record<string, Set<string>> = {
   goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template', 'template-follow-up', 'reason', 'note']),
   template: new Set(['goal']),
   reroute: new Set(['model-selector', 'thinking']),
+  lane: new Set(['dry-run', 'continue', 'deadline']),
   watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only', 'generation', 'force-unconditional', 'goal-id']),
 };
 
@@ -416,7 +433,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
 
   // Validate the verb BEFORE touching the client factory (a bad command must
   // be a usage error, not a transport error).
-  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template']);
+  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template', 'lane']);
   if (!KNOWN_VERBS.has(args.verb)) {
     throw new UsageError(`unknown verb '${args.verb}'`);
   }
@@ -450,6 +467,35 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
     case 'template': {
       // W2-g: the full report instructions, for the parent to paste into the brief file the objective points to.
       return { exitCode: 0, stdout: args.flags.has('goal') ? GOAL_REPORT_INSTRUCTION : COMPLETION_REPORT_INSTRUCTION };
+    }
+    case 'lane': {
+      // W4-a: `lane run <lane-dir>` — validated BEFORE the client factory runs.
+      const sub = args.positional[0];
+      if (sub !== 'run') throw new UsageError('lane supports: lane run <lane-dir> [--dry-run] [--continue correction] [--deadline S]');
+      const laneDir = args.positional[1];
+      if (!laneDir) throw new UsageError('lane run needs <lane-dir>');
+      if (args.positional.length > 2) throw new UsageError(`lane run takes one <lane-dir>, got ${args.positional.length - 1} arguments`);
+      const continueFlag = args.flags.get('continue');
+      if (continueFlag !== undefined && continueFlag !== 'correction') throw new UsageError("--continue takes the value 'correction' (lane run <dir> --continue correction)");
+      const deadlineSeconds = flagNumber(args, 'deadline');
+      if (args.flags.has('deadline') && (deadlineSeconds === undefined || !(deadlineSeconds > 0))) throw new UsageError('--deadline must be a positive number of seconds');
+      let lane;
+      try {
+        lane = loadLane(laneDir);
+      } catch (error) {
+        if (error instanceof LaneConfigError) throw new UsageError(error.message);
+        throw error;
+      }
+      const laneOptions = {
+        laneDir,
+        json,
+        ...(args.flags.has('dry-run') ? { dryRun: true } : {}),
+        ...(continueFlag === 'correction' ? { continueCorrection: true } : {}),
+        ...(deadlineSeconds !== undefined ? { deadlineMs: deadlineSeconds * 1000 } : {}),
+      };
+      if (laneOptions.dryRun) return runLane(laneOptions, { client: {} as LaneClient });
+      const laneClient = deps.client({ parentSessionId: flagString(args, 'parent-session') ?? lane.config.parentSessionId });
+      return runLane(laneOptions, { client: laneClient as unknown as LaneClient });
     }
     case 'capabilities': {
       const body = await getClient().capabilities();

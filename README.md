@@ -55,6 +55,7 @@ pi-orch result "$run" --json
 
 ```
 pi-orch capabilities                     # contract version, runtime features
+pi-orch lane run <lane-dir> [--dry-run] [--continue correction]  # the lane runner (see "Lane runner")
 pi-orch capacity                         # admission preflight
 pi-orch models --runtime pi [--match sub]  # live selectors; exactly one match
 pi-orch spawn --runtime rt --cwd /dir [--model-selector SEL | --model-match SUB] \
@@ -207,6 +208,37 @@ At runtime the client compares the snapshot's `contractVersion` with live `/capa
 cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 ```
 
+## Lane runner
+
+`pi-orch lane run <lane-dir>` is a small program over this client for **one lane**. It does what a parent otherwise does by hand — spawn the implementer, register the watch, dispatch the brief (a prompt, or a goal), wait, run the brief's `GATES:`, spawn a cross-family reviewer, read its verdict — and **exits only at judgement events**: a child question, gates still red after the correction cap, a reviewer verdict to adjudicate, a capacity refusal that needs the owner's overflow decision, or done. Start it as an ordinary background process; process exit is the one wake that works on every harness. It is a loop, a journal and an exit — not a conductor: no contracts, no sign-off machinery.
+
+```bash
+pi-orch lane run ./my-lane --dry-run                 # validate every input and print the plan; no API call, nothing written
+pi-orch lane run ./my-lane &                         # run (or resume) the lane
+pi-orch lane run ./my-lane --continue correction     # after exit 42: send the findings as ONE correction + a closure review
+```
+
+Flags: `--dry-run`, `--continue correction`, `--deadline S` (per wait, default 1800; exit 3 means "still working, re-run to keep waiting"), `--json`, plus the common connection flags (`--parent-session` overrides the lane's `parentSessionId`). A sample directory lives in [`examples/lane/`](examples/lane/).
+
+**Inputs** (the lane directory):
+
+| File | Contents |
+|---|---|
+| `lane.json` | `lane` (name), `cwd` (absolute), `owner` (retention ownerId), `implementer` / `reviewer` (`{runtime, selector, thinking}`), `mode` (`goal` or `prompt`), `objective?` (goal mode, one line), `ttlSeconds`, `budgetTokens?` (goal mode), `parentSessionId`, `maxCorrections` (0 or 1). Unknown keys are a usage error (exit 2). |
+| `brief.md` | The implementer's brief; it must end with a `GATES:` block (`- <command> → <exit>` lines). |
+| `review-brief.md` | The reviewer's brief. A line `VERDICT FILE: <path>` names the verdict file (relative to the lane dir; default `verdict.md`); its first line must be `VERDICT: ACCEPT`, `VERDICT: ACCEPT WITH FIXES` or `VERDICT: REJECT`. |
+| `correction-template.md` | Optional. `{{LANE}}` and `{{RED_GATES}}` (each red gate with its command, exit and last output lines) are substituted. |
+
+**Outputs** (written into the lane dir): `runner-journal.jsonl` (one record per completed step: `ts`, `step`, ids, outcome), `runner-state.json` (the step receipts, session / lease / watch / run ids, counters) and `runner-exit.json` (code, name, reason, implementer and reviewer ids — the children are left for the parent to clean up).
+
+**Exits:** `0 DONE` · `3 DEADLINE` · `25 ROUTE_LIMIT` (the refusal carries the overflow hint; overflow is the owner's decision, never automatic) · `40 QUESTION` (an `NN-question.md` file in the lane dir, or the `PI-ORCH-LANE-QUESTION` sentinel) · `41 GATES_RED` (still red after the one correction) · `42 VERDICT` (ACCEPT WITH FIXES or REJECT) · `43 RUNNER_ERROR`. A bad lane dir or a refused `--continue` is `2 USAGE`.
+
+**Resume.** Every action is a named step whose receipt is persisted before the next one starts. Re-running `lane run <dir>` replays from the state: a step with a receipt is never repeated, so no child is re-spawned and no prompt re-sent (prompts also carry a deterministic idempotency key `lane:<lane>:<step>`, so even a kill between the server accepting a prompt and the receipt being written only re-sends a server-side duplicate). Spawn and goal start have no server idempotency: if a run was killed after one of those calls began but before its receipt was written, the next run refuses with exit 43 and a reconcile hint (`pi-orch status --owner <owner>`) instead of risking a second child. A `runner.lock` (holder pid) keeps two runners off one lane. After exit 40 (you answered the child) re-running resumes the wait without the first run's receipt shortcut; exit 3 and exit 25 retry the same step.
+
+**`--continue correction`** is valid only when the lane sits at exit 42: it sends the reviewer's verdict file to the same implementer as ONE correction, re-runs the gates (red → 41), and runs a closure review on the same reviewer, ending in 0 or 42 again — never a third round.
+
+Every prompt starts with the `agent-os-child` directive (`CHILD_DIRECTIVE` in `src/lane-runner.ts`).
+
 ## Exit codes
 
 | Code | Name | Meaning |
@@ -237,6 +269,10 @@ cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 | 23 | `CREDENTIAL_IN_REPO` | a credential path (the Internal API token) resolves inside this repository; the token must come from outside the repo — point `PI_WEB_UI_TOKEN_PATH` at a path outside the package root |
 | 24 | `REMOTE_API_BASE_REFUSED` | `PI_WEB_UI_API_BASE` points at a non-loopback host (or a remote host over http); only a loopback API base or the Unix socket is allowed unless `PI_ORCH_ALLOW_REMOTE_API_BASE=1` is set, and even then a remote base must be `https:` |
 | 25 | `ROUTE_LIMIT` | Refused BEFORE any child was created: you already have the limit's worth of live children on that model route (busy, nonterminal run, or goal running/wrapping_up), or the server advertised a Claude profile cap (`GET /capacity` `claudeProfiles`) that is full — a server `429 PROFILE_CAPACITY_EXHAUSTED` maps here too. A Claude profile refusal names the cap and the owner-authorised PAYG overflow route. Use `--wait-for-slot` (explicit local limits only), wait manually, or spread across another route |
+| 40 | `QUESTION` | lane run: a child parked with a question (an `NN-question.md` file in the lane directory, or the question sentinel) — read it, answer the child, re-run the lane to resume the wait |
+| 41 | `GATES_RED` | lane run: the brief's GATES are still red after the correction cap (one bounded correction, or none when `maxCorrections` is 0) — the parent adjudicates; the runner sends nothing more |
+| 42 | `VERDICT` | lane run: the reviewer returned ACCEPT WITH FIXES or REJECT (or the closure review did) — the parent adjudicates; `--continue correction` sends the findings as ONE correction plus a closure review |
+| 43 | `RUNNER_ERROR` | lane run: an unexpected error, a failed child wait, an unreadable verdict, an unknown spawn outcome, or a held runner lock — the journal is intact; fix the cause and re-run to resume |
 
 ## Skill pack
 

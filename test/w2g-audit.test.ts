@@ -112,3 +112,8 @@ test('the real binary appends an audit record (end to end)', () => {
   assert.ok(existsSync(path));
   assert.equal(records(path)[0]?.verb, 'template');
 });
+
+test('W4a review-2: lane run records subverb run, not the lane directory', () => {
+  const record = auditRecordFor(['lane', 'run', '/tmp/my-lane'], { exitCode: 0 }, {}, 1);
+  assert.equal(record.subverb, 'run');
+});

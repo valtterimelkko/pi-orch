@@ -1,0 +1,19 @@
+{
+  "lane": "demo-lane",
+  "cwd": "/srv/work/demo-repo",
+  "owner": "orch-demo-a1b2c3d4-demo-lane",
+  "implementer": {
+    "runtime": "pi",
+    "selector": "opencode-go/deepseek-v4.1-flash",
+    "thinking": "high"
+  },
+  "reviewer": {
+    "runtime": "claude",
+    "selector": "sonnet",
+    "thinking": "medium"
+  },
+  "mode": "prompt",
+  "ttlSeconds": 14400,
+  "parentSessionId": "REPLACE-WITH-YOUR-SESSION-ID",
+  "maxCorrections": 1
+}
