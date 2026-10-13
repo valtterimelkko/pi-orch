@@ -73,6 +73,22 @@ test('W2c status: lastRun is the NEWEST run by timestamp, with runId, status and
   assert.deepEqual([lastRun?.runId, lastRun?.status, lastRun?.endedAt], ['r-new', 'completed', '2026-10-13T09:30:00Z']);
 });
 
+test('W2c review-1: lastRun.endedAt comes from the server fields terminalAt / agentEndAt', async () => {
+  const { transport } = routedTransport({
+    'GET /api/v1/sessions/s1': () => ok({ sessionId: 's1', runtime: 'pi', busy: false, status: 'idle' }),
+    'GET /api/v1/sessions/s1/goal': () => ok({ status: 'idle' }),
+    'GET /api/v1/sessions/s1/evidence': () => ok({
+      runChronology: [
+        { runId: 'r-new', status: 'completed', acceptedAt: '2026-10-13T09:00:00Z', agentEndAt: '2026-10-13T09:29:00Z', terminalAt: '2026-10-13T09:30:00Z' },
+        { runId: 'r-old', status: 'completed', acceptedAt: '2026-10-13T08:00:00Z', terminalAt: '2026-10-13T08:05:00Z' },
+      ],
+    }),
+  });
+  const { children } = await client(transport).status({ sessionId: 's1' });
+  const lastRun = children[0]?.lastRun;
+  assert.deepEqual([lastRun?.runId, lastRun?.endedAt], ['r-new', '2026-10-13T09:30:00Z']);
+});
+
 test('W2c status: without timestamps the first entry stays the last run (the pre-existing contract)', async () => {
   const { transport } = routedTransport({
     'GET /api/v1/sessions/s1': () => ok({ sessionId: 's1', busy: false, status: 'idle' }),

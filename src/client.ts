@@ -822,6 +822,7 @@ export class PiOrchClient {
     return { ...raw, ...(goal && typeof goal === 'object' ? { status: goal.status, objective: goal.objective, goal } : {}) };
   }
 
+  /** `reason` is sent for forward compatibility; servers up to contract 1.62.0 ignore it. */
   async goalPause(sessionId: string, input: { reason?: string } = {}): Promise<Record<string, unknown>> {
     const body: Record<string, unknown> = { action: 'pause' };
     if (input.reason !== undefined) body.reason = input.reason;
@@ -829,6 +830,7 @@ export class PiOrchClient {
     return this.flattenGoal(response.body as Record<string, unknown>);
   }
 
+  /** `note` is sent for forward compatibility; servers up to contract 1.62.0 ignore it (the child does not see it). */
   async goalResume(sessionId: string, input: { note?: string } = {}): Promise<Record<string, unknown>> {
     const body: Record<string, unknown> = { action: 'resume' };
     if (input.note !== undefined) body.note = input.note;
@@ -1583,14 +1585,15 @@ export class PiOrchClient {
   }
 }
 
-type RunChronologyEntry = { runId?: string; status?: string; errorCode?: string | null; startedAt?: string | number; endedAt?: string | number; completedAt?: string | number; finishedAt?: string | number; createdAt?: string | number; acceptedAt?: string | number };
+type RunChronologyEntry = { runId?: string; status?: string; errorCode?: string | null; startedAt?: string | number; terminalAt?: string | number; agentEndAt?: string | number; endedAt?: string | number; completedAt?: string | number; finishedAt?: string | number; createdAt?: string | number; acceptedAt?: string | number };
 
 function runEndedAt(run: RunChronologyEntry): string | number | undefined {
-  return run.endedAt ?? run.completedAt ?? run.finishedAt ?? undefined;
+  // The server's evidence chronology carries terminalAt / agentEndAt; the rest are tolerated aliases.
+  return run.terminalAt ?? run.agentEndAt ?? run.endedAt ?? run.completedAt ?? run.finishedAt ?? undefined;
 }
 
 function runTime(run: RunChronologyEntry): number | undefined {
-  for (const value of [run.endedAt, run.completedAt, run.finishedAt, run.startedAt, run.createdAt, run.acceptedAt]) {
+  for (const value of [run.terminalAt, run.agentEndAt, run.endedAt, run.completedAt, run.finishedAt, run.startedAt, run.createdAt, run.acceptedAt]) {
     if (typeof value === 'number') return value;
     if (typeof value === 'string') {
       const parsed = Date.parse(value);
