@@ -216,6 +216,56 @@ export function goalPaused(objective?: string, id: string = nextId('paused')): W
 }
 
 /**
+ * W2h (contract 1.62.0): how a goal watch identifies its goal. A known
+ * `goalId` is the exact identity — the server stamps it TOP-LEVEL on every
+ * goal_state/goal_end (watch `dataMatch` is a shallow top-level match), so an
+ * id-keyed condition is not woken by an old goal's clear on a reused child
+ * (finding F4). Without a known id the objective forms stay in use, exactly as
+ * before 1.62.0.
+ */
+export interface GoalMatch {
+  goalId?: string;
+  objective?: string;
+}
+
+/** goal_end keyed on the top-level goalId when one is known, else the objective forms (W2-a). */
+export function goalEndMatch(match: GoalMatch, id: string = nextId('outcome')): WatchConditionSpec {
+  if (match.goalId !== undefined && match.goalId !== '') {
+    return { id, type: 'event_type', eventType: 'goal_end', dataMatch: { goalId: match.goalId }, once: false };
+  }
+  return goalEnd(match.objective, id);
+}
+
+/** goal_paused keyed on the top-level goalId when one is known, else the objective forms (W2-a). */
+export function goalPausedMatch(match: GoalMatch, id: string = nextId('paused')): WatchConditionSpec {
+  if (match.goalId !== undefined && match.goalId !== '') {
+    return { id, type: 'event_type', eventType: 'goal_state', dataMatch: { status: 'paused', goalId: match.goalId }, once: false };
+  }
+  return goalPaused(match.objective, id);
+}
+
+/** The Wave K auto-continue goal_state, keyed on the goalId when one is known, else the objective. */
+export function goalAutoContinueMatch(match: GoalMatch, id: string = nextId('cont')): WatchConditionSpec {
+  if (match.goalId !== undefined && match.goalId !== '') {
+    return { id, type: 'event_type', eventType: 'goal_state', dataMatch: { goalId: match.goalId, autoContinued: true }, once: false };
+  }
+  return match.objective !== undefined ? goalAutoContinue(match.objective, id) : { id, type: 'event_type', eventType: 'goal_state', dataMatch: { autoContinued: true }, once: false };
+}
+
+/**
+ * W2h (W2-b, contract 1.62.0): the STALLED goal_state — the server emits
+ * top-level `stalled: true` (+ `stalledForMs`) when a goal still reads
+ * `running` while its session has been idle past `GOAL_STALL_MINUTES`. A
+ * stalled goal is not a finished one, so this is an observation condition; the
+ * goalId rides along when one is known.
+ */
+export function stalledCondition(match: GoalMatch = {}, id: string = nextId('stalled')): WatchConditionSpec {
+  const dataMatch: Record<string, string | number | boolean> = { stalled: true };
+  if (match.goalId !== undefined && match.goalId !== '') dataMatch.goalId = match.goalId;
+  return { id, type: 'event_type', eventType: 'goal_state', dataMatch, once: false };
+}
+
+/**
  * Wave K (contract 1.60.0): the AUTO-CONTINUE `goal_state` — the server
  * carried a restart-interrupted goal child across the stop, the projection
  * stays `running` and carries `autoContinued: true` — is PROGRESS, never a
@@ -262,9 +312,10 @@ function defaultRandomId(): string {
  * typed (the raw form from `spawn --goal-objective`), use
  * {@link callerObjectiveConditions}, which matches both forms.
  */
-export function defaultConditions(objective: string | undefined, deadlineMs: number): WatchConditionSpec[] {
-  const conditions: WatchConditionSpec[] = objective
-    ? [goalEnd(objective), goalPaused(objective), goalAutoContinue(objective)]
+export function defaultConditions(objective: string | undefined, deadlineMs: number, goalId?: string): WatchConditionSpec[] {
+  const match: GoalMatch = { ...(goalId !== undefined ? { goalId } : {}), ...(objective !== undefined ? { objective } : {}) };
+  const conditions: WatchConditionSpec[] = objective || goalId
+    ? [goalEndMatch(match), goalPausedMatch(match), goalAutoContinueMatch(match), stalledCondition(match)]
     : [agentEnd()];
   return withDeadlineBackstop(conditions, deadlineMs);
 }
@@ -286,9 +337,13 @@ export function defaultConditions(objective: string | undefined, deadlineMs: num
  * with completionTemplate:false stores raw; the raw condition matches, the
  * templated variant merely never fires.
  */
-export function callerObjectiveConditions(objective: string | undefined, deadlineMs: number): WatchConditionSpec[] {
+export function callerObjectiveConditions(objective: string | undefined, deadlineMs: number, goalId?: string): WatchConditionSpec[] {
+  // W2h: a known goalId is the exact identity — key on it instead of the
+  // objective forms (which a reused child's OLD goal could also match).
+  if (goalId !== undefined && goalId !== '') return defaultConditions(objective, deadlineMs, goalId);
   if (!objective) return defaultConditions(undefined, deadlineMs);
   const conditions: WatchConditionSpec[] = goalObjectiveConditionForms(objective).flatMap((form) => [goalEnd(form), goalPaused(form), goalAutoContinue(form)]);
+  conditions.push(stalledCondition());
   return withDeadlineBackstop(conditions, deadlineMs);
 }
 

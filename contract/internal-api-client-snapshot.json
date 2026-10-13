@@ -1,6 +1,6 @@
 {
   "$schema": "pi-orch-contract-snapshot/v1",
-  "contractVersion": "1.61.0",
+  "contractVersion": "1.62.0",
   "source": {
     "typeFiles": [
       "server/src/internal-api/types.ts",
@@ -1515,6 +1515,18 @@
         },
         "autoContinued": {
           "type": "boolean",
+          "optional": true
+        },
+        "goalId": {
+          "type": "string",
+          "optional": true
+        },
+        "stalled": {
+          "type": "boolean",
+          "optional": true
+        },
+        "stalledForMs": {
+          "type": "number",
           "optional": true
         },
         "runtimeState": {

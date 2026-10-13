@@ -502,19 +502,23 @@ test('W0d/17: a 429 that carries no profile fields still exits 25 and keeps the 
 
 // ── the bundled contract snapshot ────────────────────────────────────────────
 
-test('W0d/18: the bundled snapshot is the server\'s 1.61.0 (claudeProfiles + the typed refusal)', () => {
+test('W0d/18 + W2h: the bundled snapshot is the server\'s 1.62.0 (claudeProfiles, the typed refusal, goalId/stalled)', () => {
   const snapshot = JSON.parse(readFileSync(join(process.cwd(), 'contract', 'internal-api-client-snapshot.json'), 'utf8')) as {
     contractVersion: string;
     errorCodes: string[];
     types: Record<string, { fields?: Record<string, { type?: string; optional?: boolean }> }>;
   };
-  assert.equal(snapshot.contractVersion, '1.61.0');
+  assert.equal(snapshot.contractVersion, '1.62.0');
   assert.ok(snapshot.errorCodes.includes('PROFILE_CAPACITY_EXHAUSTED'));
   const claudeProfiles = snapshot.types.CapacityResponse?.fields?.claudeProfiles;
   assert.ok(claudeProfiles, 'CapacityResponse advertises claudeProfiles');
   assert.match(claudeProfiles.type ?? '', /Array<\{ profileId: string; maxConcurrent: number; active: number \}>/);
   assert.equal(claudeProfiles.optional, true, 'absent on older servers');
   assert.equal(snapshot.types.ModelInfo?.fields?.maxConcurrent?.type, 'number');
+  // W2h (contract 1.62.0): the stable goal identity and the stall facts.
+  assert.equal(snapshot.types.SessionGoalProjection?.fields?.goalId?.type, 'string');
+  assert.equal(snapshot.types.SessionGoalProjection?.fields?.stalled?.type, 'boolean');
+  assert.equal(snapshot.types.SessionGoalProjection?.fields?.stalledForMs?.type, 'number');
 });
 
 // ─── W0d review fix 1: a profile-cap 429 surfaces at once (no silent Retry-After stall) ──────────

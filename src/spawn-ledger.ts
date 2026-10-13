@@ -21,6 +21,8 @@ export interface LedgerEntry {
   ownerId?: string;
   /** W2c: the retention lease the spawn acquired, so cleanup can release it without a lookup. */
   leaseId?: string;
+  /** W2h (contract 1.62.0): the stable goal id of the child's goal, once pi-orch learns it (goal start / goal show). Additive. */
+  goalId?: string;
   parentSessionId?: string;
   at: string;
 }
@@ -38,7 +40,8 @@ export type LedgerEvent =
   | ({ event: 'spawned'; ts: string; migrated?: boolean } & LedgerEntry)
   | { event: 'deleted'; ts: string; sessionId: string }
   | { event: 'pruned'; ts: string; sessionId: string }
-  | { event: 'lease'; ts: string; sessionId: string; leaseId: string; action: 'acquired' | 'released' };
+  | { event: 'lease'; ts: string; sessionId: string; leaseId: string; action: 'acquired' | 'released' }
+  | { event: 'goal'; ts: string; sessionId: string; goalId: string };
 
 export function defaultLedgerPath(env: Record<string, string | undefined> = process.env): string {
   return env.PI_ORCH_SPAWN_LEDGER ?? join(homedir(), '.pi-orch', 'spawn-ledger.json');
@@ -123,6 +126,21 @@ export class SpawnLedger {
     return this.entries().find((entry) => entry.sessionId === sessionId)?.ownerId;
   }
 
+  /** W2h: note the child's stable goal id (from `goal start` / `goal show`). Best-effort; never throws. */
+  noteGoal(sessionId: string, goalId: string): void {
+    if (!this.path || goalId === '') return;
+    try {
+      this.append({ event: 'goal', ts: new Date().toISOString(), sessionId, goalId });
+    } catch {
+      // best effort: a missing goalId only falls back to the objective forms
+    }
+  }
+
+  /** W2h: the goal id recorded for a session, when pi-orch has learned one. */
+  goalOf(sessionId: string): string | undefined {
+    return this.entries().find((entry) => entry.sessionId === sessionId)?.goalId;
+  }
+
   /** The derived VIEW: live (not deleted / pruned) entries in spawn order. */
   entries(): LedgerEntry[] {
     const view = new Map<string, LedgerEntry>();
@@ -144,6 +162,9 @@ export class SpawnLedger {
         } else {
           view.set(event.sessionId, { ...existing, leaseId: event.leaseId });
         }
+      } else if (event.event === 'goal') {
+        const existing = view.get(event.sessionId);
+        if (existing) view.set(event.sessionId, { ...existing, goalId: event.goalId });
       }
     }
     return [...view.values()];
@@ -226,7 +247,7 @@ function parseEvents(raw: string): LedgerEvent[] {
     try {
       const parsed = JSON.parse(line) as { event?: unknown; sessionId?: unknown };
       if (typeof parsed.sessionId !== 'string') continue;
-      if (parsed.event === 'spawned' || parsed.event === 'deleted' || parsed.event === 'pruned' || parsed.event === 'lease') out.push(parsed as LedgerEvent);
+      if (parsed.event === 'spawned' || parsed.event === 'deleted' || parsed.event === 'pruned' || parsed.event === 'lease' || parsed.event === 'goal') out.push(parsed as LedgerEvent);
     } catch {
       // skip a garbage / truncated line
     }

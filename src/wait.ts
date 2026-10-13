@@ -11,7 +11,7 @@
  * reconciled firing, and the cursor resets to 0 for the new ledger.
  */
 
-import { defaultConditions, callerObjectiveConditions } from './builders.ts';
+import { defaultConditions, callerObjectiveConditions, type GoalMatch } from './builders.ts';
 import type { WatchConditionSpec } from './parsers.ts';
 import { OUTCOME_EXIT_CODES } from './exit-codes.ts';
 import { classifyReceipt, isTerminalReceipt, parseWatchesWait, type Receipt, type ReceiptClassification } from './parsers.ts';
@@ -43,8 +43,8 @@ export interface WaitDeps {
   getSessionEvidence(sessionId: string): Promise<{ runs: Array<{ runId?: string; status?: string; errorCode?: string }> }>;
   /** Existence preflight: null when the registry has no such session (404). */
   getSession(sessionId: string): Promise<{ sessionId: string; status?: string } | null>;
-  /** Goal projection for goal_end classification (correction 04 item 1) and Wave K interruption facts. */
-  getGoal(sessionId: string): Promise<{ status?: string; objective?: string; pausedReason?: string | null; lastReason?: string | null; interruption?: GoalInterruptionFacts }>;
+  /** Goal projection for goal_end classification (correction 04 item 1), Wave K interruption facts, and the W2h goalId/stalled facts. */
+  getGoal(sessionId: string): Promise<{ status?: string; objective?: string; goalId?: string; stalled?: boolean; stalledForMs?: number; pausedReason?: string | null; lastReason?: string | null; interruption?: GoalInterruptionFacts }>;
   registerWatch(sessionId: string, body: Record<string, unknown>): Promise<{ watchId: string; status?: string }>;
   getWatch(sessionId: string): Promise<{ watchId: string; status?: string; conditions?: Array<{ id?: string; spec?: Record<string, unknown> }>; label?: string } | null>;
   sleep(ms: number): Promise<void>;
@@ -84,6 +84,14 @@ export interface WaitOptions {
   conditions?: WatchConditionSpec[];
   objective?: string;
   /**
+   * W2h (contract 1.62.0): the stable goal identity, when pi-orch knows it
+   * (an explicit --goal-id, or the spawn ledger filled by `goal start` /
+   * `goal show` / goal detection). With an id the goal conditions match the
+   * top-level `dataMatch {goalId}` instead of the objective forms, so a reused
+   * child's OLD goal cannot wake the wait.
+   */
+  goalId?: string;
+  /**
    * I1: true when {@link objective} was auto-DETECTED from the goal projection
    * (waitOnChild / waitOnChildren per-child detection). The projection carries
    * the STORED objective, so the single-form default conditions are exact. A
@@ -112,7 +120,7 @@ const RECOVERY_BACKOFF_MS = 1_000;
  * already-terminal receipt returns its classified outcome immediately.
  */
 async function preflightWait(
-  child: { sessionId: string; runId?: string; objective?: string },
+  child: { sessionId: string; runId?: string; objective?: string; goalId?: string },
   deps: WaitDeps,
 ): Promise<WaitOutcome | null> {
   try {
@@ -136,7 +144,7 @@ async function preflightWait(
     // Correction 04 (run-5 lesson): an OBJECTIVE-ARMED wait does not complete
     // on the brief run's receipt while the goal is unsettled — the classified
     // goal outcome is the result (goals.md: prefer goal_end).
-  if (classified?.kind === 'completed' && child.objective) {
+  if (classified?.kind === 'completed' && (child.objective !== undefined || child.goalId !== undefined)) {
       const settled = await settledGoalOutcome(child.sessionId, deps);
       if (settled) return settled;
       return null; // goal unsettled: fall through into the watch loop
@@ -159,10 +167,15 @@ async function preflightWait(
  * child must not produce an early false `completed` from a per-turn agent_end).
  * An unreadable projection or a settled/idle goal leaves the plain path.
  */
-async function detectActiveGoal(sessionId: string, deps: WaitDeps): Promise<string | null> {
+async function detectActiveGoal(sessionId: string, deps: WaitDeps): Promise<GoalMatch | null> {
   try {
     const goal = await deps.getGoal(sessionId);
-    if ((goal.status === 'running' || goal.status === 'wrapping_up') && goal.objective) return goal.objective;
+    if ((goal.status === 'running' || goal.status === 'wrapping_up') && (goal.objective || goal.goalId)) {
+      return {
+        ...(goal.objective !== undefined ? { objective: goal.objective } : {}),
+        ...(goal.goalId !== undefined ? { goalId: goal.goalId } : {}),
+      };
+    }
   } catch {
     // no readable projection: plain wait
   }
@@ -177,10 +190,15 @@ function withAutoGoalNote(outcome: WaitOutcome): WaitOutcome {
 }
 
 export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
-  if (!options.conditions && !options.objective) {
+  if (!options.conditions && !options.objective && !options.goalId) {
     const detected = await detectActiveGoal(options.sessionId, options.deps);
     if (detected) {
-      const outcome = await waitOnChildCore({ ...options, objective: detected, objectiveFromProjection: true });
+      const outcome = await waitOnChildCore({
+        ...options,
+        objective: detected.objective,
+        ...(detected.goalId !== undefined ? { goalId: detected.goalId } : {}),
+        objectiveFromProjection: true,
+      });
       return withAutoGoalNote(outcome);
     }
   }
@@ -194,7 +212,7 @@ export async function waitOnChild(options: WaitOptions): Promise<WaitOutcome> {
  * conditions to see a continue with and reports nothing.
  */
 async function waitOnChildCore(options: WaitOptions): Promise<WaitOutcome> {
-  if (!options.objective) return waitLoop(options);
+  if (!options.objective && !options.goalId) return waitLoop(options);
   const seen = new Set<string | number>();
   const outcome = await waitLoop(options, seen);
   return { autoContinues: seen.size, ...outcome };
@@ -202,17 +220,20 @@ async function waitOnChildCore(options: WaitOptions): Promise<WaitOutcome> {
 
 async function waitLoop(options: WaitOptions, seenAutoContinues?: Set<string | number>): Promise<WaitOutcome> {
   const { deps } = options;
-  const fast = await preflightWait({ sessionId: options.sessionId, runId: options.runId, objective: options.objective }, deps);
+  const fast = await preflightWait({ sessionId: options.sessionId, runId: options.runId, objective: options.objective, goalId: options.goalId }, deps);
   if (fast) return fast;
   const sliceMs = Math.min(options.sliceMs ?? 45_000, MAX_SLICE_MS);
   const start = deps.now();
+  // W2h: a stalled goal_state is PROGRESS, never a settlement. Remember that a
+  // stall was seen so the deadline outcome reports it instead of hiding it.
+  const progress: { stalled: boolean } = { stalled: false };
   // I1 (H2 item 6): a CALLER objective is matched against both its raw and its
   // stored (templated) form — the server stores applyGoalObjectiveTemplate(X)
   // and compares dataMatch.objective strictly, so raw-only conditions never
   // fire. A projection-detected objective is already the stored form.
   const conditions = options.conditions ?? (options.objectiveFromProjection
-    ? defaultConditions(options.objective, options.deadlineMs)
-    : callerObjectiveConditions(options.objective, options.deadlineMs));
+    ? defaultConditions(options.objective, options.deadlineMs, options.goalId)
+    : callerObjectiveConditions(options.objective, options.deadlineMs, options.goalId));
   const conditionsById = new Map(conditions.flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
 
   let watch = await registerOrReuse(options.sessionId, conditions, options.label, deps);
@@ -226,7 +247,7 @@ async function waitLoop(options: WaitOptions, seenAutoContinues?: Set<string | n
     const elapsed = deps.now() - start;
     const remaining = options.deadlineMs - elapsed;
     if (remaining <= 0) {
-      return { kind: 'deadline', note: `waited ${elapsed}ms without a terminal outcome` };
+      return { kind: 'deadline', note: `waited ${elapsed}ms without a terminal outcome${progress.stalled ? '; the goal reported a stall (running while its session was idle) — check the child before re-waiting' : ''}` };
     }
 
     let result: { kind: 'fired'; body: unknown } | { kind: 'timeout' };
@@ -257,7 +278,7 @@ async function waitLoop(options: WaitOptions, seenAutoContinues?: Set<string | n
       const outcome = await outcomeFromFirings(parsed.watches.flatMap((watch_) => watch_.firings), options, deps, conditionsById, () => {
         receiptChecks += 1;
         return receiptChecks;
-      }, seenAutoContinues);
+      }, seenAutoContinues, progress);
       if (outcome) return outcome;
       continue;
     }
@@ -400,6 +421,12 @@ function isAutoContinueCondition(condition: WatchConditionSpec | undefined): boo
     && (condition.dataMatch as Record<string, unknown> | undefined)?.autoContinued === true;
 }
 
+/** True when the condition is the W2h stalled-goal_state condition (stalledCondition). */
+function isStalledCondition(condition: WatchConditionSpec | undefined): boolean {
+  return condition?.eventType === 'goal_state'
+    && (condition.dataMatch as Record<string, unknown> | undefined)?.stalled === true;
+}
+
 /** Count one distinct auto-continue, keyed by detectedAt (or the cause when the server sent none). */
 function markAutoContinue(seen: Set<string | number> | undefined, interruption: GoalInterruptionFacts | undefined): void {
   if (!seen || !interruption?.autoContinued) return;
@@ -439,13 +466,27 @@ async function goalStateFiringOutcome(
   condition: WatchConditionSpec | undefined,
   deps: WaitDeps,
   seen?: Set<string | number>,
+  progress?: { stalled: boolean },
 ): Promise<WaitOutcome | null> {
   const fromAutoContinueCondition = isAutoContinueCondition(condition);
+  const fromStalledCondition = isStalledCondition(condition);
+  if (fromStalledCondition) progress && (progress.stalled = true);
   try {
     const goal = await deps.getGoal(sessionId);
     if (goal.interruption?.autoContinued) {
       markAutoContinue(seen, goal.interruption);
       return null; // progress, never a settlement
+    }
+    // W2h: a STALLED goal is not a finished one (nor a pause) — the goal still
+    // reads `running` while its session sat idle. It settles only if the
+    // projection has actually settled since; otherwise the wait keeps going and
+    // the stall is reported on the deadline outcome.
+    if (fromStalledCondition) {
+      if (goal.status === 'achieved' || goal.status === 'failed' || goal.status === 'cleared') {
+        return goalEndOutcome(sessionId, firing.evidence ?? '', deps, seen);
+      }
+      if (goal.status === 'paused' && goal.pausedReason === 'interrupted') return interruptedStopOutcome(goal);
+      return null;
     }
     if (goal.status === 'paused' && goal.pausedReason === 'interrupted') {
       return interruptedStopOutcome(goal);
@@ -453,9 +494,9 @@ async function goalStateFiringOutcome(
     if (fromAutoContinueCondition) return null; // the wake says continue; never turn it into a settlement
     return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
   } catch {
-    // Projection unreadable: an auto-continue wake stays progress; any other
-    // goal_state firing keeps today's behaviour.
-    if (fromAutoContinueCondition) return null;
+    // Projection unreadable: an auto-continue or stalled wake stays progress;
+    // any other goal_state firing keeps today's behaviour.
+    if (fromAutoContinueCondition || fromStalledCondition) return null;
     return { kind: 'paused', evidence: firing.evidence, note: 'goal paused — read the session before resuming' };
   }
 }
@@ -467,6 +508,7 @@ async function outcomeFromFirings(
   conditionsById: Map<string, WatchConditionSpec>,
   countReceiptCheck: () => void,
   seenAutoContinues?: Set<string | number>,
+  progress?: { stalled: boolean },
 ): Promise<WaitOutcome | null> {
   for (const firing of firings) {
     // Correction 04 item 2: classify by the condition ID we registered —
@@ -477,9 +519,9 @@ async function outcomeFromFirings(
       return { kind: 'question', evidence: firing.evidence, note: 'question sentinel matched' };
     }
     if (firing.eventType === 'goal_state' || condition?.eventType === 'goal_state') {
-      const outcome = await goalStateFiringOutcome(options.sessionId, firing, condition, deps, seenAutoContinues);
+      const outcome = await goalStateFiringOutcome(options.sessionId, firing, condition, deps, seenAutoContinues, progress);
       if (outcome) return outcome;
-      continue; // auto-continue: progress — keep waiting in the same poll
+      continue; // auto-continue / stall: progress — keep waiting in the same poll
     }
     if (firing.eventType === 'goal_end' || condition?.eventType === 'goal_end') {
       return goalEndOutcome(options.sessionId, firing.evidence ?? '', deps, seenAutoContinues);
@@ -494,7 +536,7 @@ async function outcomeFromFirings(
       // active — the guard settles it instead (the exact early-false-completed
       // the carried-over acceptance item exists to kill).
       if (!options.runId) {
-        if (!options.objective) {
+        if (options.objective === undefined && options.goalId === undefined) {
           const guard = await runlessGoalGuard(options.sessionId, deps, seenAutoContinues);
           if (guard === 'keep-waiting') continue;
           if (guard) return withAutoGoalNote(guard);
@@ -521,7 +563,7 @@ async function reconcileReceipt(
       // run's completion is not the goal outcome (goals.md: prefer goal_end).
       // While the projection is still unsettled, keep waiting for the
       // classified goal result; when it is settled, return it classified.
-      if (classified?.kind === 'completed' && options.objective) {
+      if (classified?.kind === 'completed' && (options.objective !== undefined || options.goalId !== undefined)) {
         return await settledGoalOutcome(options.sessionId, deps, seenAutoContinues) ?? null;
       }
       return classified;
@@ -537,7 +579,7 @@ async function reconcileReceipt(
       // Correction 05 item 2: the run-less path applies the same goal
       // settlement as the run-id path — an objective-armed wait does not
       // complete on a terminal last run while the goal is unsettled.
-      if (classified?.kind === 'completed' && options.objective) {
+      if (classified?.kind === 'completed' && (options.objective !== undefined || options.goalId !== undefined)) {
         return await settledGoalOutcome(options.sessionId, deps, seenAutoContinues) ?? null;
       }
       // C3b live-found race: the one-shot goal probe can run BEFORE the goal
@@ -545,7 +587,7 @@ async function reconcileReceipt(
       // may be on the plain path while a goal is actually active. A terminal
       // last run then must NOT end the wait — re-check the goal here (bounded:
       // once per long-poll slice) and let the goal settle it instead.
-      if (classified && !options.objective && !options.runId) {
+      if (classified && options.objective === undefined && options.goalId === undefined && !options.runId) {
         const guard = await runlessGoalGuard(options.sessionId, deps, seenAutoContinues);
         if (guard === 'keep-waiting') return null;
         if (guard) return withAutoGoalNote(guard);
@@ -635,6 +677,8 @@ export { isTerminalReceipt };
 export interface WaitChild {
   sessionId: string;
   runId?: string;
+  /** W2h: the stable goal id for this child, when the caller knows it. */
+  goalId?: string;
 }
 
 export interface WaitOnChildrenResult {
@@ -666,20 +710,21 @@ export async function waitOnChildren(options: {
   // C1 carried-over item: per-child goal detection when no objective/conditions
   // were given — a goal child in the set settles via its projection, a plain
   // child keeps the agent_end path.
-  const detectedByChild = new Map<number, string>();
+  const detectedByChild = new Map<number, GoalMatch>();
   if (!options.conditions && !options.objective) {
     for (const [index, child] of options.children.entries()) {
       const detected = await detectActiveGoal(child.sessionId, deps);
       if (detected) detectedByChild.set(index, detected);
     }
   }
-  const objectiveFor = (index: number): string | undefined => detectedByChild.get(index) ?? options.objective;
+  const objectiveFor = (index: number): string | undefined => detectedByChild.get(index)?.objective ?? options.objective;
+  const goalIdFor = (index: number): string | undefined => detectedByChild.get(index)?.goalId ?? options.children[index]?.goalId;
 
   // Fast-fail preflight per child (C3b correction 01 item 2: the preflight
   // must see each child's DETECTED objective, or an objective-armed settlement
   // read cannot keep a goal child alive through a completed brief-run receipt).
   for (const [index, child] of options.children.entries()) {
-    const fast = await preflightWait({ ...child, objective: detectedByChild.get(index) ?? options.objective }, deps);
+    const fast = await preflightWait({ ...child, objective: objectiveFor(index), goalId: goalIdFor(index) }, deps);
     if (fast) results.set(index, fast);
   }
   const exitCodeForChild = (outcome: WaitOutcome | undefined): number =>
@@ -815,12 +860,13 @@ export async function waitOnChildren(options: {
 
 function childConditions(
   options: { conditions?: WatchConditionSpec[]; objective?: string; deadlineMs: number },
-  _child: WaitChild,
-  detectedObjective?: string,
+  child: WaitChild,
+  detected?: GoalMatch,
 ): WatchConditionSpec[] {
-  if (detectedObjective !== undefined) return defaultConditions(detectedObjective, options.deadlineMs);
+  if (detected) return defaultConditions(detected.objective, options.deadlineMs, detected.goalId);
   // I1 (H2 item 6): a caller objective matches both its raw and stored forms.
-  return options.conditions ?? callerObjectiveConditions(options.objective, options.deadlineMs);
+  // W2h: a per-child goalId keys on the id instead.
+  return options.conditions ?? callerObjectiveConditions(options.objective, options.deadlineMs, child.goalId);
 }
 
 function allExitCode(children: Array<{ outcome?: WaitOutcome }>): number {

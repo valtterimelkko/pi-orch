@@ -70,6 +70,10 @@ export interface ClientConfig {
   routeLockTimeoutMs?: number;
   /** G1: warning sink (default a line on stderr). */
   onWarn?: (line: string) => void;
+  /** W2h: sleep seam for the --wait-admission loop (default a real timer). */
+  sleep?: (ms: number) => Promise<void>;
+  /** W2h: clock seam for the --wait-admission budget (default Date.now). */
+  now?: () => number;
 }
 
 /**
@@ -129,6 +133,16 @@ export class WatchDeleteAcknowledgementError extends Error {
   }
 }
 
+/**
+ * W2h (W2-f, contract 1.62.0): is this refusal the quarantined-lease admission
+ * debt the server names? Only that class is transient debt worth waiting out;
+ * every other refusal is a decision (or a different pressure) to report at once.
+ */
+export function isQuarantinedDebtRefusal(error: unknown): error is ApiError {
+  if (!(error instanceof ApiError) || error.code !== 'ADMISSION_CAPACITY_EXHAUSTED') return false;
+  return (error.data as { reason?: unknown } | undefined)?.reason === 'quarantined_debt';
+}
+
 export class PiOrchClient {
   readonly transport: Transport;
   readonly parentSessionId?: string;
@@ -141,6 +155,9 @@ export class PiOrchClient {
   private readonly spawnLockDir: string;
   private readonly routeLockTimeoutMs: number;
   private readonly onWarn: (line: string) => void;
+  /** W2h: the --wait-admission sleep/clock seams (tests inject them). */
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly now: () => number;
   private readonly warned = new Set<string>();
   /** Correction 03 item 2: parent ids discovered stale (404 on the ?parent= lookup). */
   private readonly staleParentIds = new Set<string>();
@@ -161,6 +178,8 @@ export class PiOrchClient {
     this.spawnLedger = new SpawnLedger(ledgerPath);
     this.spawnLockDir = config.spawnLockDir ?? dirname(ledgerPath);
     this.routeLockTimeoutMs = config.routeLockTimeoutMs ?? 30_000;
+    this.sleep = config.sleep ?? ((ms: number) => new Promise<void>((resolvePromise) => setTimeout(resolvePromise, ms)));
+    this.now = config.now ?? Date.now;
   }
 
   private warnOnce(line: string): void {
@@ -440,7 +459,7 @@ export class PiOrchClient {
     return entries[0]?.selector as string;
   }
 
-  async spawn(input: CreateInput & { templateFollowUp?: boolean; modelMatch?: string; routeLimit?: number; waitForSlotMs?: number }): Promise<{
+  async spawn(input: CreateInput & { templateFollowUp?: boolean; modelMatch?: string; routeLimit?: number; waitForSlotMs?: number; waitAdmissionMs?: number }): Promise<{
     sessionId: string;
     leaseId?: string;
     parentId?: string;
@@ -460,14 +479,21 @@ export class PiOrchClient {
     // The create itself, so the gate can hold the route lock ACROSS the
     // count and the create POST (correction 01 item 1: two concurrent spawns
     // at the cap must not both create).
-    const runCreate = async (recordLedger: boolean): Promise<{
+    const runCreate = async (recordLedger: boolean, skipRetry: boolean): Promise<{
       raw: Record<string, unknown>;
       retention: { leaseId?: string } | undefined;
       sessionId: string;
     }> => {
       let response: Awaited<ReturnType<Transport['request']>>;
       try {
-        response = await this.transport.request('POST', '/api/v1/sessions', { body, headers: this.headers() });
+        // W2h: with an admission budget the transport's own Retry-After loop is
+        // skipped — withAdmissionWait owns the wait, so it can happen OUTSIDE
+        // the route lock and honour the caller's budget exactly.
+        response = await this.transport.request('POST', '/api/v1/sessions', {
+          body,
+          headers: this.headers(),
+          ...(skipRetry ? { _skipRetry: true } : {}),
+        });
       } catch (error) {
         // Correction 04 item 3: POST /sessions has no server idempotency, so a
         // lost connection/response is NEVER retried — the server may have created
@@ -513,10 +539,15 @@ export class PiOrchClient {
     // route, or wait for a slot when --wait-for-slot asks for that. The
     // count→create span is serialised across processes with an exclusive
     // route lock (correction 01 item 1); the lock is held only across the
-    // count and the create POST — a --wait-for-slot wait happens OUTSIDE it.
-    const created = gate !== undefined && modelSelector
-      ? await this.spawnUnderRouteGate(modelSelector, owner, gate, input.waitForSlotMs, runCreate)
-      : await runCreate(!this.parentSessionId);
+    // count and the create POST — a --wait-for-slot or --wait-admission wait
+    // happens OUTSIDE it (each admission retry re-acquires and re-counts).
+    const skipRetry = input.waitAdmissionMs !== undefined;
+    const createOnce = async () => (gate !== undefined && modelSelector
+      ? await this.spawnUnderRouteGate(modelSelector, owner, gate, input.waitForSlotMs, (recordLedger) => runCreate(recordLedger, skipRetry))
+      : await runCreate(!this.parentSessionId, skipRetry));
+    const created = input.waitAdmissionMs !== undefined
+      ? await this.withAdmissionWait(createOnce, input.waitAdmissionMs)
+      : await createOnce();
     const { raw, retention, sessionId } = created;
     // C3b: an OPT-IN (templateFollowUp, W2-g) templated GOAL child gets the verbatim instruction paragraph as a
     // queued follow_up (the server keeps objectives single-line, so the
@@ -535,6 +566,31 @@ export class PiOrchClient {
       ...(templateFollowUpRunId !== undefined ? { templateFollowUpRunId } : {}),
       raw,
     };
+  }
+
+  /**
+   * W2h (W2-f, contract 1.62.0): run a create attempt under a --wait-admission
+   * budget. A refusal tipped over by QUARANTINED leases (429
+   * ADMISSION_CAPACITY_EXHAUSTED with reason `quarantined_debt`) is transient
+   * debt that clears on its own; the client waits the server's Retry-After and
+   * retries until the budget is spent instead of failing. Every other refusal
+   * is surfaced at once — a non-idempotent create is never retried on an
+   * unproven outcome. The thunk is the WHOLE gated create, so each retry
+   * re-acquires the route lock and re-counts (no lock is held across the wait).
+   */
+  private async withAdmissionWait<T>(create: () => Promise<T>, waitAdmissionMs: number): Promise<T> {
+    const deadline = this.now() + waitAdmissionMs;
+    for (;;) {
+      try {
+        return await create();
+      } catch (error) {
+        if (!isQuarantinedDebtRefusal(error)) throw error;
+        const remaining = deadline - this.now();
+        if (remaining <= 0) throw error;
+        const retryAfterMs = Math.max(0, (error.retryAfterSeconds ?? 5) * 1000);
+        await this.sleep(Math.min(retryAfterMs, remaining));
+      }
+    }
   }
 
   /**
@@ -801,10 +857,14 @@ export class PiOrchClient {
     // at the top level and keep the full projection under `goal`.
     const receipt = raw.receipt as { runId?: string } | undefined;
     const goal = raw.goal as Record<string, unknown> | undefined;
+    // W2h (W2-a): the start response carries the NEW goal's stable id; record it
+    // in the spawn ledger so a later wait/watch on this child keys on it.
+    const goalId = goal && typeof goal.goalId === 'string' ? goal.goalId : undefined;
+    if (goalId !== undefined) this.spawnLedger.noteGoal(sessionId, goalId);
     const flattened: Record<string, unknown> = {
       ...raw,
       ...(receipt?.runId ? { runId: receipt.runId } : {}),
-      ...(goal && typeof goal === 'object' ? { status: goal.status, objective: goal.objective, goal } : {}),
+      ...(goal && typeof goal === 'object' ? { status: goal.status, objective: goal.objective, ...(goalId !== undefined ? { goalId } : {}), goal } : {}),
     };
     if (input.completionTemplate !== false && input.templateFollowUp === true) {
       const delivery = await this.deliverGoalTemplate(sessionId, input.objective, raw);
@@ -840,7 +900,11 @@ export class PiOrchClient {
 
   async goalShow(sessionId: string): Promise<Record<string, unknown>> {
     const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() });
-    return response.body as Record<string, unknown>;
+    const body = response.body as Record<string, unknown>;
+    // W2h (W2-a): a read projection carries the same goalId the events do;
+    // record it so the next wait/watch on this child can key on it.
+    if (typeof body.goalId === 'string') this.spawnLedger.noteGoal(sessionId, body.goalId);
+    return body;
   }
 
   /**
@@ -1085,6 +1149,7 @@ export class PiOrchClient {
     runId?: string;
     conditions?: WatchConditionSpec[];
     objective?: string;
+    goalId?: string;
     deadlineMs?: number;
     label?: string;
   }): Promise<WaitOutcome> {
@@ -1093,12 +1158,16 @@ export class PiOrchClient {
     // were supplied and applies the right defaults AFTER detection; an early
     // defaultConditions() call here would bake in per-turn agent_end and
     // bypass the detection entirely.
+    // W2h: a known goal id (explicit, or recorded by goal start / goal show)
+    // keys the goal conditions on the id instead of the objective forms.
+    const goalId = options.goalId ?? this.spawnLedger.goalOf(options.sessionId);
     const deps = this.waitDeps();
     return waitOnChild({
       sessionId: options.sessionId,
       runId: options.runId,
       conditions: options.conditions,
       objective: options.objective,
+      ...(goalId !== undefined ? { goalId } : {}),
       deadlineMs: options.deadlineMs ?? this.waitDeadlineMs,
       sliceMs: this.waitSliceMs,
       label: options.label,

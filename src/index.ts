@@ -14,12 +14,17 @@ export {
   goalEnd,
   goalPaused,
   goalAutoContinue,
+  goalEndMatch,
+  goalPausedMatch,
+  goalAutoContinueMatch,
+  stalledCondition,
   questionSentinel,
   deadlineCondition,
   type CreateInput,
   type PromptInput,
   type Runtime,
   type ThinkingLevel,
+  type GoalMatch,
 } from './builders.ts';
 export {
   parseReceipt,

@@ -16,7 +16,8 @@ test('defaultConditions: goal children get goal_end+paused+auto-continue+deadlin
   assert.equal(goal.some((condition) => condition.eventType === 'agent_end'), false);
   assert.deepEqual(
     goal.filter((condition) => condition.type !== 'deadline').map((condition) => condition.eventType),
-    ['goal_end', 'goal_state', 'goal_state'],
+    ['goal_end', 'goal_state', 'goal_state', 'goal_state'],
+    'W2h added the stalled goal_state to the default goal set',
   );
   const plain = defaultConditions(undefined, 300_000);
   assert.deepEqual(
