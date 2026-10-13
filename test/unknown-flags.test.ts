@@ -141,7 +141,7 @@ test('02-correction 5: HELP no longer documents --slice', () => {
 type HelpVerbs = Map<string, Set<string>>;
 
 function helpFlagsPerVerb(help: string): HelpVerbs {
-  const known = ['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch'];
+  const known = ['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute'];
   const perVerb: HelpVerbs = new Map(known.map((verb) => [verb, new Set<string>()]));
   const lines = help.split('\n');
   let currentVerbBlock: string | null = null;

@@ -1,0 +1,1211 @@
+TAP version 13
+# Subtest: W2c deliver: a busy child on a steer-capable runtime is STEERED with requireActiveTurn
+not ok 1 - W2c deliver: a busy child on a steer-capable runtime is STEERED with requireActiveTurn
+  ---
+  duration_ms: 1.592739
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-deliver.test.ts:32:1'
+  failureType: 'testCodeFailure'
+  error: 'pi-orch: mode must be prompt, follow_up or steer'
+  code: 'ERR_TEST_FAILURE'
+  stack: |-
+    buildPromptBody (file:///home/user/pi-orch/src/builders.ts:168:11)
+    PiOrchClient.prompt (file:///home/user/pi-orch/src/client.ts:597:18)
+    async TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:34:18)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async startSubtestAfterBootstrap (node:internal/test_runner/harness:296:3)
+  ...
+# Subtest: W2c deliver: an idle child gets follow_up (it starts a new turn)
+not ok 2 - W2c deliver: an idle child gets follow_up (it starts a new turn)
+  ---
+  duration_ms: 0.32578
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-deliver.test.ts:42:1'
+  failureType: 'testCodeFailure'
+  error: 'pi-orch: mode must be prompt, follow_up or steer'
+  code: 'ERR_TEST_FAILURE'
+  stack: |-
+    buildPromptBody (file:///home/user/pi-orch/src/builders.ts:168:11)
+    PiOrchClient.prompt (file:///home/user/pi-orch/src/client.ts:597:18)
+    async TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:44:18)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c deliver: a busy child whose runtime cannot steer gets follow_up (queued) with the reason
+not ok 3 - W2c deliver: a busy child whose runtime cannot steer gets follow_up (queued) with the reason
+  ---
+  duration_ms: 0.321819
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-deliver.test.ts:51:1'
+  failureType: 'testCodeFailure'
+  error: 'pi-orch: mode must be prompt, follow_up or steer'
+  code: 'ERR_TEST_FAILURE'
+  stack: |-
+    buildPromptBody (file:///home/user/pi-orch/src/builders.ts:168:11)
+    PiOrchClient.prompt (file:///home/user/pi-orch/src/client.ts:597:18)
+    async TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:53:18)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c deliver: steer refused because the turn ended meanwhile (409) falls back to ONE follow_up
+not ok 4 - W2c deliver: steer refused because the turn ended meanwhile (409) falls back to ONE follow_up
+  ---
+  duration_ms: 1.190024
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-deliver.test.ts:59:1'
+  failureType: 'testCodeFailure'
+  error: 'pi-orch: mode must be prompt, follow_up or steer'
+  code: 'ERR_TEST_FAILURE'
+  stack: |-
+    buildPromptBody (file:///home/user/pi-orch/src/builders.ts:168:11)
+    PiOrchClient.prompt (file:///home/user/pi-orch/src/client.ts:597:18)
+    async TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:69:18)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c deliver: a non-409 steer failure propagates (no silent fallback)
+not ok 5 - W2c deliver: a non-409 steer failure propagates (no silent fallback)
+  ---
+  duration_ms: 1.090837
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-deliver.test.ts:76:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    The input did not match the regular expression /INVALID/. Input:
+    
+    'Error: pi-orch: mode must be prompt, follow_up or steer'
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected:
+  actual:
+  error: 'pi-orch: mode must be prompt, follow_up or steer'
+  stack: |-
+    buildPromptBody (file:///home/user/pi-orch/src/builders.ts:168:11)
+    PiOrchClient.prompt (file:///home/user/pi-orch/src/client.ts:597:18)
+    async waitForActual (node:assert:644:5)
+    async Function.rejects (node:assert:767:25)
+    async TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:78:3)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  operator: 'rejects'
+  stack: |-
+    async TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:78:3)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c deliver: queue depth is reported when the server reports it
+not ok 6 - W2c deliver: queue depth is reported when the server reports it
+  ---
+  duration_ms: 1.999308
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-deliver.test.ts:81:1'
+  failureType: 'testCodeFailure'
+  error: 'pi-orch: mode must be prompt, follow_up or steer'
+  code: 'ERR_TEST_FAILURE'
+  stack: |-
+    buildPromptBody (file:///home/user/pi-orch/src/builders.ts:168:11)
+    PiOrchClient.prompt (file:///home/user/pi-orch/src/client.ts:597:18)
+    async TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:87:18)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c deliver CLI: --mode deliver is accepted, other bad modes still rejected, human output names what was done
+not ok 7 - W2c deliver CLI: --mode deliver is accepted, other bad modes still rejected, human output names what was done
+  ---
+  duration_ms: 3.754977
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-deliver.test.ts:91:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    The input did not match the regular expression /delivered steer/. Input:
+    
+    'run r9\ndispatch steer'
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected:
+  actual: |-
+    run r9
+    dispatch steer
+  operator: 'match'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:101:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c deliver: builders still reject an unknown mode
+not ok 8 - W2c deliver: builders still reject an unknown mode
+  ---
+  duration_ms: 0.660875
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-deliver.test.ts:107:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    The input did not match the regular expression /mode must be/. Input:
+    
+    'Error: unexpected GET /api/v1/sessions/s1'
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected:
+  actual:
+  error: 'unexpected GET /api/v1/sessions/s1'
+  stack: |-
+    Object.request (file:///home/user/pi-orch/test/w2c-helpers.ts:34:27)
+    PiOrchClient.gatePromptStart (file:///home/user/pi-orch/src/client.ts:694:45)
+    PiOrchClient.prompt (file:///home/user/pi-orch/src/client.ts:595:18)
+    file:///home/user/pi-orch/test/w2c-deliver.test.ts:109:48
+    waitForActual (node:assert:630:21)
+    Function.rejects (node:assert:767:31)
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:109:16)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+  operator: 'rejects'
+  stack: |-
+    async TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-deliver.test.ts:109:3)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c goal: client.goalPause / goalResume / goalShow hit the goal route with exact bodies
+not ok 9 - W2c goal: client.goalPause / goalResume / goalShow hit the goal route with exact bodies
+  ---
+  duration_ms: 1.417168
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:25:1'
+  failureType: 'testCodeFailure'
+  error: 'c.goalPause is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:31:11)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.start (node:internal/test_runner/test:944:17)
+    startSubtestAfterBootstrap (node:internal/test_runner/harness:296:17)
+  ...
+# Subtest: W2c goal: CLI pause/resume/show route to the client and print the goal status
+not ok 10 - W2c goal: CLI pause/resume/show route to the client and print the goal status
+  ---
+  duration_ms: 2.013522
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:48:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    pi-orch: unknown flag(s) for 'goal': --reason
+    
+    usage: pi-orch <verb> [args] [--json]
+    
+    Verbs:
+      capabilities                         read /capabilities (contract version)
+      capacity                             read /capacity (admission preflight)
+      models [--runtime rt] [--match sub]  list live model selectors
+      spawn --runtime rt --cwd dir [...]   create a child (retention, goal, preflight)
+      goal <sessionId> start [...]         arm a goal on a CREATED child (H-b parent
+                                           pattern: create, then goal) with budget
+      watch <sessionId> register --conditions a,b [--label L] [--pin] [--fire-if-settled]
+      watch <sessionId> delete [--generation G] | list
+                                           delete is generation-safe (409 mismatch → exit 19,
+                                           nothing deleted); with no generation available it
+                                           REFUSES unless --force-unconditional (legacy blind
+                                           delete — the only unconditional path)
+      prompt <sessionId> --message text    detached dispatch with idempotency key
+      wait <sessionId> [--run-id id]       watch-based wait; never polls; deadline
+           [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
+      result <runId> [--transcript]        receipt final text + evidence pointers
+      verify <sessionId> [--run-id id]     re-check completion claims (read-only git):
+           [--since ref] [--rerun "cmd"]   commits exist in their repos (reachability
+           [--cwd dir] [--repo dir]        checked against --since), filesChanged
+           [--rerun-timeout S]             CHANGE evidence, blocked needs a reason;
+                                           --rerun runs ONLY the command you name, in
+                                           the child's cwd. Verdicts: verified (0) /
+                                           contradicted (20) / unverifiable (21)
+      cleanup <sessionId> [--lease id --owner id] [--watch id]
+                                           release the owned lease, then delete
+      status [--parent id] | [--owner id] | [sessionId]
+                                           children by parent OR by retention owner
+                                           (Claude Code parents: owner is the only
+                                           lineage): busy, goal, last run
+    
+    Scripting: use --json for full machine output, or --id-only (spawn: prints the
+    sessionId; prompt: prints the runId; watch register/list: prints the watchId)
+    for $(...) capture. never parse the human-readable output (its wording can change at any time).
+    
+    Common flags: --socket P --token-path P --api-base URL --parent-session ID --json
+      --snapshot P (compare the live /capabilities against this snapshot copy)
+    
+    Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
+      --owner ID [--ttl S] [--label L] (durable retention with your ownerId),
+      --goal-objective OBJ [--goal-max-turns N] [--goal-verify CMD]
+        [--goal-budget-tokens N] (token budget for the goal engine; the server
+        default 5,000,000 pauses long goals mid-run — programme lanes used 60M on
+        zai, ~40M DeepSeek),
+      --preflight-path P (repeatable), --preflight-tool T (repeatable),
+      --agent-os-capture enabled|disabled,
+      --route-limit 'SEL=N' (repeatable; per-call per-route concurrency cap;
+        N=0 or 'unlimited' lifts the cap; wins over PI_ORCH_ROUTE_LIMITS),
+      --wait-for-slot S (instead of refusing over the limit, watch the live
+        children on that route and spawn when one settles; exit 3 on timeout)
+    
+    Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
+      --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool,
+      --owner ID (route counting only: the per-route gate counts THIS owner's
+        live children when the prompt would start a new turn on an idle child),
+      --no-completion-template (both spawn and prompt: skip the C3b END-OF-TASK
+      REPORT instruction, which rides by default on every dispatched message and
+      on a create-time goal objective)
+    
+    Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
+      the Wave K auto-continue progress matched), --deadline S (default 1800),
+      --label L, --conditions a,b
+      (agent_end|goal_end|paused|question:TEXT|deadline:S; goal_end/paused without
+      --objective wake on ANY goal, so pass --objective on a reused child),
+      --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
+      --all settles every child, --any returns the first to settle. Unknown runs
+      or sessions fail fast (exit 16) instead of sitting out the deadline.
+      Wave K: a server auto-continue of a restart-interrupted goal child is
+      progress — the JSON reports autoContinues: <n>; a visible stop the server
+      did NOT continue settles as interrupted (exit 5) with the cause, the
+      continueCount and a resume/re-dispatch note; provider-aborted goals end
+      as before (a failed goal_end); status shows the same facts.
+    
+    Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interrupted
+      6 never started · 7 budget exceeded · 8 cancelled · 9 transport lost
+      10 admission refused · 11 preflight failed · 12 refused busy · 14 prompt not
+      executed · 15 turn stalled · 16 wait target not found · 17 goal cleared
+      18 create unknown · 19 watch conflict · 20 verify contradicted
+      21 verify unverifiable · 22 template not delivered · 23 credential in repo
+      · 24 remote api base refused · 25 route limit (G1/W0d: spawn refused before any
+      child was created; a Claude profile route defaults to the server-advertised
+      cap, and the message names the cap and the owner-authorised PAYG overflow
+      route; --wait-for-slot waits instead). Full table: README.md
+    
+    Parent patterns (J2): a Claude Code parent is not a Pi Web UI session — its
+      children carry only the --owner id (convention:
+      orch-<programme>-<parentShort8>-<lane>). To wait idle, register a watch
+      (watch ... register, or the watch-wake mod) and END THE TURN; pi-orch wait
+      blocks the caller's turn. status --owner and cleanup --owner are the lineage
+      surface; goals need --goal-budget-tokens when the child may run long.
+    
+    
+    2 !== 0
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 0
+  actual: 2
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:59:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c goal: per-action flag strictness — a flag that does not belong to the action is a usage error
+ok 11 - W2c goal: per-action flag strictness — a flag that does not belong to the action is a usage error
+  ---
+  duration_ms: 0.757605
+  type: 'test'
+  ...
+# Subtest: W2c reroute: busy goal child — pause → abort → set_model → set_thinking_level → resume with the SAME objective
+not ok 12 - W2c reroute: busy goal child — pause → abort → set_model → set_thinking_level → resume with the SAME objective
+  ---
+  duration_ms: 0.538493
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:99:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).reroute is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:101:43)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c reroute: no --thinking skips set_thinking_level
+not ok 13 - W2c reroute: no --thinking skips set_thinking_level
+  ---
+  duration_ms: 0.509859
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:125:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).reroute is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:127:27)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c reroute: a session with NO goal gets a plain abort + set_model and a note (no pause/resume)
+not ok 14 - W2c reroute: a session with NO goal gets a plain abort + set_model and a note (no pause/resume)
+  ---
+  duration_ms: 0.462138
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:131:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).reroute is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:133:43)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c reroute: a goal read that 404s/errors is treated as no-goal, never as success of a goal step
+not ok 15 - W2c reroute: a goal read that 404s/errors is treated as no-goal, never as success of a goal step
+  ---
+  duration_ms: 0.607305
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:140:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).reroute is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:144:43)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c reroute: set_model failure stops the sequence, tries ONE recovery resume, and reports the failed step
+not ok 16 - W2c reroute: set_model failure stops the sequence, tries ONE recovery resume, and reports the failed step
+  ---
+  duration_ms: 2.542695
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:149:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).reroute is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:153:43)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c reroute: an objective that changed across the resume is reported as NOT intact (ok:false)
+not ok 17 - W2c reroute: an objective that changed across the resume is reported as NOT intact (ok:false)
+  ---
+  duration_ms: 0.749189
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:164:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).reroute is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:166:43)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c reroute: a 409 on abort (nothing running) is not a failure — the step is ok with a note
+not ok 18 - W2c reroute: a 409 on abort (nothing running) is not a failure — the step is ok with a note
+  ---
+  duration_ms: 0.836539
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:172:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).reroute is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:176:43)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c reroute CLI: requires --model-selector (exit 2), rejects unknown flags, maps ok/failed to 0/1
+not ok 19 - W2c reroute CLI: requires --model-selector (exit 2), rejects unknown flags, maps ok/failed to 0/1
+  ---
+  duration_ms: 0.590479
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-goal-reroute.test.ts:181:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    pi-orch: unknown verb 'reroute'
+    
+    usage: pi-orch <verb> [args] [--json]
+    
+    Verbs:
+      capabilities                         read /capabilities (contract version)
+      capacity                             read /capacity (admission preflight)
+      models [--runtime rt] [--match sub]  list live model selectors
+      spawn --runtime rt --cwd dir [...]   create a child (retention, goal, preflight)
+      goal <sessionId> start [...]         arm a goal on a CREATED child (H-b parent
+                                           pattern: create, then goal) with budget
+      watch <sessionId> register --conditions a,b [--label L] [--pin] [--fire-if-settled]
+      watch <sessionId> delete [--generation G] | list
+                                           delete is generation-safe (409 mismatch → exit 19,
+                                           nothing deleted); with no generation available it
+                                           REFUSES unless --force-unconditional (legacy blind
+                                           delete — the only unconditional path)
+      prompt <sessionId> --message text    detached dispatch with idempotency key
+      wait <sessionId> [--run-id id]       watch-based wait; never polls; deadline
+           [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
+      result <runId> [--transcript]        receipt final text + evidence pointers
+      verify <sessionId> [--run-id id]     re-check completion claims (read-only git):
+           [--since ref] [--rerun "cmd"]   commits exist in their repos (reachability
+           [--cwd dir] [--repo dir]        checked against --since), filesChanged
+           [--rerun-timeout S]             CHANGE evidence, blocked needs a reason;
+                                           --rerun runs ONLY the command you name, in
+                                           the child's cwd. Verdicts: verified (0) /
+                                           contradicted (20) / unverifiable (21)
+      cleanup <sessionId> [--lease id --owner id] [--watch id]
+                                           release the owned lease, then delete
+      status [--parent id] | [--owner id] | [sessionId]
+                                           children by parent OR by retention owner
+                                           (Claude Code parents: owner is the only
+                                           lineage): busy, goal, last run
+    
+    Scripting: use --json for full machine output, or --id-only (spawn: prints the
+    sessionId; prompt: prints the runId; watch register/list: prints the watchId)
+    for $(...) capture. never parse the human-readable output (its wording can change at any time).
+    
+    Common flags: --socket P --token-path P --api-base URL --parent-session ID --json
+      --snapshot P (compare the live /capabilities against this snapshot copy)
+    
+    Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
+      --owner ID [--ttl S] [--label L] (durable retention with your ownerId),
+      --goal-objective OBJ [--goal-max-turns N] [--goal-verify CMD]
+        [--goal-budget-tokens N] (token budget for the goal engine; the server
+        default 5,000,000 pauses long goals mid-run — programme lanes used 60M on
+        zai, ~40M DeepSeek),
+      --preflight-path P (repeatable), --preflight-tool T (repeatable),
+      --agent-os-capture enabled|disabled,
+      --route-limit 'SEL=N' (repeatable; per-call per-route concurrency cap;
+        N=0 or 'unlimited' lifts the cap; wins over PI_ORCH_ROUTE_LIMITS),
+      --wait-for-slot S (instead of refusing over the limit, watch the live
+        children on that route and spawn when one settles; exit 3 on timeout)
+    
+    Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
+      --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool,
+      --owner ID (route counting only: the per-route gate counts THIS owner's
+        live children when the prompt would start a new turn on an idle child),
+      --no-completion-template (both spawn and prompt: skip the C3b END-OF-TASK
+      REPORT instruction, which rides by default on every dispatched message and
+      on a create-time goal objective)
+    
+    Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
+      the Wave K auto-continue progress matched), --deadline S (default 1800),
+      --label L, --conditions a,b
+      (agent_end|goal_end|paused|question:TEXT|deadline:S; goal_end/paused without
+      --objective wake on ANY goal, so pass --objective on a reused child),
+      --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
+      --all settles every child, --any returns the first to settle. Unknown runs
+      or sessions fail fast (exit 16) instead of sitting out the deadline.
+      Wave K: a server auto-continue of a restart-interrupted goal child is
+      progress — the JSON reports autoContinues: <n>; a visible stop the server
+      did NOT continue settles as interrupted (exit 5) with the cause, the
+      continueCount and a resume/re-dispatch note; provider-aborted goals end
+      as before (a failed goal_end); status shows the same facts.
+    
+    Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interrupted
+      6 never started · 7 budget exceeded · 8 cancelled · 9 transport lost
+      10 admission refused · 11 preflight failed · 12 refused busy · 14 prompt not
+      executed · 15 turn stalled · 16 wait target not found · 17 goal cleared
+      18 create unknown · 19 watch conflict · 20 verify contradicted
+      21 verify unverifiable · 22 template not delivered · 23 credential in repo
+      · 24 remote api base refused · 25 route limit (G1/W0d: spawn refused before any
+      child was created; a Claude profile route defaults to the server-advertised
+      cap, and the message names the cap and the owner-authorised PAYG overflow
+      route; --wait-for-slot waits instead). Full table: README.md
+    
+    Parent patterns (J2): a Claude Code parent is not a Pi Web UI session — its
+      children carry only the --owner id (convention:
+      orch-<programme>-<parentShort8>-<lane>). To wait idle, register a watch
+      (watch ... register, or the watch-wake mod) and END THE TURN; pi-orch wait
+      blocks the caller's turn. status --owner and cleanup --owner are the lineage
+      surface; goals need --goal-budget-tokens when the child may run long.
+    
+    
+    2 !== 0
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 0
+  actual: 2
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-goal-reroute.test.ts:192:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c result --final: receipt finalText is returned as final.text
+not ok 20 - W2c result --final: receipt finalText is returned as final.text
+  ---
+  duration_ms: 3.584305
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:25:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly deep-equal:
+    + actual - expected
+    
+    + undefined
+    - {
+    -   source: 'receipt',
+    -   text: 'All done: 3 files changed.'
+    - }
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected:
+    source: 'receipt'
+    text: 'All done: 3 files changed.'
+  operator: 'deepStrictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:31:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async startSubtestAfterBootstrap (node:internal/test_runner/harness:296:3)
+  ...
+# Subtest: W2c result --final: an EMPTY receipt (tool-call tail) falls back to the last substantive assistant text in the transcript
+not ok 21 - W2c result --final: an EMPTY receipt (tool-call tail) falls back to the last substantive assistant text in the transcript
+  ---
+  duration_ms: 0.774845
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:35:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly deep-equal:
+    + actual - expected
+    
+    + undefined
+    - {
+    -   source: 'transcript',
+    -   text: 'Here is the real summary of the work.'
+    - }
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected:
+    source: 'transcript'
+    text: 'Here is the real summary of the work.'
+  operator: 'deepStrictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:50:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c result --final: a parsed completion block is returned (with its text) and wins as the headline
+not ok 22 - W2c result --final: a parsed completion block is returned (with its text) and wins as the headline
+  ---
+  duration_ms: 0.737302
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:53:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    + actual - expected
+    
+    + undefined
+    - 'completion'
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 'completion'
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:59:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c result --final: nothing substantive anywhere → source none, never an empty string pretending to be an answer
+not ok 23 - W2c result --final: nothing substantive anywhere → source none, never an empty string pretending to be an answer
+  ---
+  duration_ms: 0.49573
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:63:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    + actual - expected
+    
+    + undefined
+    - 'none'
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 'none'
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:70:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c result --final CLI: prints just the final text (human) / the final object (json); flag accepted before or after the run id
+not ok 24 - W2c result --final CLI: prints just the final text (human) / the final object (json); flag accepted before or after the run id
+  ---
+  duration_ms: 1.077883
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:74:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    pi-orch: unknown flag(s) for 'result': --final
+    
+    usage: pi-orch <verb> [args] [--json]
+    
+    Verbs:
+      capabilities                         read /capabilities (contract version)
+      capacity                             read /capacity (admission preflight)
+      models [--runtime rt] [--match sub]  list live model selectors
+      spawn --runtime rt --cwd dir [...]   create a child (retention, goal, preflight)
+      goal <sessionId> start [...]         arm a goal on a CREATED child (H-b parent
+                                           pattern: create, then goal) with budget
+      watch <sessionId> register --conditions a,b [--label L] [--pin] [--fire-if-settled]
+      watch <sessionId> delete [--generation G] | list
+                                           delete is generation-safe (409 mismatch → exit 19,
+                                           nothing deleted); with no generation available it
+                                           REFUSES unless --force-unconditional (legacy blind
+                                           delete — the only unconditional path)
+      prompt <sessionId> --message text    detached dispatch with idempotency key
+      wait <sessionId> [--run-id id]       watch-based wait; never polls; deadline
+           [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
+      result <runId> [--transcript]        receipt final text + evidence pointers
+      verify <sessionId> [--run-id id]     re-check completion claims (read-only git):
+           [--since ref] [--rerun "cmd"]   commits exist in their repos (reachability
+           [--cwd dir] [--repo dir]        checked against --since), filesChanged
+           [--rerun-timeout S]             CHANGE evidence, blocked needs a reason;
+                                           --rerun runs ONLY the command you name, in
+                                           the child's cwd. Verdicts: verified (0) /
+                                           contradicted (20) / unverifiable (21)
+      cleanup <sessionId> [--lease id --owner id] [--watch id]
+                                           release the owned lease, then delete
+      status [--parent id] | [--owner id] | [sessionId]
+                                           children by parent OR by retention owner
+                                           (Claude Code parents: owner is the only
+                                           lineage): busy, goal, last run
+    
+    Scripting: use --json for full machine output, or --id-only (spawn: prints the
+    sessionId; prompt: prints the runId; watch register/list: prints the watchId)
+    for $(...) capture. never parse the human-readable output (its wording can change at any time).
+    
+    Common flags: --socket P --token-path P --api-base URL --parent-session ID --json
+      --snapshot P (compare the live /capabilities against this snapshot copy)
+    
+    Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
+      --owner ID [--ttl S] [--label L] (durable retention with your ownerId),
+      --goal-objective OBJ [--goal-max-turns N] [--goal-verify CMD]
+        [--goal-budget-tokens N] (token budget for the goal engine; the server
+        default 5,000,000 pauses long goals mid-run — programme lanes used 60M on
+        zai, ~40M DeepSeek),
+      --preflight-path P (repeatable), --preflight-tool T (repeatable),
+      --agent-os-capture enabled|disabled,
+      --route-limit 'SEL=N' (repeatable; per-call per-route concurrency cap;
+        N=0 or 'unlimited' lifts the cap; wins over PI_ORCH_ROUTE_LIMITS),
+      --wait-for-slot S (instead of refusing over the limit, watch the live
+        children on that route and spawn when one settles; exit 3 on timeout)
+    
+    Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
+      --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool,
+      --owner ID (route counting only: the per-route gate counts THIS owner's
+        live children when the prompt would start a new turn on an idle child),
+      --no-completion-template (both spawn and prompt: skip the C3b END-OF-TASK
+      REPORT instruction, which rides by default on every dispatched message and
+      on a create-time goal objective)
+    
+    Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
+      the Wave K auto-continue progress matched), --deadline S (default 1800),
+      --label L, --conditions a,b
+      (agent_end|goal_end|paused|question:TEXT|deadline:S; goal_end/paused without
+      --objective wake on ANY goal, so pass --objective on a reused child),
+      --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
+      --all settles every child, --any returns the first to settle. Unknown runs
+      or sessions fail fast (exit 16) instead of sitting out the deadline.
+      Wave K: a server auto-continue of a restart-interrupted goal child is
+      progress — the JSON reports autoContinues: <n>; a visible stop the server
+      did NOT continue settles as interrupted (exit 5) with the cause, the
+      continueCount and a resume/re-dispatch note; provider-aborted goals end
+      as before (a failed goal_end); status shows the same facts.
+    
+    Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interrupted
+      6 never started · 7 budget exceeded · 8 cancelled · 9 transport lost
+      10 admission refused · 11 preflight failed · 12 refused busy · 14 prompt not
+      executed · 15 turn stalled · 16 wait target not found · 17 goal cleared
+      18 create unknown · 19 watch conflict · 20 verify contradicted
+      21 verify unverifiable · 22 template not delivered · 23 credential in repo
+      · 24 remote api base refused · 25 route limit (G1/W0d: spawn refused before any
+      child was created; a Claude profile route defaults to the server-advertised
+      cap, and the message names the cap and the owner-authorised PAYG overflow
+      route; --wait-for-slot waits instead). Full table: README.md
+    
+    Parent patterns (J2): a Claude Code parent is not a Pi Web UI session — its
+      children carry only the --owner id (convention:
+      orch-<programme>-<parentShort8>-<lane>). To wait idle, register a watch
+      (watch ... register, or the watch-wake mod) and END THE TURN; pi-orch wait
+      blocks the caller's turn. status --owner and cleanup --owner are the lineage
+      surface; goals need --goal-budget-tokens when the child may run long.
+    
+    
+    2 !== 0
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 0
+  actual: 2
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:78:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c cleanup --owner: every ledger child of the owner — watch (generation-safe) → release stored lease → delete; others untouched
+not ok 25 - W2c cleanup --owner: every ledger child of the owner — watch (generation-safe) → release stored lease → delete; others untouched
+  ---
+  duration_ms: 4.192474
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:105:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).cleanupOwner is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:109:50)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c cleanup --owner: one child failing is reported and does NOT stop the others (failed child stays in the ledger)
+not ok 26 - W2c cleanup --owner: one child failing is reported and does NOT stop the others (failed child stays in the ledger)
+  ---
+  duration_ms: 2.095132
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:125:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).cleanupOwner is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:132:50)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c cleanup --owner: an already-deleted child (404) counts as cleaned and leaves the ledger
+not ok 27 - W2c cleanup --owner: an already-deleted child (404) counts as cleaned and leaves the ledger
+  ---
+  duration_ms: 0.652806
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:142:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).cleanupOwner is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:150:50)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c cleanup --owner: a ledger entry without a leaseId reads the live lease(s) from the session detail
+not ok 28 - W2c cleanup --owner: a ledger entry without a leaseId reads the live lease(s) from the session detail
+  ---
+  duration_ms: 0.852093
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:157:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).cleanupOwner is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:164:50)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c cleanup --owner: no ledger children → empty report, ok, no requests
+not ok 29 - W2c cleanup --owner: no ledger children → empty report, ok, no requests
+  ---
+  duration_ms: 0.777432
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:169:1'
+  failureType: 'testCodeFailure'
+  error: 'client(...).cleanupOwner is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:171:42)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c cleanup CLI: --owner without a sessionId is the bulk path (exit 0 / 1); neither is a usage error
+not ok 30 - W2c cleanup CLI: --owner without a sessionId is the bulk path (exit 0 / 1); neither is a usage error
+  ---
+  duration_ms: 0.587471
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:177:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    pi-orch: cleanup needs <sessionId>
+    
+    usage: pi-orch <verb> [args] [--json]
+    
+    Verbs:
+      capabilities                         read /capabilities (contract version)
+      capacity                             read /capacity (admission preflight)
+      models [--runtime rt] [--match sub]  list live model selectors
+      spawn --runtime rt --cwd dir [...]   create a child (retention, goal, preflight)
+      goal <sessionId> start [...]         arm a goal on a CREATED child (H-b parent
+                                           pattern: create, then goal) with budget
+      watch <sessionId> register --conditions a,b [--label L] [--pin] [--fire-if-settled]
+      watch <sessionId> delete [--generation G] | list
+                                           delete is generation-safe (409 mismatch → exit 19,
+                                           nothing deleted); with no generation available it
+                                           REFUSES unless --force-unconditional (legacy blind
+                                           delete — the only unconditional path)
+      prompt <sessionId> --message text    detached dispatch with idempotency key
+      wait <sessionId> [--run-id id]       watch-based wait; never polls; deadline
+           [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
+      result <runId> [--transcript]        receipt final text + evidence pointers
+      verify <sessionId> [--run-id id]     re-check completion claims (read-only git):
+           [--since ref] [--rerun "cmd"]   commits exist in their repos (reachability
+           [--cwd dir] [--repo dir]        checked against --since), filesChanged
+           [--rerun-timeout S]             CHANGE evidence, blocked needs a reason;
+                                           --rerun runs ONLY the command you name, in
+                                           the child's cwd. Verdicts: verified (0) /
+                                           contradicted (20) / unverifiable (21)
+      cleanup <sessionId> [--lease id --owner id] [--watch id]
+                                           release the owned lease, then delete
+      status [--parent id] | [--owner id] | [sessionId]
+                                           children by parent OR by retention owner
+                                           (Claude Code parents: owner is the only
+                                           lineage): busy, goal, last run
+    
+    Scripting: use --json for full machine output, or --id-only (spawn: prints the
+    sessionId; prompt: prints the runId; watch register/list: prints the watchId)
+    for $(...) capture. never parse the human-readable output (its wording can change at any time).
+    
+    Common flags: --socket P --token-path P --api-base URL --parent-session ID --json
+      --snapshot P (compare the live /capabilities against this snapshot copy)
+    
+    Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
+      --owner ID [--ttl S] [--label L] (durable retention with your ownerId),
+      --goal-objective OBJ [--goal-max-turns N] [--goal-verify CMD]
+        [--goal-budget-tokens N] (token budget for the goal engine; the server
+        default 5,000,000 pauses long goals mid-run — programme lanes used 60M on
+        zai, ~40M DeepSeek),
+      --preflight-path P (repeatable), --preflight-tool T (repeatable),
+      --agent-os-capture enabled|disabled,
+      --route-limit 'SEL=N' (repeatable; per-call per-route concurrency cap;
+        N=0 or 'unlimited' lifts the cap; wins over PI_ORCH_ROUTE_LIMITS),
+      --wait-for-slot S (instead of refusing over the limit, watch the live
+        children on that route and spawn when one settles; exit 3 on timeout)
+    
+    Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
+      --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool,
+      --owner ID (route counting only: the per-route gate counts THIS owner's
+        live children when the prompt would start a new turn on an idle child),
+      --no-completion-template (both spawn and prompt: skip the C3b END-OF-TASK
+      REPORT instruction, which rides by default on every dispatched message and
+      on a create-time goal objective)
+    
+    Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
+      the Wave K auto-continue progress matched), --deadline S (default 1800),
+      --label L, --conditions a,b
+      (agent_end|goal_end|paused|question:TEXT|deadline:S; goal_end/paused without
+      --objective wake on ANY goal, so pass --objective on a reused child),
+      --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
+      --all settles every child, --any returns the first to settle. Unknown runs
+      or sessions fail fast (exit 16) instead of sitting out the deadline.
+      Wave K: a server auto-continue of a restart-interrupted goal child is
+      progress — the JSON reports autoContinues: <n>; a visible stop the server
+      did NOT continue settles as interrupted (exit 5) with the cause, the
+      continueCount and a resume/re-dispatch note; provider-aborted goals end
+      as before (a failed goal_end); status shows the same facts.
+    
+    Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interrupted
+      6 never started · 7 budget exceeded · 8 cancelled · 9 transport lost
+      10 admission refused · 11 preflight failed · 12 refused busy · 14 prompt not
+      executed · 15 turn stalled · 16 wait target not found · 17 goal cleared
+      18 create unknown · 19 watch conflict · 20 verify contradicted
+      21 verify unverifiable · 22 template not delivered · 23 credential in repo
+      · 24 remote api base refused · 25 route limit (G1/W0d: spawn refused before any
+      child was created; a Claude profile route defaults to the server-advertised
+      cap, and the message names the cap and the owner-authorised PAYG overflow
+      route; --wait-for-slot waits instead). Full table: README.md
+    
+    Parent patterns (J2): a Claude Code parent is not a Pi Web UI session — its
+      children carry only the --owner id (convention:
+      orch-<programme>-<parentShort8>-<lane>). To wait idle, register a watch
+      (watch ... register, or the watch-wake mod) and END THE TURN; pi-orch wait
+      blocks the caller's turn. status --owner and cleanup --owner are the lineage
+      surface; goals need --goal-budget-tokens when the child may run long.
+    
+    
+    2 !== 0
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 0
+  actual: 2
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:185:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c cleanup <sid>: the single-session path takes the lease from the ledger when --lease is not given
+not ok 31 - W2c cleanup <sid>: the single-session path takes the lease from the ledger when --lease is not given
+  ---
+  duration_ms: 1.04982
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-result-cleanup.test.ts:194:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    
+    false !== true
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  actual: false
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-result-cleanup.test.ts:199:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# pi-orch: ROUTE_LIMIT_UNCOUNTED — this spawn names no --model-selector, so it is not counted against any per-route cap (caps apply only to spawns that name --model-selector)
+# Subtest: W2c status: a list row WITHOUT busy/status triggers a detail read that fills them
+not ok 32 - W2c status: a list row WITHOUT busy/status triggers a detail read that fills them
+  ---
+  duration_ms: 2.946407
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-status-ledger.test.ts:37:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    + actual - expected
+    
+    + undefined
+    - true
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-status-ledger.test.ts:44:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async startSubtestAfterBootstrap (node:internal/test_runner/harness:296:3)
+  ...
+# Subtest: W2c status: busy is derived from status when the server omits busy
+not ok 33 - W2c status: busy is derived from status when the server omits busy
+  ---
+  duration_ms: 0.739572
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-status-ledger.test.ts:48:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    + actual - expected
+    
+    + undefined
+    - true
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-status-ledger.test.ts:56:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c status: lastRun is the NEWEST run by timestamp, with runId, status and endedAt
+not ok 34 - W2c status: lastRun is the NEWEST run by timestamp, with runId, status and endedAt
+  ---
+  duration_ms: 3.822713
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-status-ledger.test.ts:60:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly deep-equal:
+    + actual - expected
+    
+      {
+    +   errorCode: undefined,
+    +   runId: 'r-old',
+    -   endedAt: '2026-10-13T09:30:00Z',
+    -   runId: 'r-new',
+        status: 'completed'
+      }
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected:
+    runId: 'r-new'
+    status: 'completed'
+    endedAt: '2026-10-13T09:30:00Z'
+  actual:
+    runId: 'r-old'
+    status: 'completed'
+  operator: 'deepStrictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-status-ledger.test.ts:72:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c status: without timestamps the first entry stays the last run (the pre-existing contract)
+ok 35 - W2c status: without timestamps the first entry stays the last run (the pre-existing contract)
+  ---
+  duration_ms: 0.458642
+  type: 'test'
+  ...
+# Subtest: W2c status: a failed read is SURFACED in readErrors, not silently turned into nulls
+not ok 36 - W2c status: a failed read is SURFACED in readErrors, not silently turned into nulls
+  ---
+  duration_ms: 0.872106
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-status-ledger.test.ts:85:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    
+    0 !== 2
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 2
+  actual: 0
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-status-ledger.test.ts:93:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c status --owner: a child missing from GET /sessions (limited list) is still listed and NOT pruned
+not ok 37 - W2c status --owner: a child missing from GET /sessions (limited list) is still listed and NOT pruned
+  ---
+  duration_ms: 1.646156
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-status-ledger.test.ts:98:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    R1 card regression: an existing idle child with a completed run is listed
+    
+    0 !== 1
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 1
+  actual: 0
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-status-ledger.test.ts:108:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c status --owner: only a 404 on the detail read prunes (the session is really gone)
+ok 38 - W2c status --owner: only a 404 on the detail read prunes (the session is really gone)
+  ---
+  duration_ms: 2.130232
+  type: 'test'
+  ...
+# Subtest: W2c status --owner: a transient detail failure keeps the child listed (with readErrors) and keeps the ledger entry
+not ok 39 - W2c status --owner: a transient detail failure keeps the child listed (with readErrors) and keeps the ledger entry
+  ---
+  duration_ms: 1.01349
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-status-ledger.test.ts:132:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    
+    0 !== 1
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 1
+  actual: 0
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-status-ledger.test.ts:141:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c ledger: an owner-tagged spawn is recorded WITH its leaseId even when the caller has a parent identity
+not ok 40 - W2c ledger: an owner-tagged spawn is recorded WITH its leaseId even when the caller has a parent identity
+  ---
+  duration_ms: 2.290954
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-status-ledger.test.ts:145:1'
+  failureType: 'testCodeFailure'
+  error: "ENOENT: no such file or directory, open '/tmp/piorch-test-ledger-sUJYgj/spawn-ledger.json'"
+  code: 'ENOENT'
+  stack: |-
+    readFileSync (node:fs:440:20)
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-status-ledger.test.ts:153:30)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: W2c ledger: record() keeps leaseId and entriesOf() returns whole entries for one owner only
+not ok 41 - W2c ledger: record() keeps leaseId and entriesOf() returns whole entries for one owner only
+  ---
+  duration_ms: 1.744714
+  type: 'test'
+  location: '/home/user/pi-orch/test/w2c-status-ledger.test.ts:157:1'
+  failureType: 'testCodeFailure'
+  error: 'book.entriesOf is not a function'
+  code: 'ERR_TEST_FAILURE'
+  name: 'TypeError'
+  stack: |-
+    TestContext.<anonymous> (file:///home/user/pi-orch/test/w2c-status-ledger.test.ts:162:25)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+1..41
+# tests 41
+# suites 0
+# pass 3
+# fail 38
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 528.987155

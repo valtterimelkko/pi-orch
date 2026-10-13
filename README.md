@@ -64,17 +64,24 @@ pi-orch spawn --runtime rt --cwd /dir [--model-selector SEL | --model-match SUB]
   [--route-limit 'SEL=N' ...] [--wait-for-slot S]
 pi-orch goal <sessionId> start --goal-objective "..." \
   [--goal-max-turns N --goal-verify CMD --goal-budget-tokens N]
+pi-orch goal <sessionId> pause [--reason R]    # pause the goal; the engine will not re-arm a turn
+pi-orch goal <sessionId> resume [--note N]     # resume the same objective
+pi-orch goal <sessionId> show                  # the goal projection: status, objective, runs
+pi-orch reroute <sessionId> --model-selector SEL [--thinking LEVEL]
+                                               # pause goal -> abort -> set_model -> resume, stepwise
 pi-orch watch <sessionId> register --conditions agent_end [--label L] [--pin] [--fire-if-settled]
 pi-orch watch <sessionId> list      # read the watch back: status, firingCount
 pi-orch watch <sessionId> delete
 pi-orch prompt <sessionId> --message "..."     # detached + idempotency key -> runId
-                                               # [--mode prompt|follow_up|steer] [--owner ID]
+                                               # [--mode prompt|follow_up|steer|deliver] [--owner ID]
 pi-orch wait <sessionId> [--run-id <runId>] [--objective "..."] [--deadline S]
 pi-orch wait --all|--any <id>[@<runId>] ...    # several children, ONE long poll
 pi-orch result <runId> [--transcript]          # final text + completion + outputClass + evidence
+pi-orch result <runId> --final                 # only the answer (completion block / last real assistant text)
 pi-orch verify <sessionId> [--run-id id] [--since ref] [--rerun "cmd"] \
   [--cwd dir] [--repo dir] [--rerun-timeout s] # re-check completion claims
 pi-orch cleanup <sessionId> [--lease id --owner id] [--watch id]
+pi-orch cleanup --owner <id>                   # EVERY ledger child of that owner (watch, lease, delete)
 pi-orch status [--parent <sessionId>] | [--owner <id>] | [<sessionId>]
                                                # children: busy, goal, last run
 pi-orch help | --help | -h                     # usage on stdout, exit 0
@@ -91,6 +98,17 @@ On a server with contract 1.60.0 or newer, a goal child whose run was cut off by
 By default every dispatched `prompt` message and every `spawn --goal-objective` asks the child to end its final answer with a fenced `completion` block (schema `pi-completion/v1`: status, summary, commands with exit codes, tests, commits, filesChanged, openIssues, blockedReason). For a goal child the instructions also tell it — in plain words — to write the exact line `Status: GOAL_ACHIEVED` on a line of its own **immediately before** the report block when the goal is met (`Status: CONTINUING` there until it is), as plain text with no decoration. The goal engine's verifier accepts the last status line anywhere in the final message, so this placement lets the report block stay the last thing in the answer while the marker stays visible: without it the two instructions conflicted (block must be last vs marker at the end) and goal children dropped the marker, looping to their turn budget. The goal form also shows every optional field's exact shape (e.g. `"tests":[{"name":"…","result":"pass"}]` — an array of objects, never a string), because children otherwise invented shapes the server rejects (`SCHEMA_VIOLATION`, fieldPath `tests`), and pins the fence format: the opening fence line must be exactly ` ```completion ` on its own line with the JSON on the next line, since a fence line carrying content is never captured as a block. Plain prompts carry the unchanged template text. The goal template rides as one queued follow-up after the arm turn; `spawn` re-sends it only when that follow-up's receipt shows a non-delivery terminal failure: `failed` (including a never-started code), or `cancelled`/`interrupted` WITHOUT a `startedAt` — a `startedAt` proves the server observed the template's user message before the restart/cancel, so a re-send would duplicate it. A `queued`, `accepted` or `started` receipt is healthy delivery-in-progress and is never re-sent, so a goal child receives the template exactly once; both attempts failing exits 22 (`TEMPLATE_NOT_DELIVERED`). `result` parses the block into `completion` / `completionError` fields; `verify` re-checks its cheap facts against the filesystem with read-only git (claimed commits exist, `filesChanged` shows change evidence, and a claimed test is re-run only when you name the exact command with `--rerun`). Use `--no-completion-template` for steering chatter that is not a task.
 
 `result` also classifies what a run output from the receipt's own evidence: `outputClass` is `command` for a slash-command handler return (a `/goal` arm prompt ends at its command boundary with no assistant text — that is by design, not an empty final answer), `final_text` when the receipt carries final text, and `no_text` otherwise (the genuinely unexplained class: assistant messages but no text).
+
+### Pausing, rerouting, delivering and cleaning up (W2c)
+
+These verbs replace the hand-written `curl` sequences long parents used to carry.
+
+- **`goal <sid> pause [--reason R] | resume [--note N] | show`** wrap the goal control route (`POST /sessions/:id/goal` with `action` `pause`/`resume`, `GET /sessions/:id/goal`). `--reason` belongs to `pause` and `--note` to `resume`; a flag that belongs to another action is a usage error, never silently dropped.
+- **`reroute <sid> --model-selector SEL [--thinking L]`** moves a goal child onto another model in the order that works: pause the goal, abort the live turn (`POST /sessions/:id/abort`), `set_model` (+ `set_thinking_level`) through `/control`, resume the goal with a short note, then re-read the goal to prove the **same objective** is running. (`set_model` on a busy child blocks until it is idle, so doing it before the abort took 45 minutes by hand.) Every step is reported (`--json` carries `steps[]`, `failedStep`, `objectiveIntact`). The first failing step stops the sequence; if the goal was paused by this call it gets ONE recovery resume so it is never left stuck, and the exit code is 1. A `409` on the abort means nothing was running and is not a failure. A session with **no active goal** gets a plain abort + `set_model` with a note — nothing is paused or resumed. A goal that was already paused is resumed at the end.
+- **`prompt --mode deliver`** is one atomic choice: if the child has a live turn and its runtime supports steering (`/capabilities` `supportsSteer`), the message is sent as `steer` with `requireActiveTurn`; otherwise as `follow_up` (which starts the next turn on an idle child, or queues behind a runtime that cannot steer). If the turn ended between the read and the send, the refused steer falls back to one `follow_up`. The output reports what was done (`deliver.chosen`, `deliver.reason`, the server's `dispatchMode`) and the queue depth when the server reports one.
+- **`status --json`** fills `busy`, `status` and `lastRun` (`runId`, `status`, `endedAt`) for each child. A list row that omits `busy`/`status` (they are optional on `GET /sessions`) triggers a detail read; `busy` falls back to `status == running`; `lastRun` is the newest run by timestamp (the evidence order is not pinned by the contract; without timestamps the first entry is used). A failed read is reported in the child's `readErrors` instead of silently producing nulls. **`status --owner`** reads each ledger child by id and prunes an entry only on a `404` — the sessions list (which can be limited) never decides that a child is gone, so an owner's existing children are listed until they are deleted. A child spawned with `--owner` is now recorded in the ledger even when the caller has a session identity.
+- **`result <runId> --final`** returns just the answer: the parsed completion block, else the receipt's final text, else the last non-empty **assistant** message in the visible transcript — never an empty tool-call tail (`final.source` says which: `completion`, `receipt`, `transcript` or `none`). Human output prints the text alone.
+- **`cleanup --owner <id>`** (no session id) cleans every child the spawn ledger holds for that owner and only that owner: cancel its watch first (generation-safe — the generation is read and sent as the precondition, a replaced watch is skipped), release the lease the spawn stored (or, for an older ledger entry, the leases the session detail reports), delete the session. A `404` anywhere means "already gone". One report line per child; a child that failed stays in the ledger so a re-run retries it, and the exit code is 1 when any child failed. `cleanup <sid>` without `--lease` now also uses the ledger's stored lease.
 
 ### Per-route child concurrency
 

@@ -118,8 +118,10 @@ test('CLI: goal start requires --goal-objective (usage error, client untouched)'
   assert.equal(called, 0, 'usage validation happens before the client factory');
 });
 
-test('CLI: goal start is the only action (pause/resume/clear stay interactive)', async () => {
-  for (const action of ['pause', 'resume', 'clear']) {
+// W2c: pause/resume/show are now verbs (test/w2c-goal-reroute.test.ts); only
+// clear (and anything unknown) stays unsupported.
+test('CLI: goal supports start|pause|resume|show — clear and unknown actions are a usage error', async () => {
+  for (const action of ['clear', 'bogus']) {
     const result = await runCli(['goal', 's1', action], fakeDeps(() => ({}) as never));
     assert.equal(result.exitCode, 2, `goal ${action} must be a usage error`);
     assert.ok((result.stderr ?? '').includes('start'), `stderr names the supported action (goal ${action})`);

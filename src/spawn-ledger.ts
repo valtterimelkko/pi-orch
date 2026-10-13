@@ -19,6 +19,8 @@ export interface LedgerEntry {
   sessionId: string;
   route?: string;
   ownerId?: string;
+  /** W2c: the retention lease the spawn acquired, so cleanup can release it without a lookup. */
+  leaseId?: string;
   parentSessionId?: string;
   at: string;
 }
@@ -62,6 +64,43 @@ export class SpawnLedger {
       return { sessionIds: live.map((entry) => entry.sessionId), pruned };
     } catch (error) {
       return { sessionIds: [], pruned: 0, note: `ledger read failed: ${(error as Error).message}` };
+    }
+  }
+
+  /**
+   * W2c: every recorded entry of one owner, unpruned. Existence is the
+   * caller's question (a per-session read; only a 404 means gone) — the
+   * sessions LIST can be limited and must never decide that a child vanished.
+   */
+  entriesOf(ownerId: string): LedgerEntry[] {
+    if (!this.path) return [];
+    try {
+      return this.readAll().filter((entry) => entry.ownerId === ownerId);
+    } catch {
+      return [];
+    }
+  }
+
+  /** W2c: drop one session's entry (cleaned up, or confirmed gone). Best-effort; never throws. */
+  remove(sessionId: string): void {
+    if (!this.path) return;
+    try {
+      const entries = this.readAll();
+      if (entries.some((entry) => entry.sessionId === sessionId)) {
+        this.writeAll(entries.filter((entry) => entry.sessionId !== sessionId));
+      }
+    } catch {
+      // best effort: a stale entry is harmless (a later 404 prunes it)
+    }
+  }
+
+  /** W2c: the lease a spawn recorded for a session. */
+  leaseOf(sessionId: string): string | undefined {
+    if (!this.path) return undefined;
+    try {
+      return this.readAll().find((entry) => entry.sessionId === sessionId)?.leaseId;
+    } catch {
+      return undefined;
     }
   }
 
