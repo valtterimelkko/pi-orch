@@ -80,12 +80,21 @@ pi-orch result <runId> [--transcript]          # final text + completion + outpu
 pi-orch result <runId> --final                 # only the answer (completion block / last real assistant text)
 pi-orch verify <sessionId> [--run-id id] [--since ref] [--rerun "cmd"] \
   [--cwd dir] [--repo dir] [--rerun-timeout s] # re-check completion claims
+pi-orch verify <sessionId> --gates-file brief.md [--gate-timeout s] [--cwd dir]
+                                               # re-run the brief's GATES: block; a red gate → exit 20
+pi-orch template [--goal]                      # print the full report instructions (paste into a brief)
 pi-orch cleanup <sessionId> [--lease id --owner id] [--watch id]
 pi-orch cleanup --owner <id>                   # EVERY ledger child of that owner (watch, lease, delete)
 pi-orch status [--parent <sessionId>] | [--owner <id>] | [<sessionId>]
                                                # children: busy, goal, last run
 pi-orch help | --help | -h                     # usage on stdout, exit 0
 ```
+
+**Completion template and goal children.** A goal child's objective carries only a short single-line pointer; the full report instructions are no longer sent as a queued follow-up message by default (a follow-up could ride into an admission leak and fail delivery). Print them with `pi-orch template --goal` (or `pi-orch template` for the plain paragraph) and paste them into the brief file the objective points to. `spawn --goal-objective … --template-follow-up` and `goal <id> start … --template-follow-up` restore the old queued follow-up; exit 22 (`TEMPLATE_NOT_DELIVERED`) can only occur with that opt-in.
+
+**Verifying gates.** A brief may end with a machine-readable block: a line `GATES:` followed by lines `- <command> → <expected exit>` (`->` is accepted too; backticks around the command are stripped). `verify <sessionId> --gates-file brief.md` runs each command in the child's cwd (the session's own, or `--cwd`) with a per-command timeout (`--gate-timeout S`, default 1800) and compares the exit status. Any gate whose exit differs makes the verdict `contradicted` (exit 20), listing each gate's expected and actual exit and the last 20 lines of its output. Verify stays read-only in intent: a gate containing `git push`, `git reset --hard`, `rm -rf /` or `npm ci`/`npm install` is refused (never run) and the verdict is `unverifiable` (exit 21). If no completion block was captured the verdict comes from the gates alone.
+
+**Ledger and audit log.** The spawn ledger is an append-only JSONL event log (`spawned`, `deleted`, `pruned`, `lease`); the live view is derived from it, and pruning or cleanup only changes the view — no record is ever deleted. An older JSON-array ledger is converted on first read and the original is kept as `<ledger>.bak`. Every CLI invocation also appends one record `{ts, verb, subverb?, owner?, parentSession?, sessionId?, exitCode, durationMs}` to `~/.pi-orch/audit.jsonl` (override with `PI_ORCH_AUDIT_PATH`) — identifiers only, never message bodies, objectives or tokens; a failure to write it never fails the command.
 
 `--json` gives machine output; the default is human-readable. `--id-only` prints the bare id for `$(...)` capture: `spawn` prints the session id, `prompt` prints the run id, `watch register`/`watch list` print the watch id. Never parse the human output — its wording can change at any time.
 
@@ -164,7 +173,8 @@ Deprecated: `wait --slice S` is accepted as a no-op with a stderr note — it ne
 | `PI_ORCH_SNAPSHOT_PATH` | Contract snapshot file override (wins over everything; see below) |
 | `PI_ORCH_PARENT_SESSION` | Explicit parent id for bare-CLI parents |
 | `PI_ORCH_ROUTE_LIMITS` | Per-route live-children cap, JSON map `{"model selector": limit}`; `0` = unlimited; a `--route-limit` flag wins |
-| `PI_ORCH_SPAWN_LEDGER` | Bare-CLI spawn ledger path (default `~/.pi-orch/spawn-ledger.json`) used to count live children by `--owner` |
+| `PI_ORCH_SPAWN_LEDGER` | Bare-CLI spawn ledger path (default `~/.pi-orch/spawn-ledger.json`; an append-only JSONL event log) used to count live children by `--owner` |
+| `PI_ORCH_AUDIT_PATH` | Verb audit log path (default `~/.pi-orch/audit.jsonl`): one JSONL record per CLI invocation |
 | `PI_ORCH_TSC` | Optional path to a TypeScript entry point for `npm run typecheck` |
 
 CLI flags `--socket`, `--token-path`, `--api-base` and `--parent-session` override the environment.
@@ -218,7 +228,7 @@ cp <server-repo>/docs/contract/internal-api-client-snapshot.json contract/
 | 19 | `WATCH_CONFLICT` | An incompatible foreign watch is active on the child; the client never replaces foreign watches |
 | 20 | `VERIFY_CONTRADICTED` | verify found at least one claim contradicted by the filesystem (missing sha, wrong repo, file with no evidence of change, failed parent-named rerun, blocked without a reason) — the block lies somewhere |
 | 21 | `VERIFY_UNVERIFIABLE` | verify could not establish the claims: no completion captured, a typed parse error, an unsafe path, no repo to check against, nothing independently checkable, or the named run belongs to another session |
-| 22 | `TEMPLATE_NOT_DELIVERED` | spawn: the goal completion-template follow-up failed both delivery attempts — the child holds only the pointer objective; re-send the template or re-dispatch |
+| 22 | `TEMPLATE_NOT_DELIVERED` | spawn/goal start with `--template-follow-up`: the goal completion-template follow-up failed both delivery attempts — the child holds only the pointer objective; re-send the template or re-dispatch |
 | 23 | `CREDENTIAL_IN_REPO` | a credential path (the Internal API token) resolves inside this repository; the token must come from outside the repo — point `PI_WEB_UI_TOKEN_PATH` at a path outside the package root |
 | 24 | `REMOTE_API_BASE_REFUSED` | `PI_WEB_UI_API_BASE` points at a non-loopback host (or a remote host over http); only a loopback API base or the Unix socket is allowed unless `PI_ORCH_ALLOW_REMOTE_API_BASE=1` is set, and even then a remote base must be `https:` |
 | 25 | `ROUTE_LIMIT` | Refused BEFORE any child was created: you already have the limit's worth of live children on that model route (busy, nonterminal run, or goal running/wrapping_up), or the server advertised a Claude profile cap (`GET /capacity` `claudeProfiles`) that is full — a server `429 PROFILE_CAPACITY_EXHAUSTED` maps here too. A Claude profile refusal names the cap and the owner-authorised PAYG overflow route. Use `--wait-for-slot` (explicit local limits only), wait manually, or spread across another route |

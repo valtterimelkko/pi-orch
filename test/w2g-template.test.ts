@@ -33,7 +33,7 @@ function recordingClient() {
   return { calls, client };
 }
 
-const prompts = (calls: Array<{ path: string }>) => calls.filter((call) => call.path.endsWith('/prompt'));
+const prompts = (calls: Array<{ path: string; body: Record<string, unknown> }>) => calls.filter((call) => call.path.endsWith('/prompt'));
 
 test('W2-g: spawn with a goal sends NO template follow-up by default (pointer objective only)', async () => {
   const { calls, client } = recordingClient();
