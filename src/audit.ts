@@ -75,7 +75,8 @@ export function auditRecordFor(
   let sessionId: string | undefined;
   if (SESSION_POSITIONAL.has(verb)) sessionId = positional[0];
   else if (verb === 'spawn' && result.exitCode === 0 && result.stdout !== undefined) sessionId = spawnedSessionId(result.stdout, flags.has('id-only'));
-  const subverb = SUBVERB_POSITIONAL.has(verb) ? positional[1] : undefined;
+  // `lane run <dir>`: the action is the first positional; goal/watch take <sessionId> first.
+  const subverb = verb === 'lane' ? positional[0] : SUBVERB_POSITIONAL.has(verb) ? positional[1] : undefined;
   return {
     ts: now.toISOString(),
     verb,

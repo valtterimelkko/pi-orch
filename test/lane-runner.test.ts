@@ -504,3 +504,25 @@ test('W4a review: an antigravity route needs no thinking (the level is in the se
   writeFileSync(join(dir, 'lane.json'), JSON.stringify({ ...base, reviewer: { runtime: 'pi', selector: 'x/z' } }));
   assert.throws(() => loadLane(dir), LaneConfigError);
 });
+
+test('W4a review-1: a sentinel question with its file is reported once; the answered question never re-exits 40', async () => {
+  const { dir } = makeLaneDir();
+  const world = new FakeWorld(dir, { waitKinds: { implementer: ['question'] }, questionFileAtWait: { wait: 1, file: '01-question.md' } });
+  const first = await runLane({ laneDir: dir }, deps(world));
+  assert.equal(first.exitCode, 40);
+  const second = await runLane({ laneDir: dir }, deps(world));
+  assert.notEqual(second.exitCode, 40, 'the already-reported 01-question.md must not trigger a second exit 40');
+});
+
+test('W4a review-3: the question sentinel is an end-anchored line pattern, not a substring a quoted directive can trip', async () => {
+  const { dir } = makeLaneDir();
+  const world = new FakeWorld(dir, {});
+  await runLane({ laneDir: dir }, deps(world));
+  const conditions = (world.watches.get('s-implementer-1')?.conditions ?? []) as Array<Record<string, unknown>>;
+  const sentinel = conditions.find((c) => c.type === 'text');
+  assert.ok(sentinel, 'a text condition is registered');
+  assert.equal(sentinel?.contains, undefined);
+  const re = new RegExp(String(sentinel?.pattern), String(sentinel?.patternFlags ?? ''));
+  assert.ok(re.test(`thinking...\n${QUESTION_SENTINEL}\n`));
+  assert.ok(!re.test(`print the line ${QUESTION_SENTINEL} on its own line, and end your turn.`));
+});

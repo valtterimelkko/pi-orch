@@ -35,7 +35,7 @@ import { appendFileSync, existsSync, readFileSync, readdirSync, renameSync, rmSy
 import { createHash } from 'node:crypto';
 import { isAbsolute, join, resolve } from 'node:path';
 import { parseGatesBlock, type Gate } from './gates.ts';
-import { callerObjectiveConditions, defaultConditions, questionSentinel } from './builders.ts';
+import { callerObjectiveConditions, defaultConditions } from './builders.ts';
 import type { WatchConditionSpec } from './parsers.ts';
 import { CLAUDE_PAYG_OVERFLOW_HINT, profileCapacityRefusalLine, type RouteLimitProfile } from './route-limits.ts';
 
@@ -645,7 +645,8 @@ async function drive(ctx: Ctx): Promise<LaneExit> {
     const base = role === 'implementer' && config.mode === 'goal'
       ? callerObjectiveConditions(goalObjective(), deadlineMs)
       : defaultConditions(undefined, deadlineMs);
-    return [...base, questionSentinel(QUESTION_SENTINEL)];
+    // End-anchored line match: a child quoting the directive mid-sentence never trips it.
+    return [...base, { id: 'question', type: 'text', pattern: `(^|\\n)${QUESTION_SENTINEL}\\s*$`, patternFlags: '', once: false }];
   };
 
   const spawnRole = async (role: Role, key: string): Promise<void> => {
@@ -704,8 +705,11 @@ async function drive(ctx: Ctx): Promise<LaneExit> {
       });
       const kind = outcome.kind;
       if (kind === 'question') {
+        // Record the files now, so a later completed turn never re-reports an answered question.
+        const asked = questionFilesIn(lane.dir).filter((name) => !state.questionsReported.includes(name));
+        state.questionsReported.push(...asked);
         state.omitRunIdFor.push(key);
-        throw new LaneExit(40, 'the child asked a question (sentinel)', { questionFiles: questionFilesIn(lane.dir), role }, `pi-orch lane: the ${role} parked with a question — read the NN-question.md file(s) in ${lane.dir}, answer the child (pi-orch prompt ${sessionOf(role)} --message ...), then re-run the lane to resume the wait.`);
+        throw new LaneExit(40, 'the child asked a question (sentinel)', { questionFiles: asked, role }, `pi-orch lane: the ${role} parked with a question — read the NN-question.md file(s) in ${lane.dir}, answer the child (pi-orch prompt ${sessionOf(role)} --message ...), then re-run the lane to resume the wait.`);
       }
       if (kind === 'deadline') {
         throw new LaneExit(3, `wait deadline elapsed while the ${role} was still working`, { role, ...(outcome.note ? { note: outcome.note } : {}) }, `pi-orch lane: DEADLINE — the ${role} is still working${outcome.note ? ` (${outcome.note})` : ''}; re-run the lane to keep waiting (the dispatch is never re-sent).`);
