@@ -191,13 +191,28 @@ export function agentEnd(id: string = nextId('done')): WatchConditionSpec {
  * goal_end filtered by the EXACT objective string. The filter matters: reusing
  * a session can clear its OLD goal first, and an unfiltered one-shot watcher
  * would consume that stale event and miss the real result.
+ *
+ * W0-a (finding F2): with NO objective the condition carries no `objective`
+ * key at all — the server matches dataMatch by strict equality, so the old
+ * `objective: '*'` default could never equal a real objective and the watch
+ * was dead on arrival. Without the filter the server wakes on any goal_end.
  */
-export function goalEnd(objective: string, id: string = nextId('outcome')): WatchConditionSpec {
-  return { id, type: 'event_type', eventType: 'goal_end', dataMatch: { objective }, once: false };
+export function goalEnd(objective?: string, id: string = nextId('outcome')): WatchConditionSpec {
+  const condition: WatchConditionSpec = { id, type: 'event_type', eventType: 'goal_end', once: false };
+  if (objective !== undefined) condition.dataMatch = { objective };
+  return condition;
 }
 
-export function goalPaused(objective: string, id: string = nextId('paused')): WatchConditionSpec {
-  return { id, type: 'event_type', eventType: 'goal_state', dataMatch: { objective, status: 'paused' }, once: false };
+/**
+ * goal_paused filtered by the EXACT objective string (same stale-goal rule as
+ * goalEnd). W0-a (finding F2): with no objective it filters on `status`
+ * ALONE — no `objective: '*'` sentinel, which the strict-equality server
+ * match could never fire; the condition then wakes on any pause.
+ */
+export function goalPaused(objective?: string, id: string = nextId('paused')): WatchConditionSpec {
+  const dataMatch: Record<string, string | number | boolean> = { status: 'paused' };
+  if (objective !== undefined) dataMatch.objective = objective;
+  return { id, type: 'event_type', eventType: 'goal_state', dataMatch, once: false };
 }
 
 /**

@@ -9,6 +9,7 @@ import {
   agentEnd,
   goalEnd,
   goalPaused,
+  goalObjectiveConditionForms,
   questionSentinel,
   deadlineCondition,
   buildPreflightSpec,
@@ -227,7 +228,8 @@ Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
 Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
   the Wave K auto-continue progress matched), --deadline S (default 1800),
   --label L, --conditions a,b
-  (agent_end|goal_end|paused|question:TEXT|deadline:S),
+  (agent_end|goal_end|paused|question:TEXT|deadline:S; goal_end/paused without
+  --objective wake on ANY goal, so pass --objective on a reused child),
   --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
   --all settles every child, --any returns the first to settle. Unknown runs
   or sessions fail fast (exit 16) instead of sitting out the deadline.
@@ -775,15 +777,30 @@ function waitForSlotSeconds(args: ParsedArgs): number {
 }
 
 function parseConditionList(raw: string, objective: string | undefined): WatchConditionSpec[] {
-  return raw.split(',').map((token) => {
+  return raw.split(',').flatMap((token) => {
     const trimmed = token.trim();
-    if (trimmed === 'agent_end') return agentEnd();
-    if (trimmed === 'goal_end') return goalEnd(objective ?? '*');
-    if (trimmed === 'paused') return goalPaused(objective ?? '*');
-    if (trimmed.startsWith('question:')) return questionSentinel(trimmed.slice('question:'.length));
-    if (trimmed.startsWith('deadline:')) return deadlineCondition(Number(trimmed.slice('deadline:'.length)));
+    if (trimmed === 'agent_end') return [agentEnd()];
+    // 01-correction (finding F2, second path): a caller-typed --objective is
+    // the RAW text; a goal spawned with the default completion template stores
+    // applyGoalObjectiveTemplate(raw), and the server matches dataMatch by
+    // strict equality. Register every form pi-orch knows (the same rule as
+    // callerObjectiveConditions) so the watch can actually fire; an
+    // already-stored objective yields one form. No objective = no filter.
+    if (trimmed === 'goal_end') return goalObjectiveForms(objective).map((form) => goalEnd(form));
+    if (trimmed === 'paused') return goalObjectiveForms(objective).map((form) => goalPaused(form));
+    if (trimmed.startsWith('question:')) return [questionSentinel(trimmed.slice('question:'.length))];
+    if (trimmed.startsWith('deadline:')) return [deadlineCondition(Number(trimmed.slice('deadline:'.length)))];
     throw new UsageError(`unknown condition '${trimmed}' (agent_end|goal_end|paused|question:TEXT|deadline:S)`);
   });
+}
+
+/**
+ * The objective forms a `--conditions goal_end|paused` token must match: the
+ * caller's raw form plus its stored (templated) expansion, or a single
+ * unfiltered condition when no objective was given.
+ */
+function goalObjectiveForms(objective: string | undefined): Array<string | undefined> {
+  return objective === undefined ? [undefined] : goalObjectiveConditionForms(objective);
 }
 
 function mapError(error: unknown): CliResult {
