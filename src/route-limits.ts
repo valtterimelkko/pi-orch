@@ -165,7 +165,11 @@ export class RouteLimitError extends Error {
   constructor(route: string, limit: number, live: Array<{ sessionId: string; reason: string }>, profile?: RouteLimitProfile) {
     const listed = live.map((entry) => `${entry.sessionId} (${entry.reason})`).join(', ');
     const base = `route '${route}' is at its limit of ${limit} live children: ${listed}. Wait for one to settle, re-run with --wait-for-slot <seconds>, or spread the children across another route`;
-    super(profile ? `${base} — ${profileCapacityRefusalLine(profile)}` : base);
+    // A server-decided profile refusal (advertised numbers) is not about this
+    // caller's children: name the profile facts, list own children only if any.
+    const serverDecided = profile !== undefined && typeof profile.maxConcurrent === 'number' && typeof profile.active === 'number';
+    const own = live.length > 0 ? ` Your live children on it: ${listed}.` : '';
+    super(serverDecided ? `route '${route}': ${profileCapacityRefusalLine(profile)}. Wait for a turn on this profile to finish or use another route.${own}` : profile ? `${base} — ${profileCapacityRefusalLine(profile)}` : base);
     this.name = 'RouteLimitError';
     this.route = route;
     this.limit = limit;

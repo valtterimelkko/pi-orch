@@ -15,7 +15,7 @@ import {
   profileCapacityFull,
   profileIdOfSelector,
 } from '../src/route-limits.ts';
-import type { TransportResponse } from '../src/transport.ts';
+import { Transport, type TransportResponse } from '../src/transport.ts';
 
 /**
  * W0d (plan W0-d, finding F8): pi-orch's per-route limit defaults to the
@@ -515,4 +515,29 @@ test('W0d/18: the bundled snapshot is the server\'s 1.61.0 (claudeProfiles + the
   assert.match(claudeProfiles.type ?? '', /Array<\{ profileId: string; maxConcurrent: number; active: number \}>/);
   assert.equal(claudeProfiles.optional, true, 'absent on older servers');
   assert.equal(snapshot.types.ModelInfo?.fields?.maxConcurrent?.type, 'number');
+});
+
+// ─── W0d review fix 1: a profile-cap 429 surfaces at once (no silent Retry-After stall) ──────────
+test('W0d/review-1: 429 PROFILE_CAPACITY_EXHAUSTED is not retried by the transport', async () => {
+  const sleeps: number[] = [];
+  let attempts = 0;
+  const transport = new Transport({
+    apiBase: 'http://127.0.0.1:1',
+    token: 't',
+    retry: { maxAttempts: 3, maxTotalWaitMs: 120_000, sleep: async (ms) => { sleeps.push(ms); } },
+  });
+  (transport as unknown as { requestOnce: unknown }).requestOnce = async () => {
+    attempts += 1;
+    return { status: 429, headers: { 'retry-after': '15' }, body: { error: 'cap', code: 'PROFILE_CAPACITY_EXHAUSTED', profileId: 'p', maxConcurrent: 8, active: 8 }, raw: '' } as TransportResponse;
+  };
+  await assert.rejects(transport.request('POST', '/api/v1/sessions/s/prompt', { body: {} }), (error: { code?: string }) => error.code === 'PROFILE_CAPACITY_EXHAUSTED');
+  assert.equal(attempts, 1, 'one attempt only');
+  assert.deepEqual(sleeps, []);
+});
+
+test('W0d/review-2: a server-decided profile refusal does not print an empty child list or suggest --wait-for-slot', () => {
+  const error = new RouteLimitError('profile:p', 8, [], { profileId: 'p', maxConcurrent: 8, active: 8 });
+  assert.doesNotMatch(error.message, /live children: \./);
+  assert.doesNotMatch(error.message, /--wait-for-slot/);
+  assert.match(error.message, /maxConcurrent 8, 8 active/);
 });

@@ -95,7 +95,10 @@ surfaces `SNAPSHOT_STALE` on stderr and in `--json`; it never blocks a command.
   text (`src/cli.ts`). The latest additions: `20/21` (verify verdicts), `22`
   (template not delivered), `23` (`CREDENTIAL_IN_REPO`), `24`
   (`REMOTE_API_BASE_REFUSED`), `25` (`ROUTE_LIMIT`, the per-route child
-  concurrency cap; `--wait-for-slot` reuses `3 DEADLINE` on timeout).
+  concurrency cap; `--wait-for-slot` reuses `3 DEADLINE` on timeout; W0d: a
+  Claude `profile:<id>` route with no explicit limit is refused when the
+  server's `/capacity` `claudeProfiles` reports `active >= maxConcurrent`, and
+  a server `429 PROFILE_CAPACITY_EXHAUSTED` maps to `25` without a retry).
 - Error mapping lives in `mapError` (`src/cli.ts`); server error codes map via
   `ERROR_CODE_EXIT_CODES`.
 
