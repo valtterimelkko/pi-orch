@@ -778,8 +778,8 @@ function parseConditionList(raw: string, objective: string | undefined): WatchCo
   return raw.split(',').map((token) => {
     const trimmed = token.trim();
     if (trimmed === 'agent_end') return agentEnd();
-    if (trimmed === 'goal_end') return goalEnd(objective ?? '*');
-    if (trimmed === 'paused') return goalPaused(objective ?? '*');
+    if (trimmed === 'goal_end') return goalEnd(objective);
+    if (trimmed === 'paused') return goalPaused(objective);
     if (trimmed.startsWith('question:')) return questionSentinel(trimmed.slice('question:'.length));
     if (trimmed.startsWith('deadline:')) return deadlineCondition(Number(trimmed.slice('deadline:'.length)));
     throw new UsageError(`unknown condition '${trimmed}' (agent_end|goal_end|paused|question:TEXT|deadline:S)`);
