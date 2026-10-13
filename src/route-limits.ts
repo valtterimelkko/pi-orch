@@ -13,7 +13,37 @@
  *   receipt, or a goal running/wrapping_up — decided from the server's own
  *   list/detail (`busy`), goal projection (`status`) and run evidence
  *   (`runChronology[0].status`) fields. A finished idle child never counts.
+ * - W0d (contract 1.61.0): a Claude SDK profile route (`profile:<id>` under
+ *   runtime `claude`) with NO explicit limit defaults to the cap the SERVER
+ *   advertises in `GET /capacity` `claudeProfiles[].maxConcurrent` minus live
+ *   server use (`claudeProfiles[].active` — it counts other parents' turns
+ *   too, so it is preferred over the local count). An older server that does
+ *   not advertise keeps the unlimited default; an explicit limit (per-call
+ *   flag, PI_ORCH_ROUTE_LIMITS, including 0 = unlimited) still wins. A refusal
+ *   on a Claude profile names the cap and the owner-authorisation route.
  */
+
+/**
+ * W0d/O2: the overflow instruction a parent must never learn only from a
+ * failed child. The PAYG route is never taken automatically — the owner
+ * authorises it after seeing the provider balance.
+ */
+export const CLAUDE_PAYG_OVERFLOW_HINT =
+  'ask the owner to authorise the PAYG overflow route pi · anthropic · anthropic/claude-sonnet-5-5 (quote the anthropic-api balance from agent-os provider-usage); never automatic';
+
+/** One profile's advertised concurrency cap and current server-side use. */
+export interface ProfileCapacity {
+  profileId: string;
+  maxConcurrent: number;
+  active: number;
+}
+
+/** The facts a refusal can name about a Claude profile (numbers only when advertised). */
+export interface RouteLimitProfile {
+  profileId: string;
+  maxConcurrent?: number;
+  active?: number;
+}
 
 export const DEFAULT_ROUTE_LIMITS: Record<string, number> = {
   'zai/glm-5.3-flash': 5,
@@ -126,17 +156,75 @@ export class RouteLimitError extends Error {
   readonly route: string;
   readonly limit: number;
   readonly live: Array<{ sessionId: string; reason: string }>;
+  /** W0d: the Claude profile this route belongs to, when it is one. */
+  readonly profile?: RouteLimitProfile;
 
-  constructor(route: string, limit: number, live: Array<{ sessionId: string; reason: string }>) {
+  constructor(route: string, limit: number, live: Array<{ sessionId: string; reason: string }>, profile?: RouteLimitProfile) {
     const listed = live.map((entry) => `${entry.sessionId} (${entry.reason})`).join(', ');
-    super(
-      `route '${route}' is at its limit of ${limit} live children: ${listed}. Wait for one to settle, re-run with --wait-for-slot <seconds>, or spread the children across another route`,
-    );
+    const base = `route '${route}' is at its limit of ${limit} live children: ${listed}. Wait for one to settle, re-run with --wait-for-slot <seconds>, or spread the children across another route`;
+    super(profile ? `${base} — ${profileCapacityRefusalLine(profile)}` : base);
     this.name = 'RouteLimitError';
     this.route = route;
     this.limit = limit;
     this.live = live;
+    if (profile) this.profile = profile;
   }
+}
+
+/** The profile id of a `profile:<id>` model selector, or undefined for any other selector. */
+export function profileIdOfSelector(selector: string | undefined): string | undefined {
+  if (typeof selector !== 'string') return undefined;
+  const match = /^profile:(.+)$/.exec(selector.trim());
+  return match?.[1];
+}
+
+/**
+ * The Claude profile capacity rows `GET /capacity` advertises (contract
+ * 1.61.0). An older server has no `claudeProfiles` at all: the honest answer
+ * is then an empty list, never a guessed default. Malformed rows are dropped —
+ * a cap the server did not actually state is never invented.
+ */
+export function advertisedProfileCapacities(capacityBody: unknown): ProfileCapacity[] {
+  if (typeof capacityBody !== 'object' || capacityBody === null) return [];
+  const rows = (capacityBody as { claudeProfiles?: unknown }).claudeProfiles;
+  if (!Array.isArray(rows)) return [];
+  const capacities: ProfileCapacity[] = [];
+  for (const row of rows) {
+    if (typeof row !== 'object' || row === null) continue;
+    const record = row as Record<string, unknown>;
+    if (typeof record.profileId !== 'string' || record.profileId === '') continue;
+    if (typeof record.maxConcurrent !== 'number' || !Number.isInteger(record.maxConcurrent)) continue;
+    if (typeof record.active !== 'number' || !Number.isInteger(record.active)) continue;
+    capacities.push({ profileId: record.profileId, maxConcurrent: record.maxConcurrent, active: record.active });
+  }
+  return capacities;
+}
+
+/** One profile's advertised capacity, or undefined when the server does not advertise it. */
+export function advertisedProfileCapacity(capacityBody: unknown, profileId: string): ProfileCapacity | undefined {
+  return advertisedProfileCapacities(capacityBody).find((capacity) => capacity.profileId === profileId);
+}
+
+/**
+ * The default cap an advertised profile yields: `maxConcurrent` minus live
+ * server use. 0 means the profile is AT its cap right now — the caller must
+ * refuse (it is not the "unlimited" spelling of the PI_ORCH_ROUTE_LIMITS map).
+ */
+export function profileCapacityLimit(capacity: ProfileCapacity): number {
+  return Math.max(0, capacity.maxConcurrent - capacity.active);
+}
+
+/**
+ * The refusal sentence for a Claude profile: names the profile, the advertised
+ * cap and the live count, and tells the parent how to get an overflow route
+ * authorised. Shared by the local gate and the server's 429 mapping so both
+ * carry the same instruction.
+ */
+export function profileCapacityRefusalLine(profile: RouteLimitProfile): string {
+  const numbers = typeof profile.maxConcurrent === 'number' && typeof profile.active === 'number'
+    ? ` (server-advertised maxConcurrent ${profile.maxConcurrent}, ${profile.active} active turn(s))`
+    : '';
+  return `Claude profile '${profile.profileId}' is at its concurrency cap${numbers}; ${CLAUDE_PAYG_OVERFLOW_HINT}`;
 }
 
 /** Thrown when --wait-for-slot ran out of time without a slot freeing up. */

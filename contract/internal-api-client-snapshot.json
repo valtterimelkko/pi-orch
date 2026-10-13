@@ -1,6 +1,6 @@
 {
   "$schema": "pi-orch-contract-snapshot/v1",
-  "contractVersion": "1.60.0",
+  "contractVersion": "1.61.0",
   "source": {
     "typeFiles": [
       "server/src/internal-api/types.ts",
@@ -51,6 +51,7 @@
     "OPENCODE_UNAVAILABLE",
     "PAYLOAD_TOO_LARGE",
     "PREFLIGHT_FAILED",
+    "PROFILE_CAPACITY_EXHAUSTED",
     "PROMPT_INJECTION",
     "PROMPT_NOT_EXECUTED",
     "PROVIDER_NOT_ALLOWED",
@@ -544,6 +545,10 @@
         "runtimes": {
           "type": "Record<string, { activeTurns: number; maxActiveTurns: number; stalledRuns?: number }>"
         },
+        "claudeProfiles": {
+          "type": "Array<{ profileId: string; maxConcurrent: number; active: number }>",
+          "optional": true
+        },
         "classes": {
           "type": "Record<string, { active: number }>",
           "optional": true
@@ -839,6 +844,10 @@
         },
         "catalogue": {
           "type": "CommandCodeCatalogueMetadata",
+          "optional": true
+        },
+        "maxConcurrent": {
+          "type": "number",
           "optional": true
         },
         "backend": {

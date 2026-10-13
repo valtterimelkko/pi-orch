@@ -40,7 +40,7 @@ function templateReceiptWantsRetry(status: string | undefined, startedAt: string
 }
 import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, type CompletionLoad } from './verify.ts';
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild, type GoalInterruptionFacts } from './wait.ts';
-import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError } from './route-limits.ts';
+import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError, advertisedProfileCapacity, profileCapacityLimit, profileIdOfSelector, type RouteLimitProfile } from './route-limits.ts';
 import { SpawnLedger, defaultLedgerPath } from './spawn-ledger.ts';
 import { validateGoalFields, GoalFieldValidationError } from './builders.ts';
 import { withRouteLock, ROUTE_LOCK_STALE_MARGIN_MS } from './route-lock.ts';
@@ -160,14 +160,53 @@ export class PiOrchClient {
     return (typeof ceiling === 'number' ? ceiling : 30_000 + 120_000) + ROUTE_LOCK_STALE_MARGIN_MS;
   }
 
-  /** The cap for one spawn/prompt call: the per-call value wins; 0 lifts the cap.
-    * A bad value is a usage-class error, never a silent unlimited (correction 01 item 6). */
-  private effectiveLimit(route: string | undefined, perCall: number | undefined): number | undefined {
+  /** The cap for one spawn/prompt call, with the Claude profile it belongs to
+    * (W0d: the profile facts ride on the exit-25 refusal so a parent is told
+    * the cap and the overflow route instead of learning them from a failure).
+    * Priority: the per-call value wins; then an explicit map entry; then — on a
+    * Claude `profile:<id>` route only — the SERVER-ADVERTISED cap minus live
+    * server use. A bad per-call value is a usage-class error, never a silent
+    * unlimited (correction 01 item 6). */
+  private async effectiveLimit(runtime: string | undefined, route: string | undefined, perCall: number | undefined): Promise<{ limit: number | undefined; profile: RouteLimitProfile | undefined }> {
     if (perCall !== undefined) {
       validateLimitValue(route ?? '(per-call)', perCall, 'route-limit');
-      return perCall > 0 ? perCall : undefined;
+      return { limit: perCall > 0 ? perCall : undefined, profile: await this.profileRouteFacts(runtime, route) };
     }
-    return limitFor(route, this.routeLimits);
+    const profile = await this.profileRouteFacts(runtime, route);
+    // An EXPLICIT entry (the env map / module config) always wins — including
+    // an explicit 0, which means "unlimited" and must not be re-capped by the
+    // server's advertised profile default.
+    if (route !== undefined && Object.prototype.hasOwnProperty.call(this.routeLimits, route)) {
+      return { limit: limitFor(route, this.routeLimits), profile };
+    }
+    if (profile !== undefined && profile.maxConcurrent !== undefined && profile.active !== undefined) {
+      // W0d: no explicit limit, a Claude profile route, and the server does
+      // advertise → the advertised cap minus live server use. 0 means "at the
+      // cap NOW", not "unlimited", so it is returned as a real cap.
+      return { limit: profileCapacityLimit({ profileId: profile.profileId, maxConcurrent: profile.maxConcurrent, active: profile.active }), profile };
+    }
+    return { limit: undefined, profile };
+  }
+
+  /**
+   * W0d: the advertised Claude profile facts for a `profile:<id>` route under
+   * runtime `claude`. Undefined for every other route (costing no request). An
+   * older server without `claudeProfiles`, or an unreadable `/capacity`,
+   * yields the profile id WITHOUT numbers — named in a refusal, but never a
+   * cap the server did not state.
+   */
+  private async profileRouteFacts(runtime: string | undefined, selector: string | undefined): Promise<RouteLimitProfile | undefined> {
+    if (runtime !== 'claude') return undefined;
+    const profileId = profileIdOfSelector(selector);
+    if (profileId === undefined) return undefined;
+    try {
+      const response = await this.transport.request('GET', '/api/v1/capacity', { headers: this.headers() });
+      const advertised = advertisedProfileCapacity(response.body, profileId);
+      if (!advertised) return { profileId };
+      return { profileId, maxConcurrent: advertised.maxConcurrent, active: advertised.active };
+    } catch {
+      return { profileId }; // capacity unreadable: name the profile, claim no numbers
+    }
   }
 
   private get capsConfigured(): boolean {
@@ -292,6 +331,7 @@ export class PiOrchClient {
     limit: number,
     live: Array<{ sessionId: string; reason: string }>,
     remainingMs: number,
+    profile?: RouteLimitProfile,
   ): Promise<void> {
     const watchBefore = await Promise.all(live.map((entry) => this.getWatch(entry.sessionId).catch(() => null)));
     const watchable = live.filter((_, index) => !(watchBefore[index] !== null && watchBefore[index]?.status === 'active'));
@@ -299,7 +339,7 @@ export class PiOrchClient {
       // Every live child carries an unremovable foreign watch: there is no
       // watchable settle to wait for. Refuse with the normal over-limit error
       // so the caller can act now.
-      throw new RouteLimitError(route, limit, live);
+      throw new RouteLimitError(route, limit, live, profile);
     }
     const oursToClean = watchable.map((entry) => entry.sessionId);
     const waited = await this.waitMany({ mode: 'any', children: watchable.map((entry) => ({ sessionId: entry.sessionId })), deadlineMs: remainingMs });
@@ -362,7 +402,7 @@ export class PiOrchClient {
     if (!modelSelector && this.capsConfigured) {
       this.warnOnce('pi-orch: ROUTE_LIMIT_UNCOUNTED — this spawn names no --model-selector, so it is not counted against any per-route cap (caps apply only to spawns that name --model-selector)');
     }
-    const routeLimit = modelSelector ? this.effectiveLimit(modelSelector, input.routeLimit) : undefined;
+    const routeLimit = modelSelector ? await this.effectiveLimit(input.runtime, modelSelector, input.routeLimit) : { limit: undefined, profile: undefined };
     const owner = input.retention?.ownerId;
     // The create itself, so the gate can hold the route lock ACROSS the
     // count and the create POST (correction 01 item 1: two concurrent spawns
@@ -416,8 +456,8 @@ export class PiOrchClient {
     // count→create span is serialised across processes with an exclusive
     // route lock (correction 01 item 1); the lock is held only across the
     // count and the create POST — a --wait-for-slot wait happens OUTSIDE it.
-    const created = routeLimit !== undefined && modelSelector
-      ? await this.spawnUnderRouteGate(modelSelector, owner, routeLimit, input.waitForSlotMs, runCreate)
+    const created = routeLimit.limit !== undefined && modelSelector
+      ? await this.spawnUnderRouteGate(modelSelector, owner, routeLimit.limit, routeLimit.profile, input.waitForSlotMs, runCreate)
       : await runCreate(!this.parentSessionId);
     const { raw, retention, sessionId } = created;
     // C3b: a templated GOAL child gets the verbatim instruction paragraph as a
@@ -450,6 +490,7 @@ export class PiOrchClient {
     route: string,
     owner: string | undefined,
     limit: number,
+    profile: RouteLimitProfile | undefined,
     waitForSlotMs: number | undefined,
     create: (recordLedger: boolean) => Promise<{ raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string }>,
   ): Promise<{ raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string }> {
@@ -468,10 +509,10 @@ export class PiOrchClient {
         return { action: 'create', response: await create(countedBy === 'owner') };
       });
       if (outcome.action === 'create') return outcome.response;
-      if (waitForSlotMs === undefined) throw new RouteLimitError(route, limit, outcome.live);
+      if (waitForSlotMs === undefined) throw new RouteLimitError(route, limit, outcome.live, profile);
       const remaining = (deadline as number) - Date.now();
       if (remaining <= 0) throw new RouteLimitWaitDeadlineError(route, limit, waitForSlotMs);
-      await this.waitForRouteSlotOnce(route, limit, outcome.live, remaining);
+      await this.waitForRouteSlotOnce(route, limit, outcome.live, remaining, profile);
       // loop: re-count under a fresh lock
     }
   }
@@ -598,7 +639,8 @@ export class PiOrchClient {
     }
     if (typeof detail !== 'object' || detail === null) return; // unreadable detail: let the POST answer
     const route = routeOfSession(detail as { modelSelector?: string; model?: string });
-    const limit = this.effectiveLimit(route, perCall);
+    const runtime = typeof (detail as { runtime?: unknown }).runtime === 'string' ? (detail as { runtime: string }).runtime : undefined;
+    const { limit, profile } = await this.effectiveLimit(runtime, route, perCall);
     if (limit === undefined) return;
     const [goal, evidence] = await Promise.all([this.goalStatusOf(sessionId), this.lastRunStatusOf(sessionId)]);
     if (liveReason({ busy: detail.busy === true, goalStatus: goal.value, lastRunStatus: evidence.value })) return; // live: no new concurrency
@@ -612,7 +654,7 @@ export class PiOrchClient {
     const owner = routeOwner ?? this.spawnLedger.ownerOf(sessionId);
     const { count, live, countedBy } = await this.countLiveOnRoute(route as string, owner);
     if (countedBy === 'none' || count < limit) return;
-    throw new RouteLimitError(route as string, limit, live);
+    throw new RouteLimitError(route as string, limit, live, profile);
   }
 
   /**
