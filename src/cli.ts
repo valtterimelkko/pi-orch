@@ -6,6 +6,7 @@
 
 import { readFileSync } from 'node:fs';
 import { PiOrchClient } from './client.ts';
+import { appendAuditRecord, auditRecordFor, defaultAuditPath } from './audit.ts';
 import { parseGatesBlock, type Gate } from './gates.ts';
 import { COMPLETION_REPORT_INSTRUCTION, GOAL_REPORT_INSTRUCTION } from './completion-template.ts';
 import {
@@ -1037,7 +1038,14 @@ export async function main(processObject: NodeJS.Process): Promise<void> {
     randomId: () => `piorch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
     client: makeClientFactory(argv),
   };
+  const startedAt = Date.now();
   const result = await runCli(argv, deps);
+  // W2-e: one audit record per invocation; best-effort, never fails the command.
+  try {
+    appendAuditRecord(defaultAuditPath(processObject.env), auditRecordFor(argv, result, processObject.env, Date.now() - startedAt));
+  } catch {
+    // ignored
+  }
   if (result.stdout !== undefined) deps.stdout(result.stdout);
   // J2 P1/P2: stderr prints whenever present — success notes (the 5M default
   // budget note) must reach the caller, not just errors.

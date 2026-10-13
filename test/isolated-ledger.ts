@@ -12,3 +12,12 @@ import { join } from 'node:path';
 export function tempLedgerPath(): string {
   return join(mkdtempSync(join(tmpdir(), 'piorch-test-ledger-')), 'spawn-ledger.json');
 }
+
+/**
+ * W2-e: a per-test temp audit-log path. Anything that runs `main()` or the
+ * real binary passes it as PI_ORCH_AUDIT_PATH so a suite run never appends to
+ * the real ~/.pi-orch/audit.jsonl.
+ */
+export function tempAuditPath(): string {
+  return join(mkdtempSync(join(tmpdir(), 'piorch-test-audit-')), 'audit.jsonl');
+}
