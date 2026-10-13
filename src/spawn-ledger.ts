@@ -11,7 +11,7 @@
  * (X-Parent-Session) is server-authoritative and never consults the ledger.
  */
 
-import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -26,14 +26,16 @@ export interface LedgerEntry {
 }
 
 /**
- * W2-e: the ledger file is an append-only JSONL event log. One line per event;
- * the VIEW (what record/entriesOf/leaseOf/ownerOf answer from) is derived by
- * folding the events in order. Nothing ever rewrites or deletes a line:
- * `deleted` (cleanup / confirmed gone) and `pruned` (the server no longer
- * lists it) only change the view; `lease` notes a lease transition.
+ * W2-e + correction 01: two files. `spawn-ledger.json` is a frozen interface —
+ * a JSON ARRAY of entries that other programmes read directly — and is the
+ * derived VIEW, rewritten atomically after every append. The append-only JSONL
+ * event log is the separate `spawn-ledger.events.jsonl` beside it (name derived
+ * from the ledger path). One line per event; nothing ever rewrites or deletes
+ * a line: `deleted` (cleanup / confirmed gone) and `pruned` (the server no
+ * longer lists it) only change the view; `lease` notes a lease transition.
  */
 export type LedgerEvent =
-  | ({ event: 'spawned'; ts: string } & LedgerEntry)
+  | ({ event: 'spawned'; ts: string; migrated?: boolean } & LedgerEntry)
   | { event: 'deleted'; ts: string; sessionId: string }
   | { event: 'pruned'; ts: string; sessionId: string }
   | { event: 'lease'; ts: string; sessionId: string; leaseId: string; action: 'acquired' | 'released' };
@@ -49,11 +51,16 @@ export class SpawnLedger {
     this.path = path;
   }
 
+  /** The append-only event log next to the view file. */
+  get eventsPath(): string | undefined {
+    if (!this.path) return undefined;
+    return this.path.endsWith('.json') ? `${this.path.slice(0, -'.json'.length)}.events.jsonl` : `${this.path}.events.jsonl`;
+  }
+
   /** Best-effort append of one `spawned` event; never throws into the spawn path. */
   record(entry: LedgerEntry): { recorded: boolean; note?: string } {
     if (!this.path) return { recorded: false, note: 'no ledger path' };
     try {
-      this.migrateIfLegacy();
       this.append({ event: 'spawned', ts: new Date().toISOString(), ...entry });
       return { recorded: true };
     } catch (error) {
@@ -146,51 +153,68 @@ export class SpawnLedger {
   events(): LedgerEvent[] {
     if (!this.path) return [];
     try {
-      this.migrateIfLegacy();
+      this.ensureEvents();
     } catch {
       // read what is there
     }
-    let raw: string;
     try {
-      raw = readFileSync(this.path, 'utf8');
+      return parseEvents(readFileSync(this.eventsPath as string, 'utf8'));
     } catch {
-      return []; // no ledger yet
+      return this.viewFileEvents(); // events file unreadable: never lose entries
     }
-    return parseEvents(raw);
   }
 
+  /** Append one event, then rewrite the view file atomically. */
   private append(event: LedgerEvent): void {
-    const path = this.path as string;
+    this.ensureEvents();
+    this.appendLine(event);
+    this.writeView();
+  }
+
+  private appendLine(event: LedgerEvent): void {
+    const path = this.eventsPath as string;
     mkdirSync(dirname(path), { recursive: true });
     const prefix = endsMidLine(path) ? '\n' : '';
     appendFileSync(path, `${prefix}${JSON.stringify(event)}\n`);
   }
 
-  /** Convert a legacy JSON-array ledger to JSONL in place, keeping the original as `<path>.bak`. */
-  private migrateIfLegacy(): void {
-    const path = this.path as string;
-    let raw: string;
+  /** The entries of the JSON-array view file, as `spawned` events (the seed / fallback source). */
+  private viewFileEvents(): LedgerEvent[] {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(this.path as string, 'utf8'));
+    } catch {
+      return [];
+    }
+    if (!Array.isArray(parsed)) return [];
+    return (parsed as LedgerEntry[])
+      .filter((entry) => entry && typeof entry.sessionId === 'string')
+      .map((entry) => ({ event: 'spawned' as const, ts: entry.at ?? new Date().toISOString(), migrated: true, ...entry }));
+  }
+
+  /**
+   * Seed the events file from the JSON view when it is missing or holds no
+   * parseable event (first run on an existing ledger, or a corrupt log), so no
+   * entry is ever lost. The view file itself is left untouched.
+   */
+  private ensureEvents(): void {
+    const path = this.eventsPath as string;
+    let raw: string | undefined;
     try {
       raw = readFileSync(path, 'utf8');
     } catch {
-      return;
+      raw = undefined;
     }
-    if (!raw.trimStart().startsWith('[')) return;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return; // not a valid legacy ledger: leave it alone
-    }
-    if (!Array.isArray(parsed)) return;
-    const backup = existsSync(`${path}.bak`) ? `${path}.bak.${Date.now()}` : `${path}.bak`;
-    copyFileSync(path, backup);
-    const body = (parsed as LedgerEntry[])
-      .filter((entry) => entry && typeof entry.sessionId === 'string')
-      .map((entry) => JSON.stringify({ event: 'spawned', ts: entry.at ?? new Date().toISOString(), ...entry }))
-      .join('\n');
+    if (raw !== undefined && parseEvents(raw).length > 0) return;
+    for (const event of this.viewFileEvents()) this.appendLine(event);
+  }
+
+  /** Rewrite the JSON-array view atomically (temp + rename). */
+  private writeView(): void {
+    const path = this.path as string;
+    mkdirSync(dirname(path), { recursive: true });
     const tmp = `${path}.tmp-${process.pid}`;
-    writeFileSync(tmp, body.length > 0 ? `${body}\n` : '');
+    writeFileSync(tmp, `${JSON.stringify(this.entries(), null, 1)}\n`);
     renameSync(tmp, path);
   }
 }

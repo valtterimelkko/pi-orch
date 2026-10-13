@@ -47,4 +47,14 @@ RESIDUAL RISKS:
 - Ledger migration on first read by two concurrent processes could race (both write the same content; .bak may be duplicated with a timestamp suffix).
 - Old pi-orch versions reading a migrated ledger will see JSONL and treat it as empty (they expect a JSON array).
 
+## Correction 01 (ledger file format is a frozen interface)
+Applied as specified. COMMIT: see `HANDBACK w2g: correction 01` (code + this section in one commit).
+- `spawn-ledger.json` is again a JSON ARRAY of the same entry objects (incl. `leaseId`), the derived view, rewritten atomically (temp + rename) after every append. The in-place JSONL migration and `.bak` are removed.
+- Append-only log is `spawn-ledger.events.jsonl` beside it (name derived from `PI_ORCH_SPAWN_LEDGER`: `x.json` -> `x.events.jsonl`, else `<path>.events.jsonl`).
+- Seeding: an existing array ledger with no events file gets one `spawned` event per entry with `migrated: true`; the `.json` is left byte-identical (test asserts). Missing or corrupt events file (no parseable line) is re-seeded from the JSON view, so no entry is lost.
+- TDD: test/w2g-ledger.test.ts rewritten first. RED `node --test test/w2g-ledger.test.ts` exit 1 (6 of 8 failed); GREEN exit 0 (8/8). Tests: `.json` parses as an array with ownerId/leaseId after spawn/prune/cleanup/lease; events file byte length strictly grows across record/prune/lease/remove; seeding; corrupt/missing fallback; filename derivation.
+- GATES: `env NODE_ENV=test npm test` -> 0 (485 pass, 0 fail); also exit 0 with HOME = empty temp dir and PI_WEB_UI_REPO unset. `tsc -p tsconfig.json` with scratch @types/node -> 0 (`npm run typecheck` still fails in this container only on the missing @types/node, as before).
+- Residual risk removed: old readers of `spawn-ledger.json` keep working. New: a writer that edits the array directly (not via pi-orch) is not reflected in the event log until the next seed condition; the view is rewritten from the log on the next pi-orch write.
+- HOST FOLLOW-UP: after a real spawn, `node -e 'console.log(Array.isArray(JSON.parse(require("fs").readFileSync(process.env.HOME+"/.pi-orch/spawn-ledger.json"))))'` -> true, and `~/.pi-orch/spawn-ledger.events.jsonl` exists.
+
 FROZEN
