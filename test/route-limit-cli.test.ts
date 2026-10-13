@@ -1,3 +1,4 @@
+import { tempAuditPath } from './isolated-ledger.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -191,7 +192,7 @@ test('correction03/4: the REAL binary maps --route-limit bad to exit 2 with a us
   const bin = new URL('../bin/pi-orch', import.meta.url).pathname;
   const run = spawnSync(process.execPath, [bin, 'spawn', '--runtime', 'pi', '--cwd', '/tmp', '--model-selector', 'zai/glm-5.3-flash', '--route-limit', 'bad'], {
     encoding: 'utf8',
-    env: { ...process.env, NODE_ENV: 'test' },
+    env: { ...process.env, NODE_ENV: 'test', PI_ORCH_AUDIT_PATH: tempAuditPath() },
     timeout: 30_000,
   });
   assert.equal(run.status, 2, `expected usage exit 2, got ${run.status}; stderr head: ${(run.stderr ?? '').slice(0, 200)}`);

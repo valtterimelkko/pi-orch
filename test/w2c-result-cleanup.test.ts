@@ -118,7 +118,7 @@ test('W2c cleanup --owner: every ledger child of the owner — watch (generation
   ]);
   assert.deepEqual(forA[1]?.body, { expectedGeneration: 'g-a' }, 'the watch delete carries the CAS generation');
   assert.deepEqual(forA[2]?.body, { action: 'release_retention', retentionLeaseId: 'LA', ownerId: 'me' });
-  const left = JSON.parse(readFileSync(ledger, 'utf8')) as Array<{ sessionId: string }>;
+  const left = new SpawnLedger(ledger).entries() as Array<{ sessionId: string }>;
   assert.deepEqual(left.map((entry) => entry.sessionId), ['x'], 'cleaned children leave the ledger; the other owner’s entry stays');
 });
 
@@ -135,7 +135,7 @@ test('W2c cleanup --owner: one child failing is reported and does NOT stop the o
   assert.match(first?.error ?? '', /INTERNAL/);
   assert.equal(second?.deleted, true);
   assert.equal(report.ok, false);
-  const left = (JSON.parse(readFileSync(ledger, 'utf8')) as Array<{ sessionId: string }>).map((entry) => entry.sessionId).sort();
+  const left = (new SpawnLedger(ledger).entries() as Array<{ sessionId: string }>).map((entry) => entry.sessionId).sort();
   assert.deepEqual(left, ['a', 'x']);
 });
 
@@ -151,7 +151,7 @@ test('W2c cleanup --owner: an already-deleted child (404) counts as cleaned and 
   assert.equal(report.children[0]?.deleted, true);
   assert.match(report.children[0]?.notes.join(' ') ?? '', /already gone|not found/i);
   assert.equal(report.ok, true);
-  assert.equal((JSON.parse(readFileSync(ledger, 'utf8')) as unknown[]).length, 0);
+  assert.equal((new SpawnLedger(ledger).entries() as unknown[]).length, 0);
 });
 
 test('W2c cleanup --owner: a ledger entry without a leaseId reads the live lease(s) from the session detail', async () => {

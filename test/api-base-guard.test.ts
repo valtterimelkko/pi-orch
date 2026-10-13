@@ -1,3 +1,4 @@
+import { tempAuditPath } from './isolated-ledger.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -86,7 +87,7 @@ test('bin/pi-orch refuses a remote API base end to end (exit 24, no connection)'
     const run = spawnSync(
       process.execPath,
       [join(REPO, 'bin', 'pi-orch'), 'capabilities', '--api-base', 'http://example.com:9', '--token-path', token],
-      { encoding: 'utf8' },
+      { encoding: 'utf8', env: { ...process.env, PI_ORCH_AUDIT_PATH: tempAuditPath() } },
     );
     assert.equal(run.status, 24, `stderr: ${run.stderr}`);
     assert.match(run.stderr, /REMOTE_API_BASE_REFUSED/);
@@ -95,7 +96,7 @@ test('bin/pi-orch refuses a remote API base end to end (exit 24, no connection)'
     const optIn = spawnSync(
       process.execPath,
       [join(REPO, 'bin', 'pi-orch'), 'capabilities', '--api-base', 'http://example.com:9', '--token-path', token],
-      { encoding: 'utf8', env: { ...process.env, PI_ORCH_ALLOW_REMOTE_API_BASE: '1' } },
+      { encoding: 'utf8', env: { ...process.env, PI_ORCH_ALLOW_REMOTE_API_BASE: '1', PI_ORCH_AUDIT_PATH: tempAuditPath() } },
     );
     assert.equal(optIn.status, 24, 'remote http stays refused even with the opt-in');
   } finally {

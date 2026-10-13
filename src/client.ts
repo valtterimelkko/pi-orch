@@ -440,7 +440,7 @@ export class PiOrchClient {
     return entries[0]?.selector as string;
   }
 
-  async spawn(input: CreateInput & { modelMatch?: string; routeLimit?: number; waitForSlotMs?: number }): Promise<{
+  async spawn(input: CreateInput & { templateFollowUp?: boolean; modelMatch?: string; routeLimit?: number; waitForSlotMs?: number }): Promise<{
     sessionId: string;
     leaseId?: string;
     parentId?: string;
@@ -518,12 +518,12 @@ export class PiOrchClient {
       ? await this.spawnUnderRouteGate(modelSelector, owner, gate, input.waitForSlotMs, runCreate)
       : await runCreate(!this.parentSessionId);
     const { raw, retention, sessionId } = created;
-    // C3b: a templated GOAL child gets the verbatim instruction paragraph as a
+    // C3b: an OPT-IN (templateFollowUp, W2-g) templated GOAL child gets the verbatim instruction paragraph as a
     // queued follow_up (the server keeps objectives single-line, so the
     // objective carries only the flattened pointer). follow_up queues on the
     // busy arm turn and delivers after it — the C3a live-proven sequencing.
     let templateFollowUpRunId: string | undefined;
-    if (input.goal && input.completionTemplate !== false) {
+    if (input.goal && input.completionTemplate !== false && input.templateFollowUp === true) {
       const delivery = await this.deliverGoalTemplate(sessionId, input.goal.objective, raw);
       templateFollowUpRunId = delivery;
     }
@@ -776,7 +776,7 @@ export class PiOrchClient {
    * The Phase A replay had no way to do this from pi-orch (`pi-orch goal` was
    * an unknown verb). Start-only: pause/resume/clear stay interactive.
    */
-  async goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number; completionTemplate?: boolean }): Promise<Record<string, unknown>> {
+  async goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number; completionTemplate?: boolean; templateFollowUp?: boolean }): Promise<Record<string, unknown>> {
     // 02-correction 1: the shared validator — the Luna probe sent
     // budgetTokens 1000000000000 because only the create path validated.
     validateGoalFields(input);
@@ -806,7 +806,7 @@ export class PiOrchClient {
       ...(receipt?.runId ? { runId: receipt.runId } : {}),
       ...(goal && typeof goal === 'object' ? { status: goal.status, objective: goal.objective, goal } : {}),
     };
-    if (input.completionTemplate !== false) {
+    if (input.completionTemplate !== false && input.templateFollowUp === true) {
       const delivery = await this.deliverGoalTemplate(sessionId, input.objective, raw);
       if (delivery !== undefined) flattened.templateFollowUpRunId = delivery;
     }
@@ -1325,7 +1325,17 @@ export class PiOrchClient {
         ? { ...(resolvedSurface.completion !== undefined ? { block: resolvedSurface.completion } : {}), ...(resolvedSurface.error !== undefined ? { error: resolvedSurface.error } : {}), source: resolvedSurface.source }
         : {};
     };
-    return verifyChild(input, deps, loadCompletion);
+    // W2-g: gates run in the child's cwd — --cwd when given, else the session's own.
+    let effective = input;
+    if (input.gates !== undefined && input.cwd === undefined) {
+      try {
+        const detail = (await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(input.sessionId)}`, { headers: this.headers() })).body as { cwd?: unknown };
+        if (typeof detail?.cwd === 'string' && detail.cwd.length > 0) effective = { ...input, cwd: detail.cwd };
+      } catch {
+        // unreadable detail: the gates report 'no cwd available' rather than guess
+      }
+    }
+    return verifyChild(effective, deps, loadCompletion);
   }
 
   async cleanup(sessionId: string, options: { leaseId?: string; ownerId?: string; watchId?: string } = {}): Promise<{
@@ -1355,6 +1365,7 @@ export class PiOrchClient {
           headers: this.headers(),
         });
         released = true;
+        this.spawnLedger.noteLease(sessionId, leaseId, 'released');
       } catch (error) {
         notes.push(`lease release failed: ${(error as Error).message}`);
       }
@@ -1407,6 +1418,7 @@ export class PiOrchClient {
             body: { action: 'release_retention', retentionLeaseId: leaseId, ownerId },
             headers: this.headers(),
           });
+          this.spawnLedger.noteLease(sessionId, leaseId, 'released');
         } catch (error) {
           releasedAll = false;
           if (gone(error)) {

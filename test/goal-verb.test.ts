@@ -231,7 +231,7 @@ test('02-correction 3: goal start templates the objective and delivers the follo
     },
   } as never;
   const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
-  const body = await client.goalStart('s1', { objective: 'Do the bounded thing' });
+  const body = await client.goalStart('s1', { objective: 'Do the bounded thing', templateFollowUp: true });
   const goalCall = calls.find((call) => call.path?.endsWith('/goal'));
   assert.ok(goalCall, 'goal control was called');
   assert.match(String((goalCall?.body as { objective?: string }).objective), /pi-completion\/v1/, 'the objective carries the flattened completion pointer');

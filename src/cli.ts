@@ -4,7 +4,11 @@
  * factory) so no test needs a server or a real process.
  */
 
+import { readFileSync } from 'node:fs';
 import { PiOrchClient } from './client.ts';
+import { appendAuditRecord, auditRecordFor, defaultAuditPath } from './audit.ts';
+import { parseGatesBlock, type Gate } from './gates.ts';
+import { COMPLETION_REPORT_INSTRUCTION, GOAL_REPORT_INSTRUCTION } from './completion-template.ts';
 import {
   agentEnd,
   goalEnd,
@@ -29,7 +33,7 @@ export interface ClientLike {
   goalShow(sessionId: string): Promise<Record<string, unknown>>;
   reroute(sessionId: string, input: { modelSelector: string; thinking?: string }): Promise<{ ok: boolean; hadGoal: boolean; failedStep?: string; note?: string; objectiveIntact?: boolean; steps: Array<{ step: string; ok: boolean; detail: string }>; [key: string]: unknown }>;
   cleanupOwner(ownerId: string): Promise<{ owner: string; ok: boolean; children: Array<{ sessionId: string; watchDeleted: boolean; released: boolean; deleted: boolean; notes: string[]; error?: string }> }>;
-  goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number; completionTemplate?: boolean }): Promise<Record<string, unknown>>;
+  goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number; completionTemplate?: boolean; templateFollowUp?: boolean }): Promise<Record<string, unknown>>;
   registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; generation?: string; raw: unknown }>;
   getWatch(sessionId: string): Promise<{ watchId: string; status?: string; label?: string; generation?: string; firingCount?: number; allFired?: boolean; firings?: Array<Record<string, unknown>> } | null>;
   deleteWatch(sessionId: string, options?: { expectedGeneration?: string }): Promise<{ success?: boolean; watchId?: string; generation?: string }>;
@@ -37,7 +41,7 @@ export interface ClientLike {
   prompt(sessionId: string, input: Record<string, unknown>): Promise<{ runId: string; sessionId: string; detached: boolean; duplicate: boolean; dispatchMode?: string; queueDepth?: number; deliver?: { chosen: string; busy: boolean; reason: string } }>;
   wait(options: { sessionId: string; runId?: string; conditions?: WatchConditionSpec[]; objective?: string; deadlineMs?: number; label?: string }): Promise<{ kind: string; [key: string]: unknown }>;
   result(runId: string, options?: { includeTranscript?: boolean; final?: boolean }): Promise<Record<string, unknown>>;
-  verify(input: { sessionId: string; runId?: string }): Promise<{ implemented: false; plannedBy: string } | { sessionId: string; verdict: string; claims: Array<Record<string, unknown>>; summary: string }>;
+  verify(input: { sessionId: string; runId?: string; gates?: Gate[]; gateTimeoutMs?: number; [key: string]: unknown }): Promise<{ implemented: false; plannedBy: string } | { sessionId: string; verdict: string; claims: Array<Record<string, unknown>>; summary: string }>;
   cleanup(sessionId: string, options?: { leaseId?: string; ownerId?: string; watchId?: string }): Promise<{ released: boolean; deleted: boolean; notes: string[] }>;
   status(target: { parent?: string; sessionId?: string; owner?: string }): Promise<{ parent?: string; owner?: string; pruned?: number; children: Array<Record<string, unknown>> }>;
   models(runtime?: string): Promise<Array<Record<string, unknown>>>;
@@ -71,7 +75,7 @@ interface ParsedArgs {
 
 const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool', 'route-limit']);
 /** Flags that never consume the following token (so `--all c1@r1` keeps the id positional). */
-const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled', 'force-unconditional', 'final']);
+const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled', 'force-unconditional', 'final', 'template-follow-up', 'goal']);
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const verb = argv[0] ?? '';
@@ -187,6 +191,11 @@ Verbs:
                                        (+ thinking) → resume the SAME objective, each
                                        step reported; a session with no goal gets a
                                        plain abort + set_model; exit 1 on a failed step
+  template [--goal]                    print the full END-OF-TASK report instructions (paste them into
+                                       the brief file a goal objective points to; --goal adds the
+                                       Status marker + field shapes). A goal child no longer gets
+                                       them as a queued follow-up unless the opt-in flag under
+                                       Spawn flags is passed
   watch <sessionId> register --conditions a,b [--label L] [--pin] [--fire-if-settled]
   watch <sessionId> delete [--generation G] | list
                                        delete is generation-safe (409 mismatch → exit 19,
@@ -210,6 +219,13 @@ Verbs:
                                        --rerun runs ONLY the command you name, in
                                        the child's cwd. Verdicts: verified (0) /
                                        contradicted (20) / unverifiable (21)
+       [--gates-file brief.md]         re-run the GATES: block ('- <cmd> → <exit>' lines)
+       [--gate-timeout S]              of a brief in the child's cwd (or --cwd), default
+                                       1800s per gate; a gate whose exit differs →
+                                       contradicted (20) with expected/actual and the
+                                       last 20 output lines; a gate that pushes, hard-resets,
+                                       runs rm -rf at the root, or npm ci/install is
+                                       REFUSED (not run) → unverifiable (21)
   cleanup <sessionId> [--lease id --owner id] [--watch id]
                                        release the owned lease (the spawn ledger's lease
                                        when --lease is omitted), then delete
@@ -235,6 +251,9 @@ Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
     [--goal-budget-tokens N] (token budget for the goal engine; the server
     default 5,000,000 pauses long goals mid-run — programme lanes used 60M on
     zai, ~40M DeepSeek),
+  --template-follow-up (with --goal-objective, and on 'goal start': ALSO queue the
+    full report instructions as a follow-up message — the old C3b behaviour, and the
+    only way exit 22 TEMPLATE_NOT_DELIVERED can occur),
   --preflight-path P (repeatable), --preflight-tool T (repeatable),
   --agent-os-capture enabled|disabled,
   --route-limit 'SEL=N' (repeatable; per-call per-route concurrency cap;
@@ -292,14 +311,15 @@ const VERB_FLAGS: Record<string, Set<string>> = {
   capabilities: new Set([]),
   capacity: new Set([]),
   models: new Set(['runtime', 'match']),
-  spawn: new Set(['runtime', 'cwd', 'owner', 'ttl', 'label', 'model-selector', 'model-match', 'thinking', 'goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'wait-for-slot', 'agent-os-capture', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
+  spawn: new Set(['runtime', 'cwd', 'owner', 'ttl', 'label', 'model-selector', 'model-match', 'thinking', 'goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'wait-for-slot', 'agent-os-capture', 'no-completion-template', 'template-follow-up', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
   prompt: new Set(['message', 'mode', 'no-detach', 'idempotency-key', 'verbosity', 'require-active-turn', 'owner', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
   wait: new Set(['deadline', 'objective', 'conditions', 'run-id', 'all', 'any', 'label', 'slice']),
   result: new Set(['transcript', 'final']),
-  verify: new Set(['run-id', 'since', 'rerun', 'rerun-timeout', 'cwd', 'repo']),
+  verify: new Set(['run-id', 'since', 'rerun', 'rerun-timeout', 'cwd', 'repo', 'gates-file', 'gate-timeout']),
   cleanup: new Set(['lease', 'owner', 'watch']),
   status: new Set(['parent', 'owner']),
-  goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template', 'reason', 'note']),
+  goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template', 'template-follow-up', 'reason', 'note']),
+  template: new Set(['goal']),
   reroute: new Set(['model-selector', 'thinking']),
   watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only', 'generation', 'force-unconditional']),
 };
@@ -382,7 +402,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
 
   // Validate the verb BEFORE touching the client factory (a bad command must
   // be a usage error, not a transport error).
-  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute']);
+  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template']);
   if (!KNOWN_VERBS.has(args.verb)) {
     throw new UsageError(`unknown verb '${args.verb}'`);
   }
@@ -413,6 +433,10 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
   const getClient = (): ClientLike => (cachedClient ??= deps.client({ parentSessionId }));
 
   switch (args.verb) {
+    case 'template': {
+      // W2-g: the full report instructions, for the parent to paste into the brief file the objective points to.
+      return { exitCode: 0, stdout: args.flags.has('goal') ? GOAL_REPORT_INSTRUCTION : COMPLETION_REPORT_INSTRUCTION };
+    }
     case 'capabilities': {
       const body = await getClient().capabilities();
       return output(json, body, () => 'capabilities: use --json for the full body');
@@ -470,6 +494,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         preflight,
         agentOsCapture: flagString(args, 'agent-os-capture'),
         completionTemplate: args.flags.has('no-completion-template') ? false : undefined,
+        ...(args.flags.has('template-follow-up') ? { templateFollowUp: true } : {}),
         ...(waitForSlotMs !== undefined ? { waitForSlotMs } : {}),
       });
       const rendered = output(json, body, (value) => {
@@ -550,6 +575,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         ...(verifyCommand !== undefined ? { verifyCommand } : {}),
         ...(budget !== undefined ? { budgetTokens: budget } : {}),
         ...(completionTemplate !== undefined ? { completionTemplate } : {}),
+        ...(args.flags.has('template-follow-up') ? { templateFollowUp: true } : {}),
       });
       const rendered = output(json, body, (value) => {
         const goal = value as { status?: string; objective?: string };
@@ -772,7 +798,28 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const sessionId = args.positional[0];
       if (!sessionId) throw new UsageError('verify needs <sessionId>');
       const rerunTimeout = flagNumber(args, 'rerun-timeout');
+      // W2-g: the brief's GATES block, parsed BEFORE the client factory runs.
+      let gates: Gate[] | undefined;
+      const gatesFile = flagString(args, 'gates-file');
+      if (args.flags.has('gates-file') && gatesFile === undefined) throw new UsageError('--gates-file needs a path');
+      if (gatesFile !== undefined) {
+        let text: string;
+        try {
+          text = readFileSync(gatesFile, 'utf8');
+        } catch (error) {
+          throw new UsageError(`--gates-file ${gatesFile}: ${(error as Error).message}`);
+        }
+        const parsed = parseGatesBlock(text);
+        if (!parsed.found) throw new UsageError(`--gates-file ${gatesFile}: no 'GATES:' block found (a line 'GATES:' followed by '- <command> → <expected exit>' lines)`);
+        if (parsed.malformed.length > 0) throw new UsageError(`--gates-file ${gatesFile}: malformed gate line(s): ${parsed.malformed.join(' | ')} (expected '- <command> → <expected exit>')`);
+        if (parsed.gates.length === 0) throw new UsageError(`--gates-file ${gatesFile}: the GATES: block has no gates`);
+        gates = parsed.gates;
+      }
+      const gateTimeout = flagNumber(args, 'gate-timeout');
+      if (args.flags.has('gate-timeout') && (gateTimeout === undefined || !(gateTimeout > 0))) throw new UsageError('--gate-timeout must be a positive number of seconds');
       const body = await getClient().verify({
+        ...(gates !== undefined ? { gates } : {}),
+        ...(gateTimeout !== undefined ? { gateTimeoutMs: gateTimeout * 1000 } : {}),
         sessionId,
         ...(flagString(args, 'run-id') !== undefined ? { runId: flagString(args, 'run-id') } : {}),
         ...(flagString(args, 'since') !== undefined ? { since: flagString(args, 'since') } : {}),
@@ -991,7 +1038,14 @@ export async function main(processObject: NodeJS.Process): Promise<void> {
     randomId: () => `piorch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
     client: makeClientFactory(argv),
   };
+  const startedAt = Date.now();
   const result = await runCli(argv, deps);
+  // W2-e: one audit record per invocation; best-effort, never fails the command.
+  try {
+    appendAuditRecord(defaultAuditPath(processObject.env), auditRecordFor(argv, result, processObject.env, Date.now() - startedAt));
+  } catch {
+    // ignored
+  }
   if (result.stdout !== undefined) deps.stdout(result.stdout);
   // J2 P1/P2: stderr prints whenever present — success notes (the 5M default
   // budget note) must reach the caller, not just errors.

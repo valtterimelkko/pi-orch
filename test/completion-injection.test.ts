@@ -99,7 +99,7 @@ test('client.spawn with a goal: delivers the VERBATIM template as a follow_up pr
     },
   } as never;
   const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1' });
-  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' }, templateFollowUp: true } as never);
   assert.equal(calls[0]?.path, '/api/v1/sessions');
   // G1: the prompt-side route gate reads the child's detail between create and
   // dispatch; the template follow-up is still the first PROMPT after create.
@@ -172,7 +172,7 @@ test('client.spawn retries the template follow-up ONCE when the first delivery f
     },
   } as never;
   const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
-  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' }, templateFollowUp: true } as never);
   assert.equal(followUpCount, 2, 'exactly one retry');
   assert.equal((spawned as { templateFollowUpRunId?: string }).templateFollowUpRunId, 'r-follow-2');
   assert.equal((spawned.raw as { __templateFollowUpRetried?: boolean }).__templateFollowUpRetried, true);
@@ -214,7 +214,7 @@ async function spawnWithFirstReceiptStatus(firstStatus: Record<string, unknown>)
     },
   } as never;
   const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
-  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' }, templateFollowUp: true } as never);
   return { followUpCount, spawned: spawned as { templateFollowUpRunId?: string; raw: Record<string, unknown> } };
 }
 
@@ -297,7 +297,7 @@ test('client.spawn does not retry when the first follow-up run is healthy', asyn
     },
   } as never;
   const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
-  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship it' } });
+  const spawned = await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship it' }, templateFollowUp: true } as never);
   assert.equal(calls.filter((call) => call.path.endsWith('/prompt')).length, 1);
   assert.equal((spawned as { templateFollowUpRunId?: string }).templateFollowUpRunId, 'r-ok');
 });
@@ -325,7 +325,7 @@ test('I5: the goal template follow-up carries the marker instruction and the fie
     },
   } as never;
   const client = new PiOrchClient({ spawnLedgerPath: tempLedgerPath(), transportInstance: transport, randomId: () => 'k1', templateFollowUpCheckDelayMs: 1 });
-  await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' } });
+  await client.spawn({ runtime: 'pi', cwd: '/tmp/w', goal: { objective: 'Ship the fix' }, templateFollowUp: true } as never);
   const followUp = calls.find((call) => call.path === '/api/v1/sessions/s-goal/prompt');
   assert.ok(followUp, 'a follow-up prompt followed the create');
   const message = String(followUp?.body.message);

@@ -130,5 +130,5 @@ export function applyGoalObjectiveTemplate(objective: string): string {
   // I5 correction 01: the pointer is a POINTER. The flattened template used to
   // ride here too (suffix 1,280 chars), which cost 615 characters of objective
   // budget for text the follow-up repeats verbatim — so it moved out.
-  return `${objective} [${GOAL_MARKER_REMINDER} When you finish: end with the fenced pi-completion/v1 completion report block (the full report instructions arrive as a follow-up message.)]`;
+  return `${objective} [${GOAL_MARKER_REMINDER} When you finish: end with the fenced pi-completion/v1 completion report block (the full report instructions are in your brief file, or arrive as a follow-up message.)]`;
 }

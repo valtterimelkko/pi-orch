@@ -1,3 +1,4 @@
+import { tempAuditPath } from './isolated-ledger.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -90,6 +91,7 @@ test('bin/pi-orch refuses an inside-repo token path end to end (exit 23)', () =>
       ...process.env,
       PI_WEB_UI_TOKEN_PATH: join(REPO, '.piorch-inside-token'),
       PI_WEB_UI_SOCKET: join(tmpdir(), 'piorch-does-not-exist.sock'),
+      PI_ORCH_AUDIT_PATH: tempAuditPath(),
     },
     encoding: 'utf8',
   });
