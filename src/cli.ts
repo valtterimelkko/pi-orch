@@ -12,13 +12,17 @@ import { COMPLETION_REPORT_INSTRUCTION, GOAL_REPORT_INSTRUCTION } from './comple
 import {
   agentEnd,
   goalEnd,
+  goalEndMatch,
   goalPaused,
+  goalPausedMatch,
   goalObjectiveConditionForms,
+  stalledCondition,
   questionSentinel,
   deadlineCondition,
   buildPreflightSpec,
   validateGoalFields,
   GoalFieldValidationError,
+  type GoalMatch,
 } from './builders.ts';
 import type { WatchConditionSpec } from './parsers.ts';
 import { ApiError } from './parsers.ts';
@@ -39,7 +43,7 @@ export interface ClientLike {
   deleteWatch(sessionId: string, options?: { expectedGeneration?: string }): Promise<{ success?: boolean; watchId?: string; generation?: string }>;
   spawn(input: Record<string, unknown>): Promise<{ sessionId: string; leaseId?: string; parentId?: string; resolvedModel?: string; raw?: unknown }>;
   prompt(sessionId: string, input: Record<string, unknown>): Promise<{ runId: string; sessionId: string; detached: boolean; duplicate: boolean; dispatchMode?: string; queueDepth?: number; deliver?: { chosen: string; busy: boolean; reason: string } }>;
-  wait(options: { sessionId: string; runId?: string; conditions?: WatchConditionSpec[]; objective?: string; deadlineMs?: number; label?: string }): Promise<{ kind: string; [key: string]: unknown }>;
+  wait(options: { sessionId: string; runId?: string; conditions?: WatchConditionSpec[]; objective?: string; goalId?: string; deadlineMs?: number; label?: string }): Promise<{ kind: string; [key: string]: unknown }>;
   result(runId: string, options?: { includeTranscript?: boolean; final?: boolean }): Promise<Record<string, unknown>>;
   verify(input: { sessionId: string; runId?: string; gates?: Gate[]; gateTimeoutMs?: number; [key: string]: unknown }): Promise<{ implemented: false; plannedBy: string } | { sessionId: string; verdict: string; claims: Array<Record<string, unknown>>; summary: string }>;
   cleanup(sessionId: string, options?: { leaseId?: string; ownerId?: string; watchId?: string }): Promise<{ released: boolean; deleted: boolean; notes: string[] }>;
@@ -259,7 +263,11 @@ Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
   --route-limit 'SEL=N' (repeatable; per-call per-route concurrency cap;
     N=0 or 'unlimited' lifts the cap; wins over PI_ORCH_ROUTE_LIMITS),
   --wait-for-slot S (instead of refusing over the limit, watch the live
-    children on that route and spawn when one settles; exit 3 on timeout)
+    children on that route and spawn when one settles; exit 3 on timeout),
+  --wait-admission S (a 429 ADMISSION_CAPACITY_EXHAUSTED with reason
+    'quarantined_debt' is quarantined leases clearing on their own: wait the
+    server's Retry-After and retry the create until S seconds; every other
+    refusal and every transport loss is still surfaced at once)
 
 Prompt flags: --mode prompt|follow_up|steer|deliver, --no-detach, --idempotency-key K,
   --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool,
@@ -270,10 +278,16 @@ Prompt flags: --mode prompt|follow_up|steer|deliver, --no-detach, --idempotency-
   on a create-time goal objective)
 
 Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
-  the Wave K auto-continue progress matched), --deadline S (default 1800),
+  the Wave K auto-continue progress matched), --goal-id ID (contract 1.62.0:
+  match the stable top-level goalId instead of the objective forms; pass it
+  explicitly, or leave it off and wait reads the LIVE projection and keys on the
+  id only while a goal is active — a ledger-recorded id is never used), --deadline S (default 1800),
   --label L, --conditions a,b
-  (agent_end|goal_end|paused|question:TEXT|deadline:S; goal_end/paused without
-  --objective wake on ANY goal, so pass --objective on a reused child),
+  (agent_end|goal_end|paused|stalled|question:TEXT|deadline:S; goal_end/paused
+  without --objective wake on ANY goal, so pass --objective or --goal-id on a
+  reused child; stalled matches the goal_state the server emits when a running
+  goal's session has been idle past GOAL_STALL_MINUTES — a stalled goal is not
+  a finished one, and wait never reports it as paused),
   --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
   --all settles every child, --any returns the first to settle. Unknown runs
   or sessions fail fast (exit 16) instead of sitting out the deadline.
@@ -311,9 +325,9 @@ const VERB_FLAGS: Record<string, Set<string>> = {
   capabilities: new Set([]),
   capacity: new Set([]),
   models: new Set(['runtime', 'match']),
-  spawn: new Set(['runtime', 'cwd', 'owner', 'ttl', 'label', 'model-selector', 'model-match', 'thinking', 'goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'wait-for-slot', 'agent-os-capture', 'no-completion-template', 'template-follow-up', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
+  spawn: new Set(['runtime', 'cwd', 'owner', 'ttl', 'label', 'model-selector', 'model-match', 'thinking', 'goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'wait-for-slot', 'wait-admission', 'agent-os-capture', 'no-completion-template', 'template-follow-up', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
   prompt: new Set(['message', 'mode', 'no-detach', 'idempotency-key', 'verbosity', 'require-active-turn', 'owner', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
-  wait: new Set(['deadline', 'objective', 'conditions', 'run-id', 'all', 'any', 'label', 'slice']),
+  wait: new Set(['deadline', 'objective', 'conditions', 'run-id', 'all', 'any', 'label', 'slice', 'goal-id']),
   result: new Set(['transcript', 'final']),
   verify: new Set(['run-id', 'since', 'rerun', 'rerun-timeout', 'cwd', 'repo', 'gates-file', 'gate-timeout']),
   cleanup: new Set(['lease', 'owner', 'watch']),
@@ -321,7 +335,7 @@ const VERB_FLAGS: Record<string, Set<string>> = {
   goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template', 'template-follow-up', 'reason', 'note']),
   template: new Set(['goal']),
   reroute: new Set(['model-selector', 'thinking']),
-  watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only', 'generation', 'force-unconditional']),
+  watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only', 'generation', 'force-unconditional', 'goal-id']),
 };
 
 /** The full allowed flag set for a verb (connection flags included), or undefined for an unknown verb. */
@@ -476,6 +490,8 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       }
       // G1: validate the flag (cheap usage error) BEFORE the client factory runs.
       const waitForSlotMs = args.flags.has('wait-for-slot') ? waitForSlotSeconds(args) : undefined;
+      // W2h (W2-f): the quarantined-admission wait budget, validated before any request.
+      const waitAdmissionMs = args.flags.has('wait-admission') ? waitAdmissionSeconds(args) : undefined;
       const body = await getClient().spawn({
         runtime,
         cwd,
@@ -496,6 +512,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         completionTemplate: args.flags.has('no-completion-template') ? false : undefined,
         ...(args.flags.has('template-follow-up') ? { templateFollowUp: true } : {}),
         ...(waitForSlotMs !== undefined ? { waitForSlotMs } : {}),
+        ...(waitAdmissionMs !== undefined ? { waitAdmissionMs } : {}),
       });
       const rendered = output(json, body, (value) => {
         const spawned = value as { sessionId: string; leaseId?: string; parentId?: string; resolvedModel?: string };
@@ -616,8 +633,11 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       if (!sessionId || !sub) throw new UsageError('watch needs <sessionId> register|list|delete');
       if (sub === 'register') {
         const conditionsFlag = flagString(args, 'conditions');
-        if (!conditionsFlag) throw new UsageError('watch register needs --conditions (agent_end|goal_end|paused|question:TEXT|deadline:S)');
-        const conditions = parseConditionList(conditionsFlag, flagString(args, 'objective'));
+        if (!conditionsFlag) throw new UsageError('watch register needs --conditions (agent_end|goal_end|paused|stalled|question:TEXT|deadline:S)');
+        // W2h (contract 1.62.0): a known goal id keys goal conditions on the
+        // top-level dataMatch {goalId} — never woken by a reused child's old goal.
+        const goalId = flagString(args, 'goal-id');
+        const conditions = parseConditionList(conditionsFlag, flagString(args, 'objective'), goalId);
         const fireIfSettled = args.flags.has('fire-if-settled') ? true : undefined;
         const pin = args.flags.has('pin') ? true : undefined;
         const body = await getClient().registerWatch(sessionId, {
@@ -727,6 +747,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
     case 'wait': {
       const deadlineSeconds = flagNumber(args, 'deadline') ?? 1800;
       const objective = flagString(args, 'objective');
+      const goalId = flagString(args, 'goal-id');
       const conditionsFlag = flagString(args, 'conditions');
       // 02-correction 5: --slice never did anything; accepted as a deprecated
       // no-op so existing callers do not break silently.
@@ -751,12 +772,13 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       // C3b correction 01 item 1: no pre-baked default conditions — the client
       // detects an active goal when neither --conditions nor --objective is
       // given and applies goal or plain conditions AFTER detection.
-      const conditions = conditionsFlag ? parseConditionList(conditionsFlag, objective) : undefined;
+      const conditions = conditionsFlag ? parseConditionList(conditionsFlag, objective, goalId) : undefined;
       const outcome = await getClient().wait({
         sessionId,
         runId: flagString(args, 'run-id'),
         conditions,
         objective,
+        ...(goalId !== undefined ? { goalId } : {}),
         deadlineMs: deadlineSeconds * 1000,
         label: flagString(args, 'label'),
       });
@@ -913,7 +935,18 @@ function waitForSlotSeconds(args: ParsedArgs): number {
   return seconds * 1000;
 }
 
-function parseConditionList(raw: string, objective: string | undefined): WatchConditionSpec[] {
+/** W2h: the --wait-admission budget in seconds, as a usage error before any request. */
+function waitAdmissionSeconds(args: ParsedArgs): number {
+  const seconds = flagNumber(args, 'wait-admission');
+  if (seconds === undefined || seconds <= 0) throw new UsageError('--wait-admission must be a positive number of seconds');
+  return seconds * 1000;
+}
+
+function parseConditionList(raw: string, objective: string | undefined, goalId?: string): WatchConditionSpec[] {
+  const match: GoalMatch = {
+    ...(goalId !== undefined && goalId !== '' ? { goalId } : {}),
+    ...(objective !== undefined ? { objective } : {}),
+  };
   return raw.split(',').flatMap((token) => {
     const trimmed = token.trim();
     if (trimmed === 'agent_end') return [agentEnd()];
@@ -923,11 +956,14 @@ function parseConditionList(raw: string, objective: string | undefined): WatchCo
     // strict equality. Register every form pi-orch knows (the same rule as
     // callerObjectiveConditions) so the watch can actually fire; an
     // already-stored objective yields one form. No objective = no filter.
-    if (trimmed === 'goal_end') return goalObjectiveForms(objective).map((form) => goalEnd(form));
-    if (trimmed === 'paused') return goalObjectiveForms(objective).map((form) => goalPaused(form));
+    // W2h: a known goalId keys on the top-level id instead (contract 1.62.0);
+    // `stalled` matches the top-level stalled goal_state.
+    if (trimmed === 'goal_end') return goalId !== undefined && goalId !== '' ? [goalEndMatch(match)] : goalObjectiveForms(objective).map((form) => goalEnd(form));
+    if (trimmed === 'paused') return goalId !== undefined && goalId !== '' ? [goalPausedMatch(match)] : goalObjectiveForms(objective).map((form) => goalPaused(form));
+    if (trimmed === 'stalled') return [stalledCondition(match)];
     if (trimmed.startsWith('question:')) return [questionSentinel(trimmed.slice('question:'.length))];
     if (trimmed.startsWith('deadline:')) return [deadlineCondition(Number(trimmed.slice('deadline:'.length)))];
-    throw new UsageError(`unknown condition '${trimmed}' (agent_end|goal_end|paused|question:TEXT|deadline:S)`);
+    throw new UsageError(`unknown condition '${trimmed}' (agent_end|goal_end|paused|stalled|question:TEXT|deadline:S)`);
   });
 }
 
@@ -960,6 +996,16 @@ function mapError(error: unknown): CliResult {
   }
   const lines = [code ? `pi-orch: ${code}: ${rawMessage}` : rawMessage.startsWith('pi-orch:') ? rawMessage : `pi-orch: ${rawMessage}`];
   if (anyError.failures !== undefined) lines.push(`failures: ${JSON.stringify(anyError.failures)}`);
+  // W2h (W2-f, contract 1.62.0): name quarantined admission debt for what it
+  // is — the refusal is quarantined leases, not free capacity — and point at
+  // the wait flag; without it the caller decides, never a silent sit-out.
+  if (code === 'ADMISSION_CAPACITY_EXHAUSTED' && (anyError.data as { reason?: unknown } | undefined)?.reason === 'quarantined_debt') {
+    const data = anyError.data ?? {};
+    const runs = typeof data.quarantinedRuns === 'number'
+      ? ` (${data.quarantinedRuns} quarantined run(s)${typeof data.quarantinedOldestAgeMs === 'number' ? `, oldest ${Math.round(data.quarantinedOldestAgeMs / 1000)}s` : ''})`
+      : '';
+    lines.push(`quarantined admission debt${runs}: the refusal is quarantined leases, not free capacity — retry with 'spawn --wait-admission S' to wait it out, or wait for the quarantine to clear`);
+  }
   // W0d: the server's typed profile-capacity refusal (429, contract 1.61.0)
   // happens BEFORE any run receipt, so it is the same class as the local
   // route-limit refusal: exit 25, with the profile cap named and the

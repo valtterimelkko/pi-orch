@@ -153,12 +153,12 @@ test('goalAutoContinue: goal_state condition carrying the TOP-LEVEL autoContinue
   assert.deepEqual(condition.dataMatch, { objective: 'Ship it', autoContinued: true }, 'K correction C6: the event data carries top-level autoContinued, so the watch matches the top-level key, never a dotted path');
 });
 
-test('defaultConditions on a goal objective registers goal_end + paused + auto-continue + deadline (and no agent_end)', () => {
+test('defaultConditions on a goal objective registers goal_end + paused + auto-continue + stalled + deadline (and no agent_end)', () => {
   const conditions = defaultConditions('Do the bounded thing', 300_000) as unknown as Array<Record<string, unknown>>;
   assert.deepEqual(
     conditions.filter((condition) => condition.type !== 'deadline').map((condition) => condition.eventType),
-    ['goal_end', 'goal_state', 'goal_state'],
-    'goal_end, the paused goal_state and the auto-continue goal_state',
+    ['goal_end', 'goal_state', 'goal_state', 'goal_state'],
+    'goal_end, the paused goal_state, the auto-continue goal_state and the W2h stalled goal_state',
   );
   assert.equal(conditions.some((condition) => condition.eventType === 'agent_end'), false, 'no per-turn agent_end');
   assert.equal(conditions.filter(isGoalStatePaused).length, 1);
