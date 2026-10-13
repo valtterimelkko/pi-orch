@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { goalEnd, goalPaused } from '../src/builders.ts';
+import { applyGoalObjectiveTemplate } from '../src/completion-template.ts';
 import { runCli, type CliDeps } from '../src/cli.ts';
 
 /**
@@ -91,16 +92,35 @@ test('W0a CLI: watch register --conditions paused without --objective sends no o
   assert.equal(JSON.stringify(seen[0]).includes('"*"'), false, 'no "*" anywhere in the register body');
 });
 
-test('W0a CLI: watch register --conditions goal_end,paused WITH --objective matches it exactly', async () => {
+test('W0a/01-correction: watch register --conditions goal_end,paused WITH --objective registers the raw AND stored forms', async () => {
   const seen: Array<Record<string, unknown>> = [];
+  const raw = 'Ship the widget';
+  const stored = applyGoalObjectiveTemplate(raw);
   const result = await runCli(
-    ['watch', 's1', 'register', '--conditions', 'goal_end,paused', '--objective', 'Ship the widget', '--id-only'],
+    ['watch', 's1', 'register', '--conditions', 'goal_end,paused', '--objective', raw, '--id-only'],
+    captureDeps(seen),
+  );
+  assert.equal(result.exitCode, 0, `stderr: ${result.stderr ?? ''}`);
+  const conditions = (seen[0]?.conditions ?? []) as Array<{ id?: string; eventType?: string; dataMatch?: Record<string, unknown> }>;
+  const goalEnds = conditions.filter((c) => c.eventType === 'goal_end');
+  const paused = conditions.filter((c) => c.eventType === 'goal_state' && c.dataMatch?.status === 'paused');
+  assert.deepEqual(goalEnds.map((c) => c.dataMatch?.objective), [raw, stored], 'goal_end matches both the raw and the stored (templated) form');
+  assert.deepEqual(paused.map((c) => c.dataMatch?.objective), [raw, stored], 'paused matches both forms too');
+  assert.equal(JSON.stringify(seen[0]).includes('"*"'), false, 'still no "*" when an objective is given');
+  const ids = conditions.map((c) => c.id);
+  assert.equal(new Set(ids).size, ids.length, 'condition ids stay unique across the expanded forms');
+});
+
+test('W0a/01-correction: an already-stored --objective registers ONE form (no pointer growth)', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const stored = applyGoalObjectiveTemplate('Ship the widget');
+  const result = await runCli(
+    ['watch', 's1', 'register', '--conditions', 'goal_end,paused', '--objective', stored, '--id-only'],
     captureDeps(seen),
   );
   assert.equal(result.exitCode, 0, `stderr: ${result.stderr ?? ''}`);
   const conditions = (seen[0]?.conditions ?? []) as Array<{ eventType?: string; dataMatch?: Record<string, unknown> }>;
-  assert.equal(conditions.length, 2);
-  assert.deepEqual(conditions[0]?.dataMatch, { objective: 'Ship the widget' });
-  assert.deepEqual(conditions[1]?.dataMatch, { objective: 'Ship the widget', status: 'paused' });
-  assert.equal(JSON.stringify(seen[0]).includes('"*"'), false, 'still no "*" when an objective is given');
+  assert.equal(conditions.filter((c) => c.eventType === 'goal_end').length, 1, 'the stored form does not grow a second (never-firing) variant');
+  assert.equal(conditions.filter((c) => c.eventType === 'goal_state' && c.dataMatch?.status === 'paused').length, 1);
+  assert.deepEqual(conditions.find((c) => c.eventType === 'goal_end')?.dataMatch, { objective: stored });
 });
