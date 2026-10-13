@@ -12,7 +12,7 @@ import {
   RouteLimitError,
   advertisedProfileCapacity,
   advertisedProfileCapacities,
-  profileCapacityLimit,
+  profileCapacityFull,
   profileIdOfSelector,
 } from '../src/route-limits.ts';
 import type { TransportResponse } from '../src/transport.ts';
@@ -25,10 +25,12 @@ import type { TransportResponse } from '../src/transport.ts';
  * - `GET /capacity` `claudeProfiles: [{ profileId, maxConcurrent, active }]`
  *   (absent on older servers) is the source;
  * - on a `profile:<id>` route under runtime `claude` with no explicit limit,
- *   the default limit is `maxConcurrent - active` (the server's `active`
- *   counts other parents' turns too, so it is preferred over the local count);
- * - an explicit limit (per-call flag, PI_ORCH_ROUTE_LIMITS) still wins,
- *   including an explicit 0 = unlimited;
+ *   the SERVER's own numbers decide (correction 01): refuse a new turn iff
+ *   `active >= maxConcurrent` — `active` already includes this parent's live
+ *   turns, so the local count is never added to it or compared against it
+ *   (it is listed in the refusal for context only);
+ * - an explicit limit (per-call flag, PI_ORCH_ROUTE_LIMITS) still wins and keeps
+ *   the local-count semantics, including an explicit 0 = unlimited;
  * - a server that does not advertise keeps today's behaviour (no default cap);
  * - the exit-25 refusal names the profile, maxConcurrent and active, and for a
  *   Claude profile prints the owner-authorisation (PAYG overflow) hint;
@@ -69,6 +71,8 @@ function fakeTransport(options: {
   capacity?: unknown;
   /** Make the capacity read fail (server busy). */
   capacityThrows?: boolean;
+  /** Long-poll hook, so a test can prove a watch wait did NOT happen. */
+  longPoll?: () => Promise<{ fired: boolean }>;
 }) {
   const calls: Array<RecordedCall> = [];
   const pool = (): FakeChild[] => [...(options.children ?? []), ...(options.all ?? [])];
@@ -119,6 +123,11 @@ function fakeTransport(options: {
       if (method === 'GET' && evidence) {
         const entry = child(decodeURIComponent(evidence[1] as string));
         return ok({ runChronology: entry?.lastRunStatus ? [{ runId: `r-${entry.sessionId}`, status: entry.lastRunStatus }] : [] });
+      }
+      if (method === 'GET' && path.startsWith('/api/v1/watches/wait')) {
+        const result = options.longPoll ? await options.longPoll() : { fired: false };
+        if (result.fired) return ok({ fired: true, nextCursor: 'c2', waitedMs: 5, watches: [] });
+        return { status: 204, headers: {}, body: undefined, raw: '' };
       }
       if (method === 'POST' && path.endsWith('/prompt')) {
         return ok({ runId: `run-${calls.length}`, sessionId: 's', detached: true, status: 'accepted' });
@@ -182,11 +191,12 @@ test('W0d/2: advertisedProfileCapacity reads /capacity claudeProfiles (1.61.0) a
   assert.deepEqual(advertisedProfileCapacities({ claudeProfiles: [{ profileId: 'x', maxConcurrent: 'many', active: 0 }, { maxConcurrent: 1, active: 0 }] }), []);
 });
 
-test('W0d/3: profileCapacityLimit is maxConcurrent minus live server use, never below zero', () => {
-  assert.equal(profileCapacityLimit({ profileId: 'p', maxConcurrent: 8, active: 0 }), 8);
-  assert.equal(profileCapacityLimit({ profileId: 'p', maxConcurrent: 8, active: 6 }), 2);
-  assert.equal(profileCapacityLimit({ profileId: 'p', maxConcurrent: 8, active: 8 }), 0, 'at the cap: nothing left to hand out');
-  assert.equal(profileCapacityLimit({ profileId: 'p', maxConcurrent: 2, active: 5 }), 0, 'over the cap never goes negative');
+test('W0d/3: profileCapacityFull is the server\'s own predicate: active >= maxConcurrent', () => {
+  assert.equal(profileCapacityFull({ maxConcurrent: 8, active: 0 }), false);
+  assert.equal(profileCapacityFull({ maxConcurrent: 8, active: 4 }), false, 'four slots are still free — the local count must not be added to active');
+  assert.equal(profileCapacityFull({ maxConcurrent: 8, active: 7 }), false);
+  assert.equal(profileCapacityFull({ maxConcurrent: 8, active: 8 }), true);
+  assert.equal(profileCapacityFull({ maxConcurrent: 2, active: 5 }), true, 'over the cap is still full');
 });
 
 test('W0d/4: the exit-25 message names the profile cap and the PAYG overflow route (Claude profiles only)', () => {
@@ -225,17 +235,19 @@ test('W0d/6: a spawn under the advertised profile cap proceeds', async () => {
   assert.equal(created(calls), 1);
 });
 
-test('W0d/7: a spawn at the advertised cap refuses BEFORE creating anything, naming the cap', async () => {
-  const { transport, calls } = fakeTransport({ children: busyProfileChildren(2), capacity: capacityBody(2, 0) });
+test('W0d/7: a full advertised profile refuses BEFORE creating anything, naming the cap and the local children', async () => {
+  const { transport, calls } = fakeTransport({ children: busyProfileChildren(2), capacity: capacityBody(2, 2) });
   const client = gateClient(transport, { parentSessionId: 'parent-1' });
   await assert.rejects(
     client.spawn({ runtime: 'claude', cwd: '/tmp/w', modelSelector: PROFILE_SELECTOR }),
     (error: unknown) => {
       assert.ok(error instanceof RouteLimitError);
       assert.equal(error.route, PROFILE_SELECTOR);
-      assert.equal(error.limit, 2, 'the advertised maxConcurrent is the default limit');
-      assert.deepEqual(error.profile, { profileId: PROFILE_ID, maxConcurrent: 2, active: 0 });
+      assert.equal(error.limit, 2, 'the profile cap is what is named');
+      assert.deepEqual(error.profile, { profileId: PROFILE_ID, maxConcurrent: 2, active: 2 });
       assert.match(error.message, /maxConcurrent 2/);
+      assert.match(error.message, /2 active turn/);
+      assert.match(error.message, /c1/, 'the local live children are listed for context');
       assert.ok(error.message.includes(CLAUDE_PAYG_OVERFLOW_HINT));
       return true;
     },
@@ -243,40 +255,84 @@ test('W0d/7: a spawn at the advertised cap refuses BEFORE creating anything, nam
   assert.equal(created(calls), 0, 'no create happened');
 });
 
-test('W0d/8: the server-reported active count is subtracted (other parents\' turns count)', async () => {
-  // 8 allowed, 6 already active server-side (any parent) → 2 left for this one.
-  const two = fakeTransport({ children: busyProfileChildren(2), capacity: capacityBody(8, 6) });
-  const clientAt = gateClient(two.transport, { parentSessionId: 'parent-1' });
+test('W0d/8: the decision is the server\'s active count alone — free server slots are never wasted on the local count', async () => {
+  // correction 01: 8 allowed, 4 active server-side (this parent's 4 live turns
+  // ARE those 4) → four slots free → the spawn is ALLOWED.
+  const allowed = fakeTransport({ children: busyProfileChildren(4), capacity: capacityBody(8, 4) });
+  const allowedClient = gateClient(allowed.transport, { parentSessionId: 'parent-1' });
+  await allowedClient.spawn({ runtime: 'claude', cwd: '/tmp/w', modelSelector: PROFILE_SELECTOR });
+  assert.equal(created(allowed.calls), 1, 'limit = maxConcurrent - active would have refused here');
+
+  const full = fakeTransport({ children: busyProfileChildren(2), capacity: capacityBody(8, 8) });
+  const fullClient = gateClient(full.transport, { parentSessionId: 'parent-1' });
   await assert.rejects(
-    clientAt.spawn({ runtime: 'claude', cwd: '/tmp/w', modelSelector: PROFILE_SELECTOR }),
+    fullClient.spawn({ runtime: 'claude', cwd: '/tmp/w', modelSelector: PROFILE_SELECTOR }),
     (error: unknown) => {
       assert.ok(error instanceof RouteLimitError);
-      assert.equal(error.limit, 2);
-      assert.deepEqual(error.profile, { profileId: PROFILE_ID, maxConcurrent: 8, active: 6 });
+      assert.equal(error.limit, 8);
+      assert.deepEqual(error.profile, { profileId: PROFILE_ID, maxConcurrent: 8, active: 8 });
+      assert.match(error.message, /maxConcurrent 8/);
+      assert.match(error.message, /8 active turn/);
       return true;
     },
   );
-  assert.equal(created(two.calls), 0);
-
-  const one = fakeTransport({ children: busyProfileChildren(1), capacity: capacityBody(8, 6) });
-  const clientUnder = gateClient(one.transport, { parentSessionId: 'parent-1' });
-  await clientUnder.spawn({ runtime: 'claude', cwd: '/tmp/w', modelSelector: PROFILE_SELECTOR });
-  assert.equal(created(one.calls), 1);
+  assert.equal(created(full.calls), 0);
 });
 
-test('W0d/9: a profile already at its server cap is refused with no local live child at all', async () => {
+test('W0d/9: a full profile is refused from the server numbers with no local live child at all', async () => {
   const { transport, calls } = fakeTransport({ children: [], capacity: capacityBody(2, 2) });
   const client = gateClient(transport, { parentSessionId: 'parent-1' });
   await assert.rejects(
     client.spawn({ runtime: 'claude', cwd: '/tmp/w', modelSelector: PROFILE_SELECTOR }),
     (error: unknown) => {
       assert.ok(error instanceof RouteLimitError);
-      assert.equal(error.limit, 0);
+      assert.equal(error.limit, 2);
       assert.match(error.message, /maxConcurrent 2/);
       assert.ok(error.message.includes(CLAUDE_PAYG_OVERFLOW_HINT));
       return true;
     },
   );
+  assert.equal(created(calls), 0);
+});
+
+test('W0d/19 (correction 01): 8 allowed / 4 active / 4 local live → ALLOWED; 8 active → refused with the hint', async () => {
+  const fourFree = fakeTransport({ children: busyProfileChildren(4), capacity: capacityBody(8, 4) });
+  const fourFreeClient = gateClient(fourFree.transport, { parentSessionId: 'parent-1' });
+  const result = await fourFreeClient.spawn({ runtime: 'claude', cwd: '/tmp/w', modelSelector: PROFILE_SELECTOR });
+  assert.ok(result.sessionId.startsWith('new-'), 'the four free server slots are usable');
+  assert.equal(created(fourFree.calls), 1);
+
+  const atCap = fakeTransport({ children: busyProfileChildren(4), capacity: capacityBody(8, 8) });
+  const atCapClient = gateClient(atCap.transport, { parentSessionId: 'parent-1' });
+  await assert.rejects(
+    atCapClient.spawn({ runtime: 'claude', cwd: '/tmp/w', modelSelector: PROFILE_SELECTOR }),
+    (error: unknown) => {
+      assert.ok(error instanceof RouteLimitError);
+      assert.match(error.message, /maxConcurrent 8/);
+      assert.match(error.message, /8 active turn/);
+      assert.ok(error.message.includes(CLAUDE_PAYG_OVERFLOW_HINT));
+      return true;
+    },
+  );
+  assert.equal(created(atCap.calls), 0);
+});
+
+test('W0d/20 (correction 01): --wait-for-slot does not promise a watch on a server-side profile cap — it refuses at once', async () => {
+  let longPolls = 0;
+  const { transport, calls } = fakeTransport({
+    children: busyProfileChildren(2),
+    capacity: capacityBody(2, 2),
+    longPoll: async () => {
+      longPolls += 1;
+      return { fired: true };
+    },
+  });
+  const client = gateClient(transport, { parentSessionId: 'parent-1' });
+  await assert.rejects(
+    client.spawn({ runtime: 'claude', cwd: '/tmp/w', modelSelector: PROFILE_SELECTOR, waitForSlotMs: 60_000 }),
+    (error: unknown) => error instanceof RouteLimitError,
+  );
+  assert.equal(longPolls, 0, 'no watch wait: the holder may be another parent, so a local watch would be a false promise');
   assert.equal(created(calls), 0);
 });
 
@@ -328,14 +384,14 @@ test('W0d/13: an unreadable /capacity does not invent a cap either', async () =>
   assert.equal(created(calls), 1);
 });
 
-test('W0d/14: prompting an idle child on a capped profile route refuses; a live child is never gated', async () => {
+test('W0d/14: prompting an idle child on a full profile route refuses; a live child is never gated', async () => {
   const idle = fakeTransport({
     all: [
       ...busyProfileChildren(2),
       { sessionId: 'target', modelSelector: PROFILE_SELECTOR, runtime: 'claude', busy: false, lastRunStatus: 'completed' },
     ],
     children: busyProfileChildren(2),
-    capacity: capacityBody(2, 0),
+    capacity: capacityBody(2, 2),
   });
   const idleClient = gateClient(idle.transport, { parentSessionId: 'parent-1' });
   await assert.rejects(
@@ -348,6 +404,19 @@ test('W0d/14: prompting an idle child on a capped profile route refuses; a live 
     },
   );
   assert.equal(dispatched(idle.calls), 0, 'no dispatch happened');
+
+  // A free server slot: the local busy children alone must NOT refuse the prompt.
+  const free = fakeTransport({
+    all: [
+      ...busyProfileChildren(2),
+      { sessionId: 'target', modelSelector: PROFILE_SELECTOR, runtime: 'claude', busy: false, lastRunStatus: 'completed' },
+    ],
+    children: busyProfileChildren(2),
+    capacity: capacityBody(8, 2),
+  });
+  const freeClient = gateClient(free.transport, { parentSessionId: 'parent-1' });
+  await freeClient.prompt('target', { message: 'go' });
+  assert.equal(dispatched(free.calls), 1, 'six server slots were free');
 
   const live = fakeTransport({
     all: [{ sessionId: 'target', modelSelector: PROFILE_SELECTOR, runtime: 'claude', busy: true }],

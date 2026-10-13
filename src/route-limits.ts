@@ -14,13 +14,16 @@
  *   list/detail (`busy`), goal projection (`status`) and run evidence
  *   (`runChronology[0].status`) fields. A finished idle child never counts.
  * - W0d (contract 1.61.0): a Claude SDK profile route (`profile:<id>` under
- *   runtime `claude`) with NO explicit limit defaults to the cap the SERVER
- *   advertises in `GET /capacity` `claudeProfiles[].maxConcurrent` minus live
- *   server use (`claudeProfiles[].active` — it counts other parents' turns
- *   too, so it is preferred over the local count). An older server that does
- *   not advertise keeps the unlimited default; an explicit limit (per-call
- *   flag, PI_ORCH_ROUTE_LIMITS, including 0 = unlimited) still wins. A refusal
- *   on a Claude profile names the cap and the owner-authorisation route.
+ *   runtime `claude`) with NO explicit limit is decided from the capacity the
+ *   SERVER advertises in `GET /capacity` `claudeProfiles[]`: a new turn is
+ *   refused exactly when the server's own `active >= maxConcurrent`
+ *   (correction 01 — `active` already includes this parent's live turns, so
+ *   the local count is never added to it or compared against it; it is only
+ *   listed in the refusal as context). An older server that does not advertise
+ *   keeps the unlimited default; an explicit limit (per-call flag,
+ *   PI_ORCH_ROUTE_LIMITS, including 0 = unlimited) still wins and keeps the
+ *   local-count semantics. A refusal on a Claude profile names the cap and the
+ *   owner-authorisation route.
  */
 
 /**
@@ -206,12 +209,14 @@ export function advertisedProfileCapacity(capacityBody: unknown, profileId: stri
 }
 
 /**
- * The default cap an advertised profile yields: `maxConcurrent` minus live
- * server use. 0 means the profile is AT its cap right now — the caller must
- * refuse (it is not the "unlimited" spelling of the PI_ORCH_ROUTE_LIMITS map).
+ * W0d (correction 01): the SERVER's own predicate for an advertised Claude
+ * profile — a new turn is refused exactly when `active >= maxConcurrent`.
+ * `active` already counts this parent's live turns, so a client must NOT add
+ * its local count or compare it against a `maxConcurrent - active` remainder
+ * (that double-counts and wastes free server slots).
  */
-export function profileCapacityLimit(capacity: ProfileCapacity): number {
-  return Math.max(0, capacity.maxConcurrent - capacity.active);
+export function profileCapacityFull(capacity: { maxConcurrent: number; active: number }): boolean {
+  return capacity.active >= capacity.maxConcurrent;
 }
 
 /**

@@ -40,7 +40,7 @@ function templateReceiptWantsRetry(status: string | undefined, startedAt: string
 }
 import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, type CompletionLoad } from './verify.ts';
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild, type GoalInterruptionFacts } from './wait.ts';
-import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError, advertisedProfileCapacity, profileCapacityLimit, profileIdOfSelector, type RouteLimitProfile } from './route-limits.ts';
+import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError, advertisedProfileCapacity, profileCapacityFull, profileIdOfSelector, type RouteLimitProfile } from './route-limits.ts';
 import { SpawnLedger, defaultLedgerPath } from './spawn-ledger.ts';
 import { validateGoalFields, GoalFieldValidationError } from './builders.ts';
 import { withRouteLock, ROUTE_LOCK_STALE_MARGIN_MS } from './route-lock.ts';
@@ -70,6 +70,27 @@ export interface ClientConfig {
   routeLockTimeoutMs?: number;
   /** G1: warning sink (default a line on stderr). */
   onWarn?: (line: string) => void;
+}
+
+/**
+ * W0d: how one spawn/prompt is gated.
+ * - `local` — an explicit limit (per-call value or PI_ORCH_ROUTE_LIMITS entry):
+ *   refuse when THIS caller's live children on the route reach the limit.
+ * - `profile_active` — no explicit limit and the server advertises a Claude
+ *   profile capacity: the decision is the SERVER's own predicate
+ *   (`active >= maxConcurrent`, correction 01). `active` already counts this
+ *   parent's live turns, so the local count is NOT added or compared — it is
+ *   listed in the refusal as context only.
+ */
+type RouteGate =
+  | { kind: 'local'; limit: number; profile: RouteLimitProfile | undefined }
+  | { kind: 'profile_active'; limit: number; maxConcurrent: number; active: number; profile: RouteLimitProfile };
+
+/** The local live-children reading a gate refusal's message rides on. */
+interface CountedLive {
+  count: number;
+  live: Array<{ sessionId: string; reason: string }>;
+  countedBy: 'parent' | 'owner' | 'none';
 }
 
 /**
@@ -160,32 +181,64 @@ export class PiOrchClient {
     return (typeof ceiling === 'number' ? ceiling : 30_000 + 120_000) + ROUTE_LOCK_STALE_MARGIN_MS;
   }
 
-  /** The cap for one spawn/prompt call, with the Claude profile it belongs to
+  /** The gate for one spawn/prompt call, with the Claude profile it belongs to
     * (W0d: the profile facts ride on the exit-25 refusal so a parent is told
     * the cap and the overflow route instead of learning them from a failure).
-    * Priority: the per-call value wins; then an explicit map entry; then — on a
-    * Claude `profile:<id>` route only — the SERVER-ADVERTISED cap minus live
-    * server use. A bad per-call value is a usage-class error, never a silent
-    * unlimited (correction 01 item 6). */
-  private async effectiveLimit(runtime: string | undefined, route: string | undefined, perCall: number | undefined): Promise<{ limit: number | undefined; profile: RouteLimitProfile | undefined }> {
+    * Priority: the per-call value wins; then an explicit map entry (both keep
+    * the local-count semantics, and an explicit 0 = unlimited wins outright);
+    * then — on a Claude `profile:<id>` route only — the SERVER's advertised
+    * profile capacity, which is decided from the server's own numbers. A bad
+    * per-call value is a usage-class error, never a silent unlimited
+    * (correction 01 item 6). */
+  private async resolveRouteGate(runtime: string | undefined, route: string | undefined, perCall: number | undefined): Promise<RouteGate | undefined> {
     if (perCall !== undefined) {
       validateLimitValue(route ?? '(per-call)', perCall, 'route-limit');
-      return { limit: perCall > 0 ? perCall : undefined, profile: await this.profileRouteFacts(runtime, route) };
+      if (perCall <= 0) return undefined; // explicit unlimited
+      return { kind: 'local', limit: perCall, profile: await this.profileRouteFacts(runtime, route) };
     }
-    const profile = await this.profileRouteFacts(runtime, route);
     // An EXPLICIT entry (the env map / module config) always wins — including
     // an explicit 0, which means "unlimited" and must not be re-capped by the
-    // server's advertised profile default.
+    // server's advertised profile default (and needs no capacity read).
     if (route !== undefined && Object.prototype.hasOwnProperty.call(this.routeLimits, route)) {
-      return { limit: limitFor(route, this.routeLimits), profile };
+      const limit = limitFor(route, this.routeLimits);
+      if (limit === undefined) return undefined;
+      return { kind: 'local', limit, profile: await this.profileRouteFacts(runtime, route) };
     }
+    const profile = await this.profileRouteFacts(runtime, route);
     if (profile !== undefined && profile.maxConcurrent !== undefined && profile.active !== undefined) {
-      // W0d: no explicit limit, a Claude profile route, and the server does
-      // advertise → the advertised cap minus live server use. 0 means "at the
-      // cap NOW", not "unlimited", so it is returned as a real cap.
-      return { limit: profileCapacityLimit({ profileId: profile.profileId, maxConcurrent: profile.maxConcurrent, active: profile.active }), profile };
+      // W0d correction 01: no explicit limit, a Claude profile route, and the
+      // server does advertise → refuse from the server's numbers alone.
+      return { kind: 'profile_active', limit: profile.maxConcurrent, maxConcurrent: profile.maxConcurrent, active: profile.active, profile };
     }
-    return { limit: undefined, profile };
+    return undefined;
+  }
+
+  /**
+   * W0d: does this gate refuse a new turn? A `local` gate compares THIS
+   * caller's live children against its limit. An advertised profile gate
+   * refuses exactly when the server says the profile is full
+   * (`active >= maxConcurrent`, the server's own predicate) — the local count
+   * is returned purely as message context.
+   */
+  private gateRefusal(gate: RouteGate, counted: CountedLive): { limit: number; live: Array<{ sessionId: string; reason: string }> } | undefined {
+    if (gate.kind === 'profile_active') {
+      return profileCapacityFull(gate) ? { limit: gate.limit, live: counted.live } : undefined;
+    }
+    if (counted.countedBy === 'none') return undefined; // cannot count locally → today's behaviour
+    return counted.count >= gate.limit ? { limit: gate.limit, live: counted.live } : undefined;
+  }
+
+  /**
+   * The local live children a refusal lists. An advertised profile's decision
+   * does not need them, so a caller with no identity and no owner reads nothing
+   * (and raises no ROUTE_LIMIT_UNCOUNTED warning for a count that is not
+   * load-bearing).
+   */
+  private async countedForGate(route: string, owner: string | undefined, gate: RouteGate): Promise<CountedLive> {
+    if (gate.kind === 'profile_active' && !this.parentSessionId && !owner) {
+      return { count: 0, live: [], countedBy: 'none' };
+    }
+    return this.countLiveOnRoute(route, owner);
   }
 
   /**
@@ -402,7 +455,7 @@ export class PiOrchClient {
     if (!modelSelector && this.capsConfigured) {
       this.warnOnce('pi-orch: ROUTE_LIMIT_UNCOUNTED — this spawn names no --model-selector, so it is not counted against any per-route cap (caps apply only to spawns that name --model-selector)');
     }
-    const routeLimit = modelSelector ? await this.effectiveLimit(input.runtime, modelSelector, input.routeLimit) : { limit: undefined, profile: undefined };
+    const gate = modelSelector ? await this.resolveRouteGate(input.runtime, modelSelector, input.routeLimit) : undefined;
     const owner = input.retention?.ownerId;
     // The create itself, so the gate can hold the route lock ACROSS the
     // count and the create POST (correction 01 item 1: two concurrent spawns
@@ -456,8 +509,8 @@ export class PiOrchClient {
     // count→create span is serialised across processes with an exclusive
     // route lock (correction 01 item 1); the lock is held only across the
     // count and the create POST — a --wait-for-slot wait happens OUTSIDE it.
-    const created = routeLimit.limit !== undefined && modelSelector
-      ? await this.spawnUnderRouteGate(modelSelector, owner, routeLimit.limit, routeLimit.profile, input.waitForSlotMs, runCreate)
+    const created = gate !== undefined && modelSelector
+      ? await this.spawnUnderRouteGate(modelSelector, owner, gate, input.waitForSlotMs, runCreate)
       : await runCreate(!this.parentSessionId);
     const { raw, retention, sessionId } = created;
     // C3b: a templated GOAL child gets the verbatim instruction paragraph as a
@@ -489,8 +542,7 @@ export class PiOrchClient {
   private async spawnUnderRouteGate(
     route: string,
     owner: string | undefined,
-    limit: number,
-    profile: RouteLimitProfile | undefined,
+    gate: RouteGate,
     waitForSlotMs: number | undefined,
     create: (recordLedger: boolean) => Promise<{ raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string }>,
   ): Promise<{ raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string }> {
@@ -501,18 +553,26 @@ export class PiOrchClient {
     const key = `${useOwnerScope ? `owner:${owner}` : this.parentSessionId ?? 'no-identity'}|${route}`;
     const deadline = waitForSlotMs !== undefined ? Date.now() + waitForSlotMs : undefined;
     for (;;) {
-      const outcome = await withRouteLock({ dir: this.spawnLockDir, key, timeoutMs: this.routeLockTimeoutMs, staleMs: this.routeLockStaleMs }, async (): Promise<{ action: 'wait'; live: Array<{ sessionId: string; reason: string }> } | { action: 'create'; response: { raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string } }> => {
-        const { count, live, countedBy } = await this.countLiveOnRoute(route, owner);
-        if (countedBy !== 'none' && count >= limit) return { action: 'wait', live };
+      const outcome = await withRouteLock({ dir: this.spawnLockDir, key, timeoutMs: this.routeLockTimeoutMs, staleMs: this.routeLockStaleMs }, async (): Promise<{ action: 'wait'; limit: number; live: Array<{ sessionId: string; reason: string }> } | { action: 'create'; response: { raw: Record<string, unknown>; retention: { leaseId?: string } | undefined; sessionId: string } }> => {
+        const counted = await this.countedForGate(route, owner, gate);
+        const refusal = this.gateRefusal(gate, counted);
+        if (refusal) return { action: 'wait', limit: refusal.limit, live: refusal.live };
         // Record in the ledger whenever the owner ledger is the effective
         // counting domain (bare CLI, or a stale parent falling back to it).
-        return { action: 'create', response: await create(countedBy === 'owner') };
+        return { action: 'create', response: await create(counted.countedBy === 'owner') };
       });
       if (outcome.action === 'create') return outcome.response;
-      if (waitForSlotMs === undefined) throw new RouteLimitError(route, limit, outcome.live, profile);
+      // W0d correction 01: an advertised profile cap is a SERVER-wide
+      // condition — the turns holding it may belong to another parent — so no
+      // local watch reliably signals a free slot. --wait-for-slot refuses at
+      // once instead of promising a wait it cannot honour (documented); an
+      // explicit local limit keeps the watch-based wait.
+      if (gate.kind === 'profile_active' || waitForSlotMs === undefined) {
+        throw new RouteLimitError(route, outcome.limit, outcome.live, gate.profile);
+      }
       const remaining = (deadline as number) - Date.now();
-      if (remaining <= 0) throw new RouteLimitWaitDeadlineError(route, limit, waitForSlotMs);
-      await this.waitForRouteSlotOnce(route, limit, outcome.live, remaining, profile);
+      if (remaining <= 0) throw new RouteLimitWaitDeadlineError(route, outcome.limit, waitForSlotMs);
+      await this.waitForRouteSlotOnce(route, outcome.limit, outcome.live, remaining, gate.profile);
       // loop: re-count under a fresh lock
     }
   }
@@ -640,8 +700,8 @@ export class PiOrchClient {
     if (typeof detail !== 'object' || detail === null) return; // unreadable detail: let the POST answer
     const route = routeOfSession(detail as { modelSelector?: string; model?: string });
     const runtime = typeof (detail as { runtime?: unknown }).runtime === 'string' ? (detail as { runtime: string }).runtime : undefined;
-    const { limit, profile } = await this.effectiveLimit(runtime, route, perCall);
-    if (limit === undefined) return;
+    const gate = await this.resolveRouteGate(runtime, route, perCall);
+    if (gate === undefined) return;
     const [goal, evidence] = await Promise.all([this.goalStatusOf(sessionId), this.lastRunStatusOf(sessionId)]);
     if (liveReason({ busy: detail.busy === true, goalStatus: goal.value, lastRunStatus: evidence.value })) return; // live: no new concurrency
     // Correction 03 item 3: unknown target liveness must FAIL CLOSED — the
@@ -652,9 +712,10 @@ export class PiOrchClient {
     // the local spawn ledger), or an explicitly passed routeOwner (--owner on
     // the CLI), so an idle child cannot start a new turn past its owner's cap.
     const owner = routeOwner ?? this.spawnLedger.ownerOf(sessionId);
-    const { count, live, countedBy } = await this.countLiveOnRoute(route as string, owner);
-    if (countedBy === 'none' || count < limit) return;
-    throw new RouteLimitError(route as string, limit, live, profile);
+    const counted = await this.countedForGate(route as string, owner, gate);
+    const refusal = this.gateRefusal(gate, counted);
+    if (!refusal) return;
+    throw new RouteLimitError(route as string, refusal.limit, refusal.live, gate.profile);
   }
 
   /**
