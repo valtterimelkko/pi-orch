@@ -492,11 +492,16 @@ export class PiOrchClient {
       // the owner ledger must also record there, or the cap never sees the
       // new child). With a healthy identity, ?parent= counting is
       // server-authoritative and the ledger would be a second, weaker copy.
-      if (recordLedger) {
+      // W2c: an owner-tagged child is ALWAYS recorded — `status --owner` and
+      // `cleanup --owner` find children only through this ledger, and a parent
+      // that carries a session identity (PI_ORCH_PARENT_SESSION) used to skip
+      // the write, leaving its owner with 0 listed children (R1 card test).
+      if (recordLedger || input.retention?.ownerId !== undefined) {
         const recorded = this.spawnLedger.record({
           sessionId,
           route: modelSelector,
           ownerId: input.retention?.ownerId,
+          ...(retention?.leaseId !== undefined ? { leaseId: retention.leaseId } : {}),
           at: new Date().toISOString(),
         });
         if (recorded.note) this.warnOnce(`pi-orch: ${recorded.note}`);
@@ -577,14 +582,48 @@ export class PiOrchClient {
     }
   }
 
-  async prompt(sessionId: string, input: PromptInput & { followUpOnBusy?: boolean; routeLimit?: number; routeOwner?: string }): Promise<{
+  /**
+   * W2c verb 3: `mode: 'deliver'` is one atomic choice. A child with a live
+   * turn on a runtime that can steer is STEERED (requireActiveTurn, so a turn
+   * that ended in between is refused rather than silently queued); anything
+   * else — idle child, runtime without steer — gets follow_up. The choice and
+   * its reason ride back on `deliver`; the server's own dispatchMode and queue
+   * depth are reported as-is.
+   */
+  private async chooseDelivery(sessionId: string): Promise<DeliveryChoice> {
+    const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() });
+    const detail = (response.body ?? {}) as { runtime?: string; busy?: boolean; status?: string };
+    const busy = detail.busy === true || (detail.busy === undefined && detail.status === 'running');
+    if (!busy) return { chosen: 'follow_up', busy: false, reason: 'child is idle: follow_up starts its next turn' };
+    let canSteer = false;
+    try {
+      const capabilities = (await this.transport.request('GET', '/api/v1/capabilities', { headers: this.headers() })).body as { runtimes?: Record<string, { supportsSteer?: boolean; supportsSteerWhileBusy?: boolean }> };
+      const runtime = detail.runtime !== undefined ? capabilities.runtimes?.[detail.runtime] : undefined;
+      canSteer = runtime?.supportsSteer === true && runtime.supportsSteerWhileBusy !== false;
+    } catch {
+      canSteer = false; // capabilities unreadable: queue rather than guess
+    }
+    return canSteer
+      ? { chosen: 'steer', busy: true, reason: 'child has a live turn and its runtime supports steer' }
+      : { chosen: 'follow_up', busy: true, reason: 'child has a live turn but its runtime cannot steer one (or capabilities were unreadable): queued as follow_up' };
+  }
+
+  async prompt(sessionId: string, rawInput: Omit<PromptInput, 'mode'> & { mode?: PromptInput['mode'] | 'deliver'; followUpOnBusy?: boolean; routeLimit?: number; routeOwner?: string }): Promise<{
     runId: string;
     sessionId: string;
     detached: boolean;
     duplicate: boolean;
     dispatchMode?: string;
+    queueDepth?: number;
+    deliver?: DeliveryChoice;
     raw: unknown;
   }> {
+    let deliver: DeliveryChoice | undefined;
+    let input = rawInput as PromptInput & { followUpOnBusy?: boolean; routeLimit?: number; routeOwner?: string };
+    if (rawInput.mode === 'deliver') {
+      deliver = await this.chooseDelivery(sessionId);
+      input = { ...rawInput, mode: deliver.chosen, ...(deliver.chosen === 'steer' ? { requireActiveTurn: true } : {}) };
+    }
     // G1: a prompt that would START a new turn on an IDLE child of a limited
     // route adds one concurrent generation to that route — it is gated like a
     // spawn. A prompt to a LIVE child is never gated: follow_up queues after
@@ -607,12 +646,23 @@ export class PiOrchClient {
       // 409 codes propagate.
       const apiError = error as ApiError;
       const busyRefusal = apiError instanceof ApiError && apiError.status === 409 && apiError.code === 'SESSION_BUSY';
-      if (!(input.followUpOnBusy === true && busyRefusal)) throw error;
-      response = await this.transport.request('POST', path, {
-        body: { ...body, mode: 'follow_up' },
-        headers: this.headers(),
-        _idempotent: true,
-      });
+      // W2c deliver: the steer was refused 409 (the turn ended between the
+      // read and the send) — fall back ONCE to follow_up, which starts the
+      // next turn on an idle child. Any other failure propagates.
+      const steerRefusal = deliver?.chosen === 'steer' && apiError instanceof ApiError && apiError.status === 409;
+      if (steerRefusal) {
+        const { requireActiveTurn: _dropped, ...rest } = body;
+        void _dropped;
+        deliver = { chosen: 'follow_up', busy: false, reason: `steer refused (${apiError.code}) — the live turn ended; fell back to follow_up` };
+        response = await this.transport.request('POST', path, { body: { ...rest, mode: 'follow_up' }, headers: this.headers(), _idempotent: true });
+      } else {
+        if (!(input.followUpOnBusy === true && busyRefusal)) throw error;
+        response = await this.transport.request('POST', path, {
+          body: { ...body, mode: 'follow_up' },
+          headers: this.headers(),
+          _idempotent: true,
+        });
+      }
     }
     const raw = response.body as Record<string, unknown>;
     const duplicate = raw.duplicate === true;
@@ -624,6 +674,8 @@ export class PiOrchClient {
       detached: raw.detached === true,
       duplicate,
       dispatchMode: typeof raw.dispatchMode === 'string' ? raw.dispatchMode : undefined,
+      ...(queueDepthOf(raw) !== undefined ? { queueDepth: queueDepthOf(raw) } : {}),
+      ...(deliver !== undefined ? { deliver } : {}),
       raw,
     };
   }
@@ -763,6 +815,157 @@ export class PiOrchClient {
     flattened.raw = raw;
     return flattened;
   }
+  // ── W2c verb 1: goal pause / resume / show ───────────────────────────────
+
+  private flattenGoal(raw: Record<string, unknown>): Record<string, unknown> {
+    const goal = raw.goal as Record<string, unknown> | undefined;
+    return { ...raw, ...(goal && typeof goal === 'object' ? { status: goal.status, objective: goal.objective, goal } : {}) };
+  }
+
+  /** `reason` is sent for forward compatibility; servers up to contract 1.62.0 ignore it. */
+  async goalPause(sessionId: string, input: { reason?: string } = {}): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = { action: 'pause' };
+    if (input.reason !== undefined) body.reason = input.reason;
+    const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { body, headers: this.headers() });
+    return this.flattenGoal(response.body as Record<string, unknown>);
+  }
+
+  /** `note` is sent for forward compatibility; servers up to contract 1.62.0 ignore it (the child does not see it). */
+  async goalResume(sessionId: string, input: { note?: string } = {}): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = { action: 'resume' };
+    if (input.note !== undefined) body.note = input.note;
+    const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { body, headers: this.headers() });
+    return this.flattenGoal(response.body as Record<string, unknown>);
+  }
+
+  async goalShow(sessionId: string): Promise<Record<string, unknown>> {
+    const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() });
+    return response.body as Record<string, unknown>;
+  }
+
+  /**
+   * W2c verb 2: reroute a (possibly busy) goal child onto another model.
+   * Lesson behind the order: `set_model` on a busy child blocks until it is
+   * idle, so the goal is paused FIRST (it will not re-arm a turn), the live
+   * turn is aborted, the model/thinking are switched, and the goal resumes
+   * with the SAME objective (re-read to prove it). A session with no active
+   * goal gets the plain abort + switch with a note. Every step is reported;
+   * the first failure stops the sequence, and a goal this call paused gets
+   * ONE recovery resume so it is never left stuck paused.
+   */
+  async reroute(sessionId: string, input: { modelSelector: string; thinking?: string }): Promise<RerouteOutcome> {
+    const steps: RerouteStep[] = [];
+    const id = encodeURIComponent(sessionId);
+    const fail = (step: string, detail: string): RerouteStep => {
+      const entry = { step, ok: false, detail };
+      steps.push(entry);
+      return entry;
+    };
+    const pass = (step: string, detail: string): void => { steps.push({ step, ok: true, detail }); };
+    const describe = (error: unknown): string => {
+      const e = error as { code?: string; message?: string };
+      return [e.code, e.message].filter((part, index, all) => part && all.indexOf(part) === index).join(': ') || String(error);
+    };
+
+    let goal: { status?: string; objective?: string } | undefined;
+    try {
+      goal = await this.goalShow(sessionId) as { status?: string; objective?: string };
+      pass('read_goal', `goal status ${goal.status ?? 'unknown'}`);
+    } catch (error) {
+      pass('read_goal', `no readable goal (${describe(error)}) — treated as no goal`);
+    }
+    const hadGoal = goal !== undefined && ['running', 'paused', 'wrapping_up'].includes(goal.status ?? '') && typeof goal.objective === 'string' && goal.objective !== '';
+    const objective = hadGoal ? goal?.objective : undefined;
+    const outcome = (extra: Partial<RerouteOutcome>): RerouteOutcome => ({
+      ok: !steps.some((step) => !step.ok),
+      sessionId,
+      hadGoal,
+      steps,
+      ...(objective !== undefined ? { objective } : {}),
+      ...extra,
+    });
+
+    let paused = false;
+    if (hadGoal) {
+      if (goal?.status === 'paused') {
+        pass('pause_goal', 'goal was already paused');
+        paused = true;
+      } else {
+        try {
+          await this.goalPause(sessionId, { reason: `reroute to ${input.modelSelector}` });
+          pass('pause_goal', 'goal paused');
+          paused = true;
+        } catch (error) {
+          fail('pause_goal', describe(error));
+          return outcome({ ok: false, failedStep: 'pause_goal' });
+        }
+      }
+    }
+    const recover = async (failedStep: string): Promise<RerouteOutcome> => {
+      if (paused) {
+        try {
+          await this.goalResume(sessionId, { note: `Reroute to ${input.modelSelector} failed at ${failedStep}; resuming the same objective on the current model.` });
+          pass('resume_goal', `recovery resume after ${failedStep} failed — goal running again on the previous model`);
+        } catch (error) {
+          fail('resume_goal', `recovery resume failed (${describe(error)}) — the goal is left PAUSED, resume it by hand`);
+        }
+      }
+      return outcome({ ok: false, failedStep });
+    };
+
+    try {
+      await this.transport.request('POST', `/api/v1/sessions/${id}/abort`, { body: {}, headers: this.headers() });
+      pass('abort', 'live turn aborted');
+    } catch (error) {
+      if ((error as { status?: number }).status === 409) {
+        pass('abort', `nothing to abort (${(error as { code?: string }).code ?? 'session not streaming'})`);
+      } else {
+        fail('abort', describe(error));
+        return recover('abort');
+      }
+    }
+    try {
+      await this.transport.request('POST', `/api/v1/sessions/${id}/control`, { body: { action: 'set_model', modelId: input.modelSelector }, headers: this.headers() });
+      pass('set_model', `model set to ${input.modelSelector}`);
+    } catch (error) {
+      fail('set_model', describe(error));
+      return recover('set_model');
+    }
+    if (input.thinking !== undefined) {
+      try {
+        await this.transport.request('POST', `/api/v1/sessions/${id}/control`, { body: { action: 'set_thinking_level', level: input.thinking }, headers: this.headers() });
+        pass('set_thinking_level', `thinking level set to ${input.thinking}`);
+      } catch (error) {
+        fail('set_thinking_level', describe(error));
+        return recover('set_thinking_level');
+      }
+    }
+    if (!hadGoal) {
+      return outcome({ note: 'session has no goal: did a plain abort + model switch (nothing to pause or resume)' });
+    }
+    try {
+      await this.goalResume(sessionId, { note: `Rerouted to ${input.modelSelector}${input.thinking ? ` (thinking ${input.thinking})` : ''}; continue the same objective.` });
+      pass('resume_goal', 'goal resumed');
+    } catch (error) {
+      fail('resume_goal', describe(error));
+      return outcome({ ok: false, failedStep: 'resume_goal' });
+    }
+    try {
+      const after = await this.goalShow(sessionId) as { status?: string; objective?: string };
+      const intact = after.objective === objective;
+      const running = after.status !== 'paused';
+      if (intact && running) {
+        pass('verify_goal', `goal ${after.status ?? 'unknown'} with the same objective`);
+        return outcome({ objectiveIntact: true });
+      }
+      fail('verify_goal', intact ? `goal still ${after.status} after resume` : 'the goal objective changed across the reroute');
+      return outcome({ ok: false, failedStep: 'verify_goal', objectiveIntact: intact });
+    } catch (error) {
+      fail('verify_goal', `could not re-read the goal: ${describe(error)}`);
+      return outcome({ ok: false, failedStep: 'verify_goal' });
+    }
+  }
+
   async registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; generation?: string; raw: unknown }> {
     const body = buildWatchBody(input);
     const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/watch`, {
@@ -985,7 +1188,7 @@ export class PiOrchClient {
     };
   }
 
-  async result(runId: string, options: { includeTranscript?: boolean } = {}): Promise<{
+  async result(runId: string, options: { includeTranscript?: boolean; final?: boolean } = {}): Promise<{
     runId: string;
     sessionId: string;
     status: string;
@@ -1004,6 +1207,7 @@ export class PiOrchClient {
     completionCapturedBy?: CompletionCaptureSource;
     evidence: { receipt: string; transcript: string; sessionPath?: string; completion?: string };
     transcript?: Array<{ kind: string; text: string }>;
+    final?: FinalResult;
   }> {
     const response = await this.transport.request('GET', `/api/v1/runs/${encodeURIComponent(runId)}`, { headers: this.headers() });
     const receipt = parseReceipt(response.body) as Receipt & ReceiptWithCompletion;
@@ -1027,14 +1231,36 @@ export class PiOrchClient {
       ...(resolved?.source === 'session_surface' ? { completion: `/api/v1/sessions/${encodeURIComponent(sessionId)}` } : resolved ? { completion: `/api/v1/runs/${encodeURIComponent(runId)}` } : {}),
     };
     let transcript: Array<{ kind: string; text: string }> | undefined;
-    if (options.includeTranscript) {
-      const transcriptResponse = await this.transport.request(
-        'GET',
-        `/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript?scope=visible_full`,
-        { headers: this.headers(), timeoutMs: 60_000 },
-      );
-      const body = transcriptResponse.body as { items?: Array<{ kind: string; text: string }> };
-      transcript = body.items ?? [];
+    if (options.includeTranscript || (options.final === true && !hasText(receipt.finalText) && resolved?.completion === undefined)) {
+      try {
+        const transcriptResponse = await this.transport.request(
+          'GET',
+          `/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript?scope=visible_full`,
+          { headers: this.headers(), timeoutMs: 60_000 },
+        );
+        const body = transcriptResponse.body as { items?: Array<{ kind: string; text: string }> };
+        transcript = body.items ?? [];
+      } catch (error) {
+        // An explicitly requested transcript keeps failing loudly; the
+        // --final lookup is best effort and degrades to source 'none'.
+        if (options.includeTranscript) throw error;
+      }
+    }
+    // W2c verb 5: --final is the answer a parent wants — the parsed completion
+    // block, else the receipt's final text, else the last substantive
+    // ASSISTANT text in the transcript; never a blank tool-call tail.
+    let final: FinalResult | undefined;
+    if (options.final === true) {
+      if (resolved?.completion !== undefined) {
+        final = { source: 'completion', completion: resolved.completion, ...(hasText(receipt.finalText) ? { text: receipt.finalText } : {}) };
+      } else if (hasText(receipt.finalText)) {
+        final = { source: 'receipt', text: receipt.finalText };
+      } else {
+        const lastAssistant = [...(transcript ?? [])].reverse().find((item) => item.kind === 'assistant' && hasText(item.text));
+        final = lastAssistant
+          ? { source: 'transcript', text: lastAssistant.text }
+          : { source: 'none', note: 'no substantive assistant text on the receipt or in the visible transcript — read the transcript evidence' };
+      }
     }
     return {
       runId: receipt.runId,
@@ -1052,7 +1278,8 @@ export class PiOrchClient {
       ...(resolved?.capturedAt !== undefined ? { completionCapturedAt: resolved.capturedAt } : {}),
       ...(resolved?.capturedBy !== undefined ? { completionCapturedBy: resolved.capturedBy } : {}),
       evidence,
-      ...(transcript !== undefined ? { transcript } : {}),
+      ...(options.includeTranscript && transcript !== undefined ? { transcript } : {}),
+      ...(final !== undefined ? { final } : {}),
     };
   }
 
@@ -1118,10 +1345,13 @@ export class PiOrchClient {
         notes.push(`watch delete failed: ${(error as Error).message}`);
       }
     }
-    if (options.leaseId) {
+    // W2c: the spawn ledger stores the lease the spawn acquired, so a single
+    // cleanup without --lease releases it too instead of leaving it to expire.
+    const leaseId = options.leaseId ?? this.spawnLedger.leaseOf(sessionId);
+    if (leaseId) {
       try {
         await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/control`, {
-          body: { action: 'release_retention', retentionLeaseId: options.leaseId, ...(options.ownerId ? { ownerId: options.ownerId } : {}) },
+          body: { action: 'release_retention', retentionLeaseId: leaseId, ...(options.ownerId ? { ownerId: options.ownerId } : {}) },
           headers: this.headers(),
         });
         released = true;
@@ -1130,7 +1360,79 @@ export class PiOrchClient {
       }
     }
     await this.transport.request('DELETE', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() });
+    this.spawnLedger.remove(sessionId);
     return { released, deleted: true, notes };
+  }
+
+  /**
+   * W2c verb 6: clean up EVERY ledger child of one owner — and only that
+   * owner's. Per child: cancel its watch first (generation-safe: the
+   * generation is read and sent as the CAS precondition, a replaced watch is
+   * skipped), release the stored lease (or, for an entry recorded before the
+   * ledger kept leases, the leases the session detail reports), then delete.
+   * A 404 anywhere means "already gone" and counts as cleaned. One child's
+   * failure is reported and never stops the others; a child that could not be
+   * deleted stays in the ledger so a re-run finds it again.
+   */
+  async cleanupOwner(ownerId: string): Promise<CleanupOwnerReport> {
+    const children: CleanupOwnerChild[] = [];
+    for (const entry of this.spawnLedger.entriesOf(ownerId)) {
+      const sessionId = entry.sessionId;
+      const id = encodeURIComponent(sessionId);
+      const child: CleanupOwnerChild = { sessionId, watchDeleted: false, released: false, deleted: false, notes: [] };
+      const fail = (message: string): void => { child.error ??= message; };
+      const gone = (error: unknown): boolean => (error as { status?: number }).status === 404;
+      try {
+        const outcome = await this.deleteOwnWatchConditionally(sessionId);
+        child.watchDeleted = outcome.deleted;
+        if (outcome.note) child.notes.push(outcome.note);
+      } catch (error) {
+        child.notes.push(`watch delete failed: ${describeError(error)}`);
+        fail(`watch: ${describeError(error)}`);
+      }
+      let leaseIds: string[] = entry.leaseId !== undefined ? [entry.leaseId] : [];
+      if (leaseIds.length === 0) {
+        try {
+          const detail = (await this.transport.request('GET', `/api/v1/sessions/${id}`, { headers: this.headers() })).body as { retention?: { leases?: Array<{ leaseId?: string }> } };
+          leaseIds = (detail.retention?.leases ?? []).map((lease) => lease.leaseId).filter((lease): lease is string => typeof lease === 'string');
+          if (leaseIds.length === 0) child.notes.push('no lease recorded or reported (nothing to release)');
+        } catch (error) {
+          if (!gone(error)) { child.notes.push(`lease lookup failed: ${describeError(error)}`); fail(`lease lookup: ${describeError(error)}`); }
+        }
+      }
+      let releasedAll = leaseIds.length > 0;
+      for (const leaseId of leaseIds) {
+        try {
+          await this.transport.request('POST', `/api/v1/sessions/${id}/control`, {
+            body: { action: 'release_retention', retentionLeaseId: leaseId, ownerId },
+            headers: this.headers(),
+          });
+        } catch (error) {
+          releasedAll = false;
+          if (gone(error)) {
+            child.notes.push(`lease ${leaseId}: session not found (already gone)`);
+          } else {
+            child.notes.push(`lease ${leaseId} release failed: ${describeError(error)}`);
+            fail(`lease ${leaseId}: ${describeError(error)}`);
+          }
+        }
+      }
+      child.released = releasedAll;
+      try {
+        await this.transport.request('DELETE', `/api/v1/sessions/${id}`, { headers: this.headers() });
+        child.deleted = true;
+      } catch (error) {
+        if (gone(error)) {
+          child.deleted = true;
+          child.notes.push('session not found (already gone)');
+        } else {
+          fail(`delete: ${describeError(error)}`);
+        }
+      }
+      if (child.deleted) this.spawnLedger.remove(sessionId);
+      children.push(child);
+    }
+    return { owner: ownerId, ok: children.every((child) => child.deleted && child.error === undefined), children };
   }
 
   async status(target: { parent?: string; sessionId?: string; owner?: string }): Promise<{
@@ -1146,7 +1448,9 @@ export class PiOrchClient {
       goalStatus?: string;
       goalObjective?: string;
       goalInterruption?: GoalInterruptionFacts;
-      lastRun?: { runId?: string; status?: string; errorCode?: string };
+      lastRun?: { runId?: string; status?: string; endedAt?: string | number; errorCode?: string };
+      readErrors?: string[];
+      missing?: boolean;
     }>;
   }> {
     if (target.sessionId) {
@@ -1158,21 +1462,31 @@ export class PiOrchClient {
     // ledger noted at spawn time (G1). Per-host, best-effort: children
     // spawned by other clients (hand-written curl) are invisible here.
     if (target.owner) {
-      const list = await this.transport.request('GET', '/api/v1/sessions', { headers: this.headers() });
-      const sessions = (list.body as { sessions?: Array<{ sessionId: string }> }).sessions ?? [];
-      const known = new Set(sessions.map((session) => session.sessionId));
-      const { sessionIds, pruned, note } = this.spawnLedger.entriesFor(target.owner, known);
-      const children: Awaited<ReturnType<PiOrchClient['childStatus']>>[] = [];
-      const queue = [...sessionIds];
+      // W2c: the owner's children come from the ledger and each is read by id.
+      // The sessions LIST (which can be limited) no longer decides existence —
+      // only a 404 on the per-session read prunes (R1 card test: an existing
+      // idle child was dropped from the ledger and 0 children were listed).
+      const entries = this.spawnLedger.entriesOf(target.owner);
+      const found: Array<Awaited<ReturnType<PiOrchClient['childStatus']>>> = [];
+      const queue = [...entries];
+      let pruned = 0;
       const worker = async (): Promise<void> => {
         for (;;) {
-          const sessionId = queue.shift();
-          if (!sessionId) return;
-          children.push(await this.childStatus(sessionId));
+          const entry = queue.shift();
+          if (!entry) return;
+          const child = await this.childStatus(entry.sessionId);
+          if (child.missing) {
+            this.spawnLedger.remove(entry.sessionId);
+            pruned += 1;
+          } else {
+            found.push(child);
+          }
         }
       };
       await Promise.all([worker(), worker(), worker(), worker()]);
-      return { owner: target.owner, pruned, ...(note ? { note } : {}), children };
+      const order = new Map(entries.map((entry, index) => [entry.sessionId, index]));
+      found.sort((left, right) => (order.get(left.sessionId) ?? 0) - (order.get(right.sessionId) ?? 0));
+      return { owner: target.owner, pruned, ...(this.spawnLedger.path ? {} : { note: 'no ledger path' }), children: found };
     }
     if (!target.parent) throw new Error('pi-orch: status needs --parent <id>, --owner <id> or a sessionId');
     const query = new URLSearchParams({ parent: target.parent });
@@ -1205,36 +1519,170 @@ export class PiOrchClient {
     goalStatus?: string;
     goalObjective?: string;
     goalInterruption?: GoalInterruptionFacts;
-    lastRun?: { runId?: string; status?: string; errorCode?: string };
+    lastRun?: { runId?: string; status?: string; endedAt?: string | number; errorCode?: string };
+    readErrors?: string[];
+    missing?: boolean;
   }> {
-    // Correction 04 item 6: direct reads derive busy from the session detail.
-    const detail = known ?? await this.transport
-      .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() })
-      .then((response) => response.body as { runtime?: string; busy?: boolean; status?: string })
-      .catch(() => ({}) as { runtime?: string; busy?: boolean; status?: string });
+    const readErrors: string[] = [];
+    const describe = (error: unknown): string => {
+      const e = error as { code?: string; message?: string };
+      return [e.code, e.message].filter((part, index, all) => part && all.indexOf(part) === index).join(' ');
+    };
+    let missing = false;
+    // W2c: GET /sessions rows carry busy/status only optionally (SessionInfo),
+    // so a row that has neither is not enough — read the detail. A failed read
+    // is surfaced in readErrors; it used to vanish into silent nulls.
+    let detail: { runtime?: string; busy?: boolean; status?: string } | undefined = known;
+    if (detail === undefined || (detail.busy === undefined && detail.status === undefined)) {
+      try {
+        const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() });
+        detail = { ...detail, ...((response.body ?? {}) as { runtime?: string; busy?: boolean; status?: string }) };
+      } catch (error) {
+        if ((error as { status?: number }).status === 404) missing = true;
+        readErrors.push(`detail: ${describe(error)}`);
+        detail ??= {};
+      }
+    }
     const [goal, evidence] = await Promise.all([
       this.transport
         .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() })
         .then((response) => response.body as { status?: string; objective?: string; interruption?: GoalInterruptionFacts })
-        .catch(() => ({ status: 'unknown' as string | undefined, objective: undefined as string | undefined, interruption: undefined as GoalInterruptionFacts | undefined })),
+        .catch((error: unknown) => {
+          if ((error as { status?: number }).status !== 404) readErrors.push(`goal: ${describe(error)}`);
+          return { status: 'unknown' as string | undefined, objective: undefined as string | undefined, interruption: undefined as GoalInterruptionFacts | undefined };
+        }),
       this.transport
         .request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/evidence`, { headers: this.headers() })
-        .then((response) => response.body as { runChronology?: Array<{ runId?: string; status?: string; errorCode?: string }>; status?: string })
-        .catch(() => ({ runChronology: [] as Array<{ runId?: string; status?: string; errorCode?: string }>, status: undefined as string | undefined })),
+        .then((response) => response.body as { runChronology?: RunChronologyEntry[]; status?: string })
+        .catch((error: unknown) => {
+          readErrors.push(`evidence: ${describe(error)}`);
+          return { runChronology: [] as RunChronologyEntry[], status: undefined as string | undefined };
+        }),
     ]);
-    const last = evidence.runChronology?.[0];
+    const last = newestRun(evidence.runChronology ?? []);
+    const status = detail.status ?? evidence.status;
+    const busy = detail.busy ?? (status !== undefined ? status === 'running' : undefined);
     return {
       sessionId,
       runtime: detail.runtime,
-      busy: detail.busy,
-      status: detail.status ?? evidence.status,
+      busy,
+      status,
       goalStatus: goal?.status,
       goalObjective: goal?.objective,
       // Wave K (additive): present only when the server holds interruption facts.
       ...(goal?.interruption ? { goalInterruption: goal.interruption } : {}),
-      lastRun: last ? { runId: last.runId, status: last.status, errorCode: last.errorCode ?? undefined } : undefined,
+      lastRun: last
+        ? {
+            runId: last.runId,
+            status: last.status,
+            ...(runEndedAt(last) !== undefined ? { endedAt: runEndedAt(last) } : {}),
+            errorCode: last.errorCode ?? undefined,
+          }
+        : undefined,
+      ...(readErrors.length > 0 ? { readErrors } : {}),
+      ...(missing ? { missing: true } : {}),
     };
   }
+}
+
+type RunChronologyEntry = { runId?: string; status?: string; errorCode?: string | null; startedAt?: string | number; terminalAt?: string | number; agentEndAt?: string | number; endedAt?: string | number; completedAt?: string | number; finishedAt?: string | number; createdAt?: string | number; acceptedAt?: string | number };
+
+function runEndedAt(run: RunChronologyEntry): string | number | undefined {
+  // The server's evidence chronology carries terminalAt / agentEndAt; the rest are tolerated aliases.
+  return run.terminalAt ?? run.agentEndAt ?? run.endedAt ?? run.completedAt ?? run.finishedAt ?? undefined;
+}
+
+function runTime(run: RunChronologyEntry): number | undefined {
+  for (const value of [run.terminalAt, run.agentEndAt, run.endedAt, run.completedAt, run.finishedAt, run.startedAt, run.createdAt, run.acceptedAt]) {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string') {
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * W2c: the newest run of an evidence chronology. The contract does not pin the
+ * order, so timestamps decide when entries carry them; without any timestamp
+ * the first entry stays the last run (the pre-existing reading).
+ */
+function newestRun(runs: RunChronologyEntry[]): RunChronologyEntry | undefined {
+  let best: RunChronologyEntry | undefined;
+  let bestTime = -Infinity;
+  for (const run of runs) {
+    const time = runTime(run);
+    if (time !== undefined && time > bestTime) { best = run; bestTime = time; }
+  }
+  return best ?? runs[0];
+}
+
+export interface CleanupOwnerChild {
+  sessionId: string;
+  watchDeleted: boolean;
+  released: boolean;
+  deleted: boolean;
+  notes: string[];
+  error?: string;
+}
+
+export interface CleanupOwnerReport {
+  owner: string;
+  ok: boolean;
+  children: CleanupOwnerChild[];
+}
+
+/** W2c: the answer `result --final` selected and where it came from. */
+export interface FinalResult {
+  source: 'completion' | 'receipt' | 'transcript' | 'none';
+  text?: string;
+  completion?: CompletionBlock;
+  note?: string;
+}
+
+function hasText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/** W2c: a one-line, code-bearing description of a thrown error. */
+function describeError(error: unknown): string {
+  const e = error as { code?: string; message?: string };
+  const parts = [e.code, e.message].filter((part, index, all): part is string => typeof part === 'string' && part !== '' && all.indexOf(part) === index);
+  return parts.length > 0 ? parts.join(': ') : String(error);
+}
+
+/** W2c: what `prompt --mode deliver` chose and why. */
+export interface DeliveryChoice {
+  chosen: 'steer' | 'follow_up';
+  busy: boolean;
+  reason: string;
+}
+
+export interface RerouteStep {
+  step: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface RerouteOutcome {
+  ok: boolean;
+  sessionId: string;
+  hadGoal: boolean;
+  steps: RerouteStep[];
+  objective?: string;
+  objectiveIntact?: boolean;
+  failedStep?: string;
+  note?: string;
+}
+
+/** The queue depth a dispatch response reports, under any of the names the server has used. */
+function queueDepthOf(raw: Record<string, unknown>): number | undefined {
+  for (const key of ['queueDepth', 'queuedCount', 'queueLength']) {
+    if (typeof raw[key] === 'number') return raw[key] as number;
+  }
+  const queue = raw.queue as { depth?: unknown } | undefined;
+  return queue && typeof queue.depth === 'number' ? queue.depth : undefined;
 }
 
 function defaultRandomId(): string {

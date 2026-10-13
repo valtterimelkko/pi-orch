@@ -24,14 +24,19 @@ import { defaultSocketPath, defaultTokenPath, loadSnapshot, liveContractVersion 
 import { readToken } from './transport.ts';
 
 export interface ClientLike {
+  goalPause(sessionId: string, input: { reason?: string }): Promise<Record<string, unknown>>;
+  goalResume(sessionId: string, input: { note?: string }): Promise<Record<string, unknown>>;
+  goalShow(sessionId: string): Promise<Record<string, unknown>>;
+  reroute(sessionId: string, input: { modelSelector: string; thinking?: string }): Promise<{ ok: boolean; hadGoal: boolean; failedStep?: string; note?: string; objectiveIntact?: boolean; steps: Array<{ step: string; ok: boolean; detail: string }>; [key: string]: unknown }>;
+  cleanupOwner(ownerId: string): Promise<{ owner: string; ok: boolean; children: Array<{ sessionId: string; watchDeleted: boolean; released: boolean; deleted: boolean; notes: string[]; error?: string }> }>;
   goalStart(sessionId: string, input: { objective: string; maxTurns?: number; verifyCommand?: string; budgetTokens?: number; completionTemplate?: boolean }): Promise<Record<string, unknown>>;
   registerWatch(sessionId: string, input: { conditions: WatchConditionSpec[]; label?: string; fireIfSettled?: boolean; pin?: boolean }): Promise<{ watchId: string; status?: string; generation?: string; raw: unknown }>;
   getWatch(sessionId: string): Promise<{ watchId: string; status?: string; label?: string; generation?: string; firingCount?: number; allFired?: boolean; firings?: Array<Record<string, unknown>> } | null>;
   deleteWatch(sessionId: string, options?: { expectedGeneration?: string }): Promise<{ success?: boolean; watchId?: string; generation?: string }>;
   spawn(input: Record<string, unknown>): Promise<{ sessionId: string; leaseId?: string; parentId?: string; resolvedModel?: string; raw?: unknown }>;
-  prompt(sessionId: string, input: Record<string, unknown>): Promise<{ runId: string; sessionId: string; detached: boolean; duplicate: boolean; dispatchMode?: string }>;
+  prompt(sessionId: string, input: Record<string, unknown>): Promise<{ runId: string; sessionId: string; detached: boolean; duplicate: boolean; dispatchMode?: string; queueDepth?: number; deliver?: { chosen: string; busy: boolean; reason: string } }>;
   wait(options: { sessionId: string; runId?: string; conditions?: WatchConditionSpec[]; objective?: string; deadlineMs?: number; label?: string }): Promise<{ kind: string; [key: string]: unknown }>;
-  result(runId: string, options?: { includeTranscript?: boolean }): Promise<Record<string, unknown>>;
+  result(runId: string, options?: { includeTranscript?: boolean; final?: boolean }): Promise<Record<string, unknown>>;
   verify(input: { sessionId: string; runId?: string }): Promise<{ implemented: false; plannedBy: string } | { sessionId: string; verdict: string; claims: Array<Record<string, unknown>>; summary: string }>;
   cleanup(sessionId: string, options?: { leaseId?: string; ownerId?: string; watchId?: string }): Promise<{ released: boolean; deleted: boolean; notes: string[] }>;
   status(target: { parent?: string; sessionId?: string; owner?: string }): Promise<{ parent?: string; owner?: string; pruned?: number; children: Array<Record<string, unknown>> }>;
@@ -66,7 +71,7 @@ interface ParsedArgs {
 
 const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool', 'route-limit']);
 /** Flags that never consume the following token (so `--all c1@r1` keeps the id positional). */
-const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled', 'force-unconditional']);
+const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled', 'force-unconditional', 'final']);
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const verb = argv[0] ?? '';
@@ -173,6 +178,15 @@ Verbs:
   spawn --runtime rt --cwd dir [...]   create a child (retention, goal, preflight)
   goal <sessionId> start [...]         arm a goal on a CREATED child (H-b parent
                                        pattern: create, then goal) with budget
+  goal <sessionId> pause [--reason R]  pause the goal (the engine will not re-arm a turn)
+  goal <sessionId> resume [--note N]   resume the paused goal (same objective)
+  goal <sessionId> show                read the goal projection (status, objective, runs)
+  reroute <sessionId> --model-selector SEL [--thinking L]
+                                       move a (busy) goal child to another model:
+                                       pause goal → abort the live turn → set_model
+                                       (+ thinking) → resume the SAME objective, each
+                                       step reported; a session with no goal gets a
+                                       plain abort + set_model; exit 1 on a failed step
   watch <sessionId> register --conditions a,b [--label L] [--pin] [--fire-if-settled]
   watch <sessionId> delete [--generation G] | list
                                        delete is generation-safe (409 mismatch → exit 19,
@@ -180,9 +194,15 @@ Verbs:
                                        REFUSES unless --force-unconditional (legacy blind
                                        delete — the only unconditional path)
   prompt <sessionId> --message text    detached dispatch with idempotency key
+       [--mode deliver]                deliver = steer if the child has a live turn on a
+                                       runtime that can steer, else follow_up; reports
+                                       what was done (and the queue depth if known)
   wait <sessionId> [--run-id id]       watch-based wait; never polls; deadline
        [--all|--any id[@runId] ...]    several children in ONE call (no shell loop)
   result <runId> [--transcript]        receipt final text + evidence pointers
+         [--final]                     only the answer: the parsed completion block, else
+                                       the receipt text, else the last non-empty assistant
+                                       message (never an empty tool-call tail)
   verify <sessionId> [--run-id id]     re-check completion claims (read-only git):
        [--since ref] [--rerun "cmd"]   commits exist in their repos (reachability
        [--cwd dir] [--repo dir]        checked against --since), filesChanged
@@ -191,7 +211,12 @@ Verbs:
                                        the child's cwd. Verdicts: verified (0) /
                                        contradicted (20) / unverifiable (21)
   cleanup <sessionId> [--lease id --owner id] [--watch id]
-                                       release the owned lease, then delete
+                                       release the owned lease (the spawn ledger's lease
+                                       when --lease is omitted), then delete
+  cleanup --owner ID                   EVERY ledger child of that owner (only that owner):
+                                       cancel its watch (generation-safe), release the
+                                       stored lease, delete; one report line per child;
+                                       exit 1 if any child could not be cleaned
   status [--parent id] | [--owner id] | [sessionId]
                                        children by parent OR by retention owner
                                        (Claude Code parents: owner is the only
@@ -217,7 +242,7 @@ Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
   --wait-for-slot S (instead of refusing over the limit, watch the live
     children on that route and spawn when one settles; exit 3 on timeout)
 
-Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
+Prompt flags: --mode prompt|follow_up|steer|deliver, --no-detach, --idempotency-key K,
   --verbosity answers|tasks|full, --require-active-turn, --preflight-path/--preflight-tool,
   --owner ID (route counting only: the per-route gate counts THIS owner's
     live children when the prompt would start a new turn on an idle child),
@@ -270,11 +295,12 @@ const VERB_FLAGS: Record<string, Set<string>> = {
   spawn: new Set(['runtime', 'cwd', 'owner', 'ttl', 'label', 'model-selector', 'model-match', 'thinking', 'goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'wait-for-slot', 'agent-os-capture', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
   prompt: new Set(['message', 'mode', 'no-detach', 'idempotency-key', 'verbosity', 'require-active-turn', 'owner', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
   wait: new Set(['deadline', 'objective', 'conditions', 'run-id', 'all', 'any', 'label', 'slice']),
-  result: new Set(['transcript']),
+  result: new Set(['transcript', 'final']),
   verify: new Set(['run-id', 'since', 'rerun', 'rerun-timeout', 'cwd', 'repo']),
   cleanup: new Set(['lease', 'owner', 'watch']),
   status: new Set(['parent', 'owner']),
-  goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template']),
+  goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template', 'reason', 'note']),
+  reroute: new Set(['model-selector', 'thinking']),
   watch: new Set(['conditions', 'objective', 'label', 'pin', 'fire-if-settled', 'id-only', 'generation', 'force-unconditional']),
 };
 
@@ -356,7 +382,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
 
   // Validate the verb BEFORE touching the client factory (a bad command must
   // be a usage error, not a transport error).
-  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch']);
+  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute']);
   if (!KNOWN_VERBS.has(args.verb)) {
     throw new UsageError(`unknown verb '${args.verb}'`);
   }
@@ -482,7 +508,33 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const sessionId = args.positional[0];
       const action = args.positional[1];
       if (!sessionId) throw new UsageError('goal needs <sessionId>');
-      if (action !== 'start') throw new UsageError("goal supports only 'start' — pause/resume/clear stay interactive (goal <sessionId> start --goal-objective OBJ)");
+      if (action === 'pause' || action === 'resume' || action === 'show') {
+        // W2c: per-action flag strictness — VERB_FLAGS is verb-wide, so a flag
+        // that belongs to another action must not be silently dropped here.
+        const own = action === 'pause' ? ['reason'] : action === 'resume' ? ['note'] : [];
+        const stray = [...args.flags.keys()].filter((name) => !COMMON_FLAGS.has(name) && !own.includes(name));
+        if (stray.length > 0) throw new UsageError(`unknown flag(s) for 'goal ${action}': ${stray.map((name) => `--${name}`).join(', ')}`);
+        if (action === 'pause') {
+          const body = await getClient().goalPause(sessionId, { ...(flagString(args, 'reason') !== undefined ? { reason: flagString(args, 'reason') } : {}) });
+          return output(json, body, goalLine);
+        }
+        if (action === 'resume') {
+          const body = await getClient().goalResume(sessionId, { ...(flagString(args, 'note') !== undefined ? { note: flagString(args, 'note') } : {}) });
+          return output(json, body, goalLine);
+        }
+        const body = await getClient().goalShow(sessionId);
+        return output(json, body, (value) => {
+          const goal = value as { status?: string; objective?: string; runs?: number; maxRuns?: number | null; pausedReason?: string | null; lastReason?: string | null };
+          return [
+            goalLine(value),
+            goal.runs !== undefined ? `runs ${goal.runs}${goal.maxRuns != null ? `/${goal.maxRuns}` : ''}` : undefined,
+            goal.pausedReason ? `paused: ${goal.pausedReason}` : undefined,
+            goal.lastReason ? `last: ${goal.lastReason}` : undefined,
+          ].filter(Boolean).join('\n');
+        });
+      }
+      if (action !== 'start') throw new UsageError("goal supports start|pause|resume|show (goal <sessionId> start --goal-objective OBJ | pause [--reason R] | resume [--note N] | show)");
+      if (args.flags.has('reason') || args.flags.has('note')) throw new UsageError(`unknown flag(s) for 'goal start': ${['reason', 'note'].filter((name) => args.flags.has(name)).map((name) => `--${name}`).join(', ')}`);
       const objective = flagString(args, 'goal-objective');
       if (!objective) throw new UsageError('goal start needs --goal-objective OBJ');
       const budget = flagNumber(args, 'goal-budget-tokens');
@@ -515,6 +567,19 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         };
       }
       return budget === undefined ? { ...rendered, stderr: DEFAULT_BUDGET_NOTE } : rendered;
+    }
+    case 'reroute': {
+      const sessionId = args.positional[0];
+      if (!sessionId) throw new UsageError('reroute needs <sessionId>');
+      const modelSelector = flagString(args, 'model-selector');
+      if (!modelSelector) throw new UsageError('reroute needs --model-selector SEL');
+      const thinking = flagString(args, 'thinking');
+      const outcome = await getClient().reroute(sessionId, { modelSelector, ...(thinking !== undefined ? { thinking } : {}) });
+      const lines = outcome.steps.map((step) => `${step.ok ? 'ok  ' : 'FAIL'} ${step.step}: ${step.detail}`);
+      if (outcome.note) lines.push(outcome.note);
+      lines.push(outcome.ok ? `reroute ok${outcome.hadGoal ? ' — goal resumed with the same objective' : ''}` : `reroute FAILED at ${outcome.failedStep ?? 'unknown'}`);
+      const stdout = json ? `${JSON.stringify(outcome, null, 2)}` : lines.join('\n');
+      return outcome.ok ? { exitCode: 0, stdout } : { exitCode: 1, stdout, stderr: `pi-orch: reroute failed at ${outcome.failedStep ?? 'unknown'} — see each step's result${json ? ' in the JSON on stdout' : ' above'}` };
     }
     case 'watch': {
       // J2 P4: register/list/delete WITHOUT waiting — the idle-parent pattern:
@@ -621,11 +686,13 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         ...(flagString(args, 'owner') !== undefined ? { routeOwner: flagString(args, 'owner') } : {}),
       });
       return output(json, body, (value) => {
-        const prompt = value as { runId: string; duplicate: boolean; dispatchMode?: string };
+        const prompt = value as { runId: string; duplicate: boolean; dispatchMode?: string; queueDepth?: number; deliver?: { chosen: string; reason: string } };
         if (args.flags.has('id-only')) return prompt.runId;
         return [
           `run ${prompt.runId}${prompt.duplicate ? ' (duplicate: idempotent replay)' : ''}`,
           prompt.dispatchMode ? `dispatch ${prompt.dispatchMode}` : undefined,
+          prompt.deliver ? `delivered ${prompt.deliver.chosen} — ${prompt.deliver.reason}` : undefined,
+          prompt.queueDepth !== undefined ? `queue depth ${prompt.queueDepth}` : undefined,
         ]
           .filter(Boolean)
           .join('\n');
@@ -677,7 +744,14 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
     case 'result': {
       const runId = args.positional[0];
       if (!runId) throw new UsageError('result needs <runId>');
-      const body = await getClient().result(runId, { includeTranscript: args.flags.has('transcript') });
+      const wantFinal = args.flags.has('final');
+      const body = await getClient().result(runId, { includeTranscript: args.flags.has('transcript'), ...(wantFinal ? { final: true } : {}) });
+      if (wantFinal && !json) {
+        const final = (body as { final?: { source: string; text?: string; completion?: unknown; note?: string } }).final;
+        if (final?.text) return { exitCode: 0, stdout: final.text };
+        if (final?.completion) return { exitCode: 0, stdout: JSON.stringify(final.completion, null, 2) };
+        return { exitCode: 0, stdout: `(${final?.note ?? 'no final answer found'})` };
+      }
       return output(json, body, (value) => {
         const result = value as { status: string; finalText?: string; outputClass?: 'command' | 'final_text' | 'no_text'; outputClassBasis?: string; evidence: { transcript: string } };
         // I1 (H2 item 1): a handler-return receipt is a COMMAND — it has no
@@ -716,7 +790,16 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
     }
     case 'cleanup': {
       const sessionId = args.positional[0];
-      if (!sessionId) throw new UsageError('cleanup needs <sessionId>');
+      const owner = flagString(args, 'owner');
+      if (!sessionId && owner && !args.flags.has('lease') && !args.flags.has('watch')) {
+        // W2c verb 6: bulk — every ledger child of this owner, none of anyone else's.
+        const report = await getClient().cleanupOwner(owner);
+        const lines = report.children.map((child) => `${child.sessionId}: watch=${child.watchDeleted ? 'deleted' : 'none'} lease=${child.released ? 'released' : 'none'} deleted=${child.deleted}${child.error ? ` ERROR ${child.error}` : ''}${child.notes.length > 0 ? ` (${child.notes.join('; ')})` : ''}`);
+        lines.push(`owner ${owner}: ${report.children.length} child(ren) processed, ${report.children.filter((child) => child.deleted).length} deleted${report.ok ? '' : ' — SOME FAILED (re-run to retry; failed children stay in the ledger)'}`);
+        const stdout = json ? `${JSON.stringify(report, null, 2)}` : lines.join('\n');
+        return report.ok ? { exitCode: 0, stdout } : { exitCode: 1, stdout, stderr: 'pi-orch: cleanup --owner: at least one child could not be fully cleaned (see the report)' };
+      }
+      if (!sessionId) throw new UsageError('cleanup needs <sessionId>, or --owner <id> alone to clean every ledger child of that owner');
       const body = await getClient().cleanup(sessionId, {
         leaseId: flagString(args, 'lease'),
         ownerId: flagString(args, 'owner'),
@@ -765,6 +848,11 @@ function interruptionSuffix(child: Record<string, unknown>): string {
   const facts = child.goalInterruption as { cause?: string; continueCount?: number; autoContinued?: boolean } | undefined;
   if (!facts) return '';
   return ` interrupted cause=${facts.cause ?? 'unknown'} continueCount=${facts.continueCount ?? 0} autoContinued=${facts.autoContinued === true}`;
+}
+
+function goalLine(value: unknown): string {
+  const goal = value as { status?: string; objective?: string };
+  return `goal ${goal.status ?? 'unknown'}${goal.objective ? ` — ${goal.objective.slice(0, 80)}` : ''}`;
 }
 
 function renderVerifyHuman(body: { verdict: string; claims: Array<{ kind: string; claim: string; result: string; detail?: string }>; summary: string }): string {

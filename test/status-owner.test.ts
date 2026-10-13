@@ -50,6 +50,11 @@ test('client.status({owner}) lists the ledger children, prunes dead ones, enrich
       if (method === 'GET' && path === '/api/v1/sessions') {
         return ok({ sessions: [{ sessionId: 's-live', runtime: 'pi', busy: false, status: 'idle' }] });
       }
+      // W2c: existence is a per-session read now (only a 404 means gone); the
+      // dead ledger child answers 404 here instead of being absent from the list.
+      if (method === 'GET' && path === '/api/v1/sessions/s-dead') {
+        throw Object.assign(new Error('gone'), { status: 404, code: 'SESSION_NOT_FOUND' });
+      }
       if (method === 'GET' && path.startsWith('/api/v1/sessions/s-')) {
         sessionGets.push(path);
         return ok({ sessionId: 's-live', runtime: 'pi', busy: false, status: 'idle' });
