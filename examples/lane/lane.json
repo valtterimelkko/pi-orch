@@ -1,0 +1,11 @@
+{
+  "lane": "demo-lane",
+  "cwd": "/srv/work/demo-repo",
+  "owner": "orch-demo-a1b2c3d4-demo-lane",
+  "implementer": { "runtime": "pi", "selector": "zai/glm-5.3", "thinking": "high" },
+  "reviewer": { "runtime": "claude", "selector": "profile:max", "thinking": "medium" },
+  "mode": "prompt",
+  "ttlSeconds": 14400,
+  "parentSessionId": "REPLACE-WITH-YOUR-SESSION-ID",
+  "maxCorrections": 1
+}

@@ -23,19 +23,19 @@ export interface AuditRecord {
   durationMs: number;
 }
 
-export const AUDITED_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template', 'help']);
+export const AUDITED_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template', 'lane', 'help']);
 
 /** Verbs whose first positional argument is a session id. */
 const SESSION_POSITIONAL = new Set(['prompt', 'wait', 'result', 'verify', 'cleanup', 'goal', 'watch', 'reroute']);
 /** Verbs with a second positional that names the action. */
-const SUBVERB_POSITIONAL = new Set(['goal', 'watch']);
+const SUBVERB_POSITIONAL = new Set(['goal', 'watch', 'lane']);
 
 export function defaultAuditPath(env: Record<string, string | undefined> = process.env): string {
   return env.PI_ORCH_AUDIT_PATH ?? join(homedir(), '.pi-orch', 'audit.jsonl');
 }
 
 // Flags that take no value; skipping their following token would swallow a positional.
-const BOOLEAN = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'template-follow-up', 'goal', 'pin', 'fire-if-settled', 'force-unconditional', 'final']);
+const BOOLEAN = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'template-follow-up', 'goal', 'pin', 'fire-if-settled', 'force-unconditional', 'final', 'dry-run']);
 
 /** Minimal scan: only the named flags are ever read; no other flag value is kept. */
 function scanArgs(argv: string[]): { positional: string[]; flags: Map<string, string> } {

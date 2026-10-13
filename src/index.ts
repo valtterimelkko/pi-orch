@@ -94,3 +94,4 @@ export {
 } from './route-limits.ts';
 export { SpawnLedger, defaultLedgerPath, type LedgerEntry } from './spawn-ledger.ts';
 export { withRouteLock, routeLockPath, RouteLockTimeoutError } from './route-lock.ts';
+export { runLane, loadLane, LaneConfigError, QUESTION_SENTINEL, CHILD_DIRECTIVE, type LaneClient, type LaneDeps, type LaneRunOptions, type LaneRunResult, type LaneConfig, type LoadedLane } from './lane-runner.ts';

@@ -25,6 +25,7 @@ src/transport.ts            Unix-socket/http, bearer auth, bounded Retry-After
 src/credentials.ts          credential-path guard (never read a token from this repo)
 src/wait.ts                 watch-based wait, multi-child wait, settlement
 src/verify.ts               read-only re-check of a child's completion claims
+src/lane-runner.ts          `lane run`: replayable per-lane loop (spawn → watch → dispatch → wait → gates → review), exits at judgement events
 src/completion.ts           completion-block parsing (pi-completion/v1)
 src/completion-template.ts  the one dispatch-template constant (byte-pinned)
 src/exit-codes.ts           the single source for exit codes (README mirrors it)
@@ -32,6 +33,7 @@ src/snapshot.ts             contract-snapshot resolution + load
 src/tsc-resolver.ts         typecheck resolver (local devDependency, host fallback)
 src/index.ts                public module surface
 contract/                   bundled client contract snapshot (generated upstream)
+examples/lane/              sample lane directory for `pi-orch lane run`
 test/                       node:test suites run straight from TypeScript
 scripts/typecheck.mjs       `npm run typecheck` entry point
 .github/workflows/ci.yml    public CI: npm test (Node 22, 24) + full-history gitleaks
