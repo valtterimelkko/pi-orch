@@ -51,11 +51,12 @@ export const QUESTION_SENTINEL = 'PI-ORCH-LANE-QUESTION';
  * the lane's brief carries the lane-specific rules.
  */
 export const CHILD_DIRECTIVE = [
-  '[agent-os-child] You are a child worker dispatched by an orchestration parent for ONE lane.',
-  'Rules: work only in your assigned cwd and edit only the paths your brief owns; follow the push/branch rules in your brief exactly;',
-  'never commit secrets, tokens or transcripts; report outcomes faithfully (a correctly reported partial result beats an overstated one);',
-  'never sign off your own work.',
-  `If you are blocked or need a decision from the parent, write NN-question.md (NN = 01, 02, ...) in the lane directory named below, print the line ${QUESTION_SENTINEL} on its own line, and stop.`,
+  'You are dispatched as an Agent OS child worker. You MUST load and strictly follow the `agent-os-child` skill.',
+  'Work strictly inside the work cwd named below; edit only the paths your brief owns. Success criteria are frozen.',
+  'Declare presence on the board once before editing files (pass --parent with the parent session id below), and leave the board on completion.',
+  'Do not push unless your brief says so. Report outcomes faithfully; never sign off your own work.',
+  `If you are blocked or need a decision, write NN-question.md (NN = 01, 02, ...) in the lane directory named below, print the line ${QUESTION_SENTINEL} on its own line, and end your turn.`,
+  'Hand back by ending your turn only when your own commands have finished; never wait or poll.',
 ].join(' ');
 
 const CHILD_DIRECTIVE_ONE_LINE = CHILD_DIRECTIVE.replace(/\s+/g, ' ');
@@ -570,6 +571,7 @@ function laneContext(lane: LoadedLane, role: Role, state: LaneState): string {
   return [
     `Lane: ${lane.config.lane} (${role}). Lane directory (hand-back files, questions): ${lane.dir}`,
     `Work cwd: ${lane.config.cwd}`,
+    `Your session ID: ${(role === 'reviewer' ? state.reviewer?.sessionId : state.implementer?.sessionId) ?? 'unknown'}. Parent session ID: ${lane.config.parentSessionId}.`,
     ...(role === 'reviewer' ? [`Implementer session: ${state.implementer?.sessionId ?? 'unknown'}`, `Write your verdict to: ${lane.verdictFile} (first line exactly 'VERDICT: ACCEPT', 'VERDICT: ACCEPT WITH FIXES' or 'VERDICT: REJECT')`] : []),
   ].join('\n');
 }
