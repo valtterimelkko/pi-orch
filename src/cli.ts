@@ -228,7 +228,8 @@ Prompt flags: --mode prompt|follow_up|steer, --no-detach, --idempotency-key K,
 Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
   the Wave K auto-continue progress matched), --deadline S (default 1800),
   --label L, --conditions a,b
-  (agent_end|goal_end|paused|question:TEXT|deadline:S),
+  (agent_end|goal_end|paused|question:TEXT|deadline:S; goal_end/paused without
+  --objective wake on ANY goal, so pass --objective on a reused child),
   --all|--any <sessionId>[@<runId>] ...  wait several children in one call:
   --all settles every child, --any returns the first to settle. Unknown runs
   or sessions fail fast (exit 16) instead of sitting out the deadline.

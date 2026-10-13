@@ -17,7 +17,7 @@ import { runCli, type CliDeps } from '../src/cli.ts';
  * With an objective, it still matches that exact string (the existing
  * objective-filtered tests stay green).
  *
- * Provenance: brief `/root/orch-ops/parent-machinery-20261013/W0a/brief.md`
+ * Provenance: plan W0-a, finding F2 (dead `objective:"*"` goal watches).
  * (plan W0-a, finding F2); code at src/cli.ts:781-782, src/builders.ts:195-201.
  */
 
