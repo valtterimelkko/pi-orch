@@ -19,7 +19,7 @@ import {
 import type { WatchConditionSpec } from './parsers.ts';
 import { ApiError } from './parsers.ts';
 import { ERROR_CODE_EXIT_CODES, exitCodeFor, VERIFY_EXIT_CODES } from './exit-codes.ts';
-import { resolveRouteLimits } from './route-limits.ts';
+import { resolveRouteLimits, profileCapacityRefusalLine, type RouteLimitProfile } from './route-limits.ts';
 import { defaultSocketPath, defaultTokenPath, loadSnapshot, liveContractVersion } from './snapshot.ts';
 import { readToken } from './transport.ts';
 
@@ -245,8 +245,10 @@ Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interr
   executed · 15 turn stalled · 16 wait target not found · 17 goal cleared
   18 create unknown · 19 watch conflict · 20 verify contradicted
   21 verify unverifiable · 22 template not delivered · 23 credential in repo
-  · 24 remote api base refused · 25 route limit (G1: spawn refused before any
-  child was created; --wait-for-slot waits instead). Full table: README.md
+  · 24 remote api base refused · 25 route limit (G1/W0d: spawn refused before any
+  child was created; a Claude profile route defaults to the server-advertised
+  cap, and the message names the cap and the owner-authorised PAYG overflow
+  route; --wait-for-slot waits instead). Full table: README.md
 
 Parent patterns (J2): a Claude Code parent is not a Pi Web UI session — its
   children carry only the --owner id (convention:
@@ -804,7 +806,7 @@ function goalObjectiveForms(objective: string | undefined): Array<string | undef
 }
 
 function mapError(error: unknown): CliResult {
-  const anyError = error as { code?: string; status?: number; httpCode?: string; failures?: unknown; retryAfterSeconds?: number; message?: string; hint?: string; details?: string };
+  const anyError = error as { code?: string; status?: number; httpCode?: string; failures?: unknown; retryAfterSeconds?: number; message?: string; hint?: string; details?: string; data?: Record<string, unknown> };
   const code = anyError.httpCode ?? anyError.code;
   // Correction 04 item 3: an unknown create outcome gets a distinct exit code
   // and a machine-readable {outcome, hint} body telling the caller to
@@ -823,6 +825,21 @@ function mapError(error: unknown): CliResult {
   }
   const lines = [code ? `pi-orch: ${code}: ${rawMessage}` : rawMessage.startsWith('pi-orch:') ? rawMessage : `pi-orch: ${rawMessage}`];
   if (anyError.failures !== undefined) lines.push(`failures: ${JSON.stringify(anyError.failures)}`);
+  // W0d: the server's typed profile-capacity refusal (429, contract 1.61.0)
+  // happens BEFORE any run receipt, so it is the same class as the local
+  // route-limit refusal: exit 25, with the profile cap named and the
+  // owner-authorised overflow route spelled out — never a bare HTTP error.
+  if (code === 'PROFILE_CAPACITY_EXHAUSTED') {
+    const data = anyError.data ?? {};
+    const profile: RouteLimitProfile = {
+      profileId: typeof data.profileId === 'string' ? data.profileId : 'unknown',
+      ...(typeof data.maxConcurrent === 'number' ? { maxConcurrent: data.maxConcurrent } : {}),
+      ...(typeof data.active === 'number' ? { active: data.active } : {}),
+    };
+    lines.push(profileCapacityRefusalLine(profile));
+    if (anyError.retryAfterSeconds !== undefined) lines.push(`retry-after: ${anyError.retryAfterSeconds}s`);
+    return { exitCode: 25, stderr: lines.join('\n') };
+  }
   const message = lines.join('\n');
   if (code !== undefined && code in ERROR_CODE_EXIT_CODES) {
     return { exitCode: ERROR_CODE_EXIT_CODES[code] ?? 1, stderr: message };

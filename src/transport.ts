@@ -120,7 +120,11 @@ export class Transport {
       }
       const retryAfter = parseRetryAfter(response.headers['retry-after']);
       const retryable = (response.status === 429 || response.status === 503) && retryAfter !== undefined;
-      if (retryable && attempt < retry.maxAttempts && !options._skipRetry) {
+      // W0d: a Claude profile at its cap is a decision for the parent (wait,
+      // another route, or the owner's overflow route), not a transient to sit
+      // out silently — surface it at once (exit 25) instead of retrying.
+      const profileCapRefusal = response.status === 429 && (response.body as { code?: unknown } | undefined)?.code === 'PROFILE_CAPACITY_EXHAUSTED';
+      if (retryable && attempt < retry.maxAttempts && !options._skipRetry && !profileCapRefusal) {
         // Correction 04 item 8: never retry EARLIER than the server asked.
         // The delay is waited in full unless the remaining budget cannot cover
         // it — then the refusal is returned with its retry hint instead.
