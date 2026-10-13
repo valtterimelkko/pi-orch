@@ -279,8 +279,9 @@ Prompt flags: --mode prompt|follow_up|steer|deliver, --no-detach, --idempotency-
 
 Wait flags: --run-id RUNID, --objective OBJ (goal children: goal_end + paused +
   the Wave K auto-continue progress matched), --goal-id ID (contract 1.62.0:
-  match the stable top-level goalId instead of the objective forms — recorded by
-  goal start / goal show, or pass it explicitly), --deadline S (default 1800),
+  match the stable top-level goalId instead of the objective forms; pass it
+  explicitly, or leave it off and wait reads the LIVE projection and keys on the
+  id only while a goal is active — a ledger-recorded id is never used), --deadline S (default 1800),
   --label L, --conditions a,b
   (agent_end|goal_end|paused|stalled|question:TEXT|deadline:S; goal_end/paused
   without --objective wake on ANY goal, so pass --objective or --goal-id on a

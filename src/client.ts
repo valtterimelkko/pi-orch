@@ -1158,9 +1158,13 @@ export class PiOrchClient {
     // were supplied and applies the right defaults AFTER detection; an early
     // defaultConditions() call here would bake in per-turn agent_end and
     // bypass the detection entirely.
-    // W2h: a known goal id (explicit, or recorded by goal start / goal show)
-    // keys the goal conditions on the id instead of the objective forms.
-    const goalId = options.goalId ?? this.spawnLedger.goalOf(options.sessionId);
+    // W2h: a known goal id (explicit --goal-id) keys the goal conditions on the
+    // id instead of the objective forms. Correction 01: the ledger's recorded
+    // goalId is INFORMATION only — it is written by `goal start` / `goal show`
+    // and never cleared, so a reused child's wait must not take it. Without an
+    // explicit id, waitOnChild's LIVE projection detection supplies the current
+    // id, and only while a goal is active; otherwise the plain path is used.
+    const goalId = options.goalId;
     const deps = this.waitDeps();
     return waitOnChild({
       sessionId: options.sessionId,
@@ -1238,10 +1242,15 @@ export class PiOrchClient {
       },
       getGoal: async (sessionId) => {
         const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`, { headers: this.headers() });
-        const body = response.body as { status?: string; objective?: string; pausedReason?: string | null; lastReason?: string | null; interruption?: GoalInterruptionFacts };
+        const body = response.body as { status?: string; objective?: string; goalId?: string; stalled?: boolean; stalledForMs?: number; pausedReason?: string | null; lastReason?: string | null; interruption?: GoalInterruptionFacts };
         return {
           status: body.status,
           objective: body.objective,
+          // W2h: the live projection's stable goal id (contract 1.62.0) — the
+          // ONLY id `wait` keys conditions on when none was passed explicitly.
+          ...(body.goalId !== undefined ? { goalId: body.goalId } : {}),
+          ...(body.stalled !== undefined ? { stalled: body.stalled } : {}),
+          ...(body.stalledForMs !== undefined ? { stalledForMs: body.stalledForMs } : {}),
           pausedReason: body.pausedReason,
           lastReason: body.lastReason,
           ...(body.interruption ? { interruption: body.interruption } : {}),

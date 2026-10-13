@@ -154,11 +154,19 @@ test('W2h CLI: wait passes --goal-id through to the client', async () => {
   assert.equal(captured?.objective, 'Ship it');
 });
 
-// ─── 4. client.wait: id-keyed registration, from the flag or the ledger ─────
+// ─── 4. client.wait: id-keyed registration from the LIVE projection, never the ledger ──
 
-test('W2h: client.wait keys the registered conditions on a ledger-recorded goalId', async () => {
+/**
+ * Correction 01 (parent review): the spawn ledger's goalId is INFORMATION, never
+ * a condition selector. It is written by `goal start` / `goal show` and never
+ * cleared, so a child reused for a second goal (or a plain run) would otherwise
+ * have `wait` key on the OLD goal's id — the exact stale-goal failure this lane
+ * exists to prevent. `wait` keys on an explicit `--goal-id` only; otherwise it
+ * reads the LIVE projection and keys on that id only while a goal is active.
+ */
+test('W2h/01: a stale ledger goalId is ignored — wait keys on the projection\'s current goalId', async () => {
   const ledgerPath = tempLedgerPath();
-  new SpawnLedger(ledgerPath).record({ sessionId: 's1', goalId: 'goal_from_ledger', at: 't' });
+  new SpawnLedger(ledgerPath).record({ sessionId: 's1', goalId: 'goal_old', at: 't' });
   const calls: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
   const transport = {
     request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
@@ -166,17 +174,43 @@ test('W2h: client.wait keys the registered conditions on a ledger-recorded goalI
       if (path === '/api/v1/sessions/s1') return ok({ sessionId: 's1', busy: false });
       if (path === '/api/v1/sessions/s1/watch' && method === 'GET') return { status: 404, headers: {}, body: { code: 'NOT_FOUND' }, raw: '{}' };
       if (path === '/api/v1/sessions/s1/watch' && method === 'POST') return ok({ watchId: 'w1', status: 'active' });
-      if (path === '/api/v1/sessions/s1/goal') return ok({ supported: true, status: 'achieved', objective: 'Ship it', goalId: 'goal_from_ledger' });
+      // The reused child now runs goal B: a DIFFERENT, active goalId.
+      if (path === '/api/v1/sessions/s1/goal') return ok({ supported: true, status: 'running', objective: 'Ship the widget', goalId: 'goal_new' });
       if (path.startsWith('/api/v1/watches/wait')) return { status: 204, headers: {}, body: undefined, raw: '' };
       throw new Error(`unexpected ${method} ${path}`);
     },
   } as never;
-  const client = new PiOrchClient({ spawnLedgerPath: ledgerPath, transportInstance: transport, waitSliceMs: 20, waitDeadlineMs: 200 });
-  await client.wait({ sessionId: 's1', objective: 'Ship it' });
+  const client = new PiOrchClient({ spawnLedgerPath: ledgerPath, transportInstance: transport, waitSliceMs: 20, waitDeadlineMs: 120 });
+  await client.wait({ sessionId: 's1' });
   const registration = calls.find((call) => call.path === '/api/v1/sessions/s1/watch' && call.method === 'POST');
   const conditions = (registration?.body as { conditions: WatchConditionSpec[] } | undefined)?.conditions ?? [];
-  assert.deepEqual(conditions.filter((condition) => condition.eventType === 'goal_end').map((condition) => condition.dataMatch), [{ goalId: 'goal_from_ledger' }]);
-  assert.equal(conditions.some((condition) => condition.dataMatch !== undefined && 'objective' in condition.dataMatch), false, 'the ledger id replaces the objective forms');
+  assert.deepEqual(conditions.filter((condition) => condition.eventType === 'goal_end').map((condition) => condition.dataMatch), [{ goalId: 'goal_new' }], 'keyed on the CURRENT goal, not the ledger');
+  assert.equal(JSON.stringify(conditions).includes('goal_old'), false, 'the stale ledger id must not appear in any condition');
+});
+
+test('W2h/01: with no active goal a stale ledger goalId yields the plain agent_end set (never a goal-only set)', async () => {
+  const ledgerPath = tempLedgerPath();
+  new SpawnLedger(ledgerPath).record({ sessionId: 's1', goalId: 'goal_old', at: 't' });
+  const calls: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
+  const transport = {
+    request: async (method: string, path: string, options: { body?: Record<string, unknown> } = {}) => {
+      calls.push({ method, path, body: options.body });
+      if (path === '/api/v1/sessions/s1') return ok({ sessionId: 's1', busy: false });
+      if (path === '/api/v1/sessions/s1/watch' && method === 'GET') return { status: 404, headers: {}, body: { code: 'NOT_FOUND' }, raw: '{}' };
+      if (path === '/api/v1/sessions/s1/watch' && method === 'POST') return ok({ watchId: 'w1', status: 'active' });
+      // No active goal: a plain run on the reused child.
+      if (path === '/api/v1/sessions/s1/goal') return ok({ supported: true, status: 'idle' });
+      if (path.startsWith('/api/v1/watches/wait')) return { status: 204, headers: {}, body: undefined, raw: '' };
+      throw new Error(`unexpected ${method} ${path}`);
+    },
+  } as never;
+  const client = new PiOrchClient({ spawnLedgerPath: ledgerPath, transportInstance: transport, waitSliceMs: 20, waitDeadlineMs: 120 });
+  await client.wait({ sessionId: 's1' });
+  const registration = calls.find((call) => call.path === '/api/v1/sessions/s1/watch' && call.method === 'POST');
+  const conditions = (registration?.body as { conditions: WatchConditionSpec[] } | undefined)?.conditions ?? [];
+  assert.deepEqual(conditions.map((condition) => condition.eventType ?? 'deadline'), ['agent_end'], 'no active goal: the plain path (the sub-second test deadline adds no deadline backstop), no goal conditions');
+  assert.equal(conditions.some((condition) => condition.eventType === 'goal_end' || condition.eventType === 'goal_state'), false, 'no goal condition of any kind');
+  assert.equal(JSON.stringify(conditions).includes('goal_'), false, 'no goal id or goal event leaked into the conditions');
 });
 
 test('W2h: an explicit wait goalId wins over the ledger', async () => {
