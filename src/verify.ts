@@ -323,7 +323,8 @@ export async function verifyChild(
   let gateResults: GateResult[] | undefined;
   if (input.gates !== undefined) {
     gateResults = [];
-    const gateCwd = input.cwd ?? filesRepo;
+    // Gates run only where the caller or the session said: never a directory guessed from claimed commits.
+    const gateCwd = input.cwd;
     const timeoutMs = input.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS;
     for (const gate of input.gates) {
       const check = `gate '${gate.command}' → expected exit ${gate.expectedExit}`;

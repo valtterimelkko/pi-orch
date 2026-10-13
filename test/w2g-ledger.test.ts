@@ -133,3 +133,14 @@ test('a ledger with no path records nothing and reads empty', () => {
   assert.deepEqual(book.events(), []);
   book.remove('s');
 });
+
+test('W2g review-1: the migration marker never leaks into the frozen JSON view', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'w2g-rev1-'));
+  const path = join(dir, 'spawn-ledger.json');
+  writeFileSync(path, JSON.stringify([{ sessionId: 's-old', ownerId: 'o', createdAt: '2026-10-13T00:00:00Z' }]));
+  const ledger = new SpawnLedger(path);
+  ledger.record({ sessionId: 's-new', ownerId: 'o', createdAt: '2026-10-13T01:00:00Z' } as never);
+  const view = JSON.parse(readFileSync(path, 'utf8')) as Array<Record<string, unknown>>;
+  assert.equal(view.length, 2);
+  for (const entry of view) assert.equal('migrated' in entry, false);
+});

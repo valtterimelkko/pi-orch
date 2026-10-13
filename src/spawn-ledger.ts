@@ -128,7 +128,7 @@ export class SpawnLedger {
     const view = new Map<string, LedgerEntry>();
     for (const event of this.events()) {
       if (event.event === 'spawned') {
-        const { event: _kind, ts: _ts, ...entry } = event;
+        const { event: _kind, ts: _ts, migrated: _migrated, ...entry } = event as typeof event & { migrated?: boolean };
         view.delete(entry.sessionId); // a re-record moves to the end, like the old filter-then-push
         view.set(entry.sessionId, entry);
       } else if (event.event === 'deleted' || event.event === 'pruned') {
