@@ -508,7 +508,7 @@ test('W0d/18: the bundled snapshot is the server\'s 1.61.0 (claudeProfiles + the
     errorCodes: string[];
     types: Record<string, { fields?: Record<string, { type?: string; optional?: boolean }> }>;
   };
-  assert.equal(snapshot.contractVersion, '1.61.0');
+  assert.equal(snapshot.contractVersion, '1.62.0');
   assert.ok(snapshot.errorCodes.includes('PROFILE_CAPACITY_EXHAUSTED'));
   const claudeProfiles = snapshot.types.CapacityResponse?.fields?.claudeProfiles;
   assert.ok(claudeProfiles, 'CapacityResponse advertises claudeProfiles');
