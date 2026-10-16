@@ -24,6 +24,8 @@ export interface LedgerEntry {
   /** W2h (contract 1.62.0): the stable goal id of the child's goal, once pi-orch learns it (goal start / goal show). Additive. */
   goalId?: string;
   parentSessionId?: string;
+  /** Step 1i.2 C (contract 1.63.0): the NATIVE parent id sent in the create body (parentKind "native"), when one was. Additive; old lines parse without it. */
+  nativeParentSessionId?: string;
   at: string;
 }
 

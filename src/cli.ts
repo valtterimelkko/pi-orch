@@ -60,7 +60,7 @@ export interface CliDeps {
   stdout(line: string): void;
   stderr(line: string): void;
   randomId(): string;
-  client(config: { parentSessionId?: string }): ClientLike;
+  client(config: { parentSessionId?: string; nativeParentSessionId?: string }): ClientLike;
 }
 
 export interface CliResult {
@@ -80,7 +80,7 @@ interface ParsedArgs {
 
 const REPEATABLE_FLAGS = new Set(['preflight-path', 'preflight-tool', 'route-limit']);
 /** Flags that never consume the following token (so `--all c1@r1` keeps the id positional). */
-const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled', 'force-unconditional', 'final', 'template-follow-up', 'goal', 'dry-run']);
+const BOOLEAN_FLAGS = new Set(['all', 'any', 'json', 'id-only', 'no-detach', 'require-active-turn', 'help', 'transcript', 'no-completion-template', 'pin', 'fire-if-settled', 'force-unconditional', 'final', 'template-follow-up', 'goal', 'dry-run', 'no-native-parent']);
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const verb = argv[0] ?? '';
@@ -262,6 +262,10 @@ sessionId; prompt: prints the runId; watch register/list: prints the watchId)
 for $(...) capture. never parse the human-readable output (its wording can change at any time).
 
 Common flags: --socket P --token-path P --api-base URL --parent-session ID --json
+  --no-native-parent (never send CLAUDE_CODE_SESSION_ID as a declared native
+  parent; on a 1.63.0+ server a spawn with no managed parent identity sends
+  the body fields parentSessionId + parentKind "native" so the child is
+  linked in every lineage surface)
   --snapshot P (compare the live /capabilities against this snapshot copy)
 
 Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
@@ -336,7 +340,7 @@ Parent patterns (J2): a Claude Code parent is not a Pi Web UI session — its
 // stored by parseArgs and silently dropped (Phase A receipt:
 // --goal-budget-tokens exited 0 while the goal armed with the 5M default) —
 // now a usage error before the client factory runs.
-const COMMON_FLAGS = new Set(['socket', 'token-path', 'api-base', 'parent-session', 'json', 'snapshot']);
+const COMMON_FLAGS = new Set(['socket', 'token-path', 'api-base', 'parent-session', 'no-native-parent', 'json', 'snapshot']);
 const VERB_FLAGS: Record<string, Set<string>> = {
   capabilities: new Set([]),
   capacity: new Set([]),
@@ -457,11 +461,20 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
     deps.env.PI_ORCH_PARENT_SESSION ??
     deps.env.PI_WEB_UI_SESSION_ID ??
     deps.env.PI_SESSION_ID;
+  // Step 1i.2 C (contract 1.63.0): with NO managed identity, the caller's
+  // native session id rides in the create body as a declared parent (shown in
+  // every lineage surface on a 1.63.0 server; nothing is sent to an older
+  // one). --no-native-parent opts out. Validation lives in the client
+  // (bad value → one warning, spawn proceeds).
+  const nativeParentSessionId =
+    parentSessionId === undefined && !args.flags.has('no-native-parent')
+      ? deps.env.CLAUDE_CODE_SESSION_ID
+      : undefined;
 
   // Lazy: flags must be validated (cheap usage errors) before the client
   // factory runs (which reads tokens and can fail with transport errors).
   let cachedClient: ClientLike | undefined;
-  const getClient = (): ClientLike => (cachedClient ??= deps.client({ parentSessionId }));
+  const getClient = (): ClientLike => (cachedClient ??= deps.client({ parentSessionId, nativeParentSessionId }));
 
   switch (args.verb) {
     case 'template': {
@@ -494,7 +507,13 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         ...(deadlineSeconds !== undefined ? { deadlineMs: deadlineSeconds * 1000 } : {}),
       };
       if (laneOptions.dryRun) return runLane(laneOptions, { client: {} as LaneClient });
-      const laneClient = deps.client({ parentSessionId: flagString(args, 'parent-session') ?? lane.config.parentSessionId });
+      const laneManaged = flagString(args, 'parent-session') ?? lane.config.parentSessionId;
+      const laneClient = deps.client({
+        parentSessionId: laneManaged,
+        ...(laneManaged === undefined && !args.flags.has('no-native-parent') && deps.env.CLAUDE_CODE_SESSION_ID !== undefined
+          ? { nativeParentSessionId: deps.env.CLAUDE_CODE_SESSION_ID }
+          : {}),
+      });
       return runLane(laneOptions, { client: laneClient as unknown as LaneClient });
     }
     case 'capabilities': {
@@ -936,7 +955,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         const body = await getClient().status({ owner });
         return output(json, body, (value) => {
           const status = value as { owner?: string; pruned?: number; children: Array<Record<string, unknown>> };
-          const lines = status.children.map((child) => `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String((child.lastRun as { status?: string } | undefined)?.status)}${interruptionSuffix(child)}`);
+          const lines = status.children.map((child) => `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String((child.lastRun as { status?: string } | undefined)?.status)}${nativeParentSuffix(child)}${interruptionSuffix(child)}`);
           lines.push(`owner ${String(status.owner)}: ${status.children.length} child(ren), ${String(status.pruned ?? 0)} stale ledger entr(y/ies) pruned`);
           return lines.join('\n');
         });
@@ -963,6 +982,15 @@ function interruptionSuffix(child: Record<string, unknown>): string {
   const facts = child.goalInterruption as { cause?: string; continueCount?: number; autoContinued?: boolean } | undefined;
   if (!facts) return '';
   return ` interrupted cause=${facts.cause ?? 'unknown'} continueCount=${facts.continueCount ?? 0} autoContinued=${facts.autoContinued === true}`;
+}
+
+/**
+ * Step 1i.2 C (criterion 3): the native parent a child was spawned with,
+ * shown on the `status --owner` line when the ledger recorded one.
+ */
+function nativeParentSuffix(child: Record<string, unknown>): string {
+  const nativeParent = child.nativeParentSessionId;
+  return typeof nativeParent === 'string' && nativeParent !== '' ? ` nativeParent=${nativeParent}` : '';
 }
 
 function goalLine(value: unknown): string {
@@ -1100,7 +1128,7 @@ function validatedGoalFields(goal: { objective: string; maxTurns?: number; verif
 
 // ─── process entry ───────────────────────────────────────────────────────────
 
-export function makeClientFactory(argv: string[]): (config: { parentSessionId?: string }) => ClientLike {
+export function makeClientFactory(argv: string[]): (config: { parentSessionId?: string; nativeParentSessionId?: string }) => ClientLike {
   const args = parseArgs(argv);
   const socket = flagString(args, 'socket') ?? process.env.PI_WEB_UI_SOCKET ?? defaultSocketPath(process.env);
   const tokenPath = flagString(args, 'token-path') ?? process.env.PI_WEB_UI_TOKEN_PATH ?? defaultTokenPath(process.env);
@@ -1110,12 +1138,13 @@ export function makeClientFactory(argv: string[]): (config: { parentSessionId?: 
   // surfaces as a UsageError → exit 2 with the usage text, never an uncaught
   // stack from main() before runCli can map it.
   let routeLimits: Record<string, number> | undefined;
-  return ({ parentSessionId }) => {
+  return ({ parentSessionId, nativeParentSessionId }) => {
     routeLimits ??= mergeRouteLimits(process.env, routeLimitOverrides(args.repeatable.get('route-limit') ?? []));
     const token = readToken(tokenPath);
     return new PiOrchClient({
       transport: { socketPath: apiBase ? undefined : socket, apiBase, token },
       parentSessionId,
+      nativeParentSessionId,
       routeLimits,
     }) as unknown as ClientLike;
   };

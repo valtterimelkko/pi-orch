@@ -42,7 +42,7 @@ import { verifyChild, makeNodeVerifyDeps, type VerifyInput, type VerifyResult, t
 import { waitOnChild, waitOnChildren, type WaitOutcome, type WaitDeps, type WaitOnChildrenResult, type WaitChild, type GoalInterruptionFacts } from './wait.ts';
 import { limitFor, liveReason, resolveRouteLimits, routeOfSession, validateLimitValue, RouteLimitError, RouteLimitWaitDeadlineError, advertisedProfileCapacity, profileCapacityFull, profileIdOfSelector, type RouteLimitProfile } from './route-limits.ts';
 import { SpawnLedger, defaultLedgerPath } from './spawn-ledger.ts';
-import { validateGoalFields, GoalFieldValidationError } from './builders.ts';
+import { validateGoalFields, GoalFieldValidationError, NATIVE_PARENT_ID_PATTERN } from './builders.ts';
 import { withRouteLock, ROUTE_LOCK_STALE_MARGIN_MS } from './route-lock.ts';
 import { dirname } from 'node:path';
 
@@ -52,6 +52,16 @@ export interface ClientConfig {
   /** Pre-built transport (tests); overrides `transport`. */
   transportInstance?: Transport;
   parentSessionId?: string;
+  /**
+   * Step 1i.2 C (contract 1.63.0): the caller's NATIVE session id (e.g. a
+   * Claude Code session uuid), sent as create-body `parentSessionId` +
+   * `parentKind: "native"` on every spawn WHEN the server advertises
+   * `features.nativeParentLinkage`. Never sent as X-Parent-Session, never
+   * sent when a managed `parentSessionId` exists, and skipped (one warning)
+   * when the value is not a bare native id. On an older server nothing
+   * changes: the create schema is strict, so no new field is sent.
+   */
+  nativeParentSessionId?: string;
   /** Default idempotency-key factory; injectable for tests. */
   randomId?: () => string;
   waitDeadlineMs?: number;
@@ -94,7 +104,7 @@ type RouteGate =
 interface CountedLive {
   count: number;
   live: Array<{ sessionId: string; reason: string }>;
-  countedBy: 'parent' | 'owner' | 'none';
+  countedBy: 'parent' | 'owner' | 'none' | 'parent+owner';
 }
 
 /**
@@ -146,6 +156,7 @@ export function isQuarantinedDebtRefusal(error: unknown): error is ApiError {
 export class PiOrchClient {
   readonly transport: Transport;
   readonly parentSessionId?: string;
+  readonly nativeParentSessionId?: string;
   private readonly randomId: () => string;
   private readonly waitDeadlineMs: number;
   private readonly waitSliceMs: number;
@@ -168,6 +179,7 @@ export class PiOrchClient {
     }
     this.transport = config.transportInstance ?? new Transport(config.transport as TransportConfig);
     this.parentSessionId = config.parentSessionId;
+    this.nativeParentSessionId = config.nativeParentSessionId;
     this.randomId = config.randomId ?? defaultRandomId;
     this.waitDeadlineMs = config.waitDeadlineMs ?? 30 * 60_000;
     this.waitSliceMs = config.waitSliceMs ?? 45_000;
@@ -187,6 +199,45 @@ export class PiOrchClient {
     if (this.warned.has(key)) return;
     this.warned.add(key);
     this.onWarn(line);
+  }
+
+  /**
+   * Step 1i.2 C: the usable native parent id — the configured value when it
+   * is a bare native id AND the server advertises
+   * `features.nativeParentLinkage`; undefined otherwise. The capability read
+   * is made once per client; an unreadable /capabilities means an unknown or
+   * older server, and nothing is sent (the create schema is strict).
+   */
+  private nativeParentSupport?: Promise<boolean>;
+
+  private usableNativeParentId(requested?: string): Promise<string | undefined> {
+    const id = requested ?? this.nativeParentSessionId;
+    if (id === undefined) return Promise.resolve(undefined);
+    if (!NATIVE_PARENT_ID_PATTERN.test(id)) {
+      this.warnOnce(`pi-orch: NATIVE_PARENT_SKIPPED — the native parent id is not a bare session id (${NATIVE_PARENT_ID_PATTERN.source}); spawning without a native parent`);
+      return Promise.resolve(undefined);
+    }
+    this.nativeParentSupport ??= (async () => {
+      try {
+        const body = (await this.transport.request('GET', '/api/v1/capabilities', { headers: this.headers() })).body as {
+          features?: { nativeParentLinkage?: unknown };
+        };
+        return body.features?.nativeParentLinkage !== undefined;
+      } catch {
+        return false; // capabilities unreadable: assume an older server, send nothing
+      }
+    })();
+    return this.nativeParentSupport.then((supported) => {
+      if (supported) return id;
+      // Correction 1 item 2: a caller who EXPLICITLY asked for a native
+      // parent must not be dropped silently on an older server; the
+      // environment-configured one stays a silent no-op (normal operation
+      // there).
+      if (requested !== undefined) {
+        this.warnOnce('pi-orch: NATIVE_PARENT_SKIPPED — the server does not advertise features.nativeParentLinkage; spawning without the requested native parent');
+      }
+      return undefined;
+    });
   }
 
   /**
@@ -355,7 +406,7 @@ export class PiOrchClient {
   private async countLiveOnRoute(
     route: string,
     owner: string | undefined,
-  ): Promise<{ count: number; live: Array<{ sessionId: string; reason: string }>; countedBy: 'parent' | 'owner' | 'none' }> {
+  ): Promise<{ count: number; live: Array<{ sessionId: string; reason: string }>; countedBy: 'parent' | 'owner' | 'none' | 'parent+owner' }> {
     if (this.parentSessionId) {
       try {
         const response = await this.transport.request('GET', `/api/v1/sessions?parent=${encodeURIComponent(this.parentSessionId)}`, { headers: this.headers() });
@@ -374,6 +425,12 @@ export class PiOrchClient {
         // stale identity + an owner: fall back to the ledger below
       }
     }
+    // Step 1i.2 C (criterion 4): a NATIVE parent's declared children are
+    // countable by parent on a 1.63.0 server (GET /sessions?parent=<native
+    // id>), so the per-route cap counts a Claude Code parent's children by
+    // parent, not only by owner. Capability-gated like the create field; a
+    // 404 here means "no declared children yet", not a stale identity.
+    const nativeId = await this.usableNativeParentId();
     if (owner) {
       const response = await this.transport.request('GET', '/api/v1/sessions', { headers: this.headers() });
       const sessions = (response.body as { sessions?: Array<Record<string, unknown>> }).sessions ?? [];
@@ -382,10 +439,35 @@ export class PiOrchClient {
       if (ledger.note) this.warnOnce(`pi-orch: ${ledger.note}`);
       const mine = sessions.filter((session) => ledger.sessionIds.includes(String(session.sessionId)));
       const live = await this.liveAmong(mine, route);
-      return { count: live.length, live, countedBy: 'owner' };
+      if (nativeId === undefined) return { count: live.length, live, countedBy: 'owner' };
+      const declared = await this.liveDeclaredAmong(route, nativeId);
+      const seen = new Set(live.map((entry) => entry.sessionId));
+      const merged = [...live, ...declared.filter((entry) => !seen.has(entry.sessionId))];
+      return { count: merged.length, live: merged, countedBy: 'parent+owner' };
+    }
+    if (nativeId !== undefined) {
+      const declared = await this.liveDeclaredAmong(route, nativeId);
+      return { count: declared.length, live: declared, countedBy: 'parent' };
     }
     this.warnOnce(`pi-orch: ROUTE_LIMIT_UNCOUNTED — no parent session identity and no retention owner: cannot count live children on route '${route}'; proceeding without the limit (set --parent-session or spawn with --owner)`);
     return { count: 0, live: [], countedBy: 'none' };
+  }
+
+  /**
+   * Step 1i.2 C: the declared children of a native parent on `route`, read
+   * from the server (contract 1.63.0). A 404 is the normal first-spawn case
+   * (nothing declares this parent yet) — an empty list, never a stale
+   * identity; any other failure propagates like the managed-parent read.
+   */
+  private async liveDeclaredAmong(route: string, nativeId: string): Promise<Array<{ sessionId: string; reason: string }>> {
+    try {
+      const response = await this.transport.request('GET', `/api/v1/sessions?parent=${encodeURIComponent(nativeId)}`, { headers: this.headers() });
+      const sessions = (response.body as { sessions?: Array<Record<string, unknown>> }).sessions ?? [];
+      return await this.liveAmong(sessions, route);
+    } catch (error) {
+      if ((error as { status?: number }).status === 404) return [];
+      throw error;
+    }
   }
 
   /**
@@ -467,7 +549,14 @@ export class PiOrchClient {
     raw: unknown;
   }> {
     const modelSelector = input.modelSelector ?? (input.modelMatch ? await this.resolveModel(input.runtime, input.modelMatch) : undefined);
-    const body = buildCreateBody({ ...input, modelSelector });
+    // Step 1i.2 C + correction 1 item 2: the native parent rides in the BODY
+    // (parentKind "native"), only when there is no managed identity (managed
+    // wins, mirroring the server's header precedence) and the server
+    // advertises the capability — a CALLER-PASSED nativeParentId goes through
+    // the same gate (and never reaches the builder ungated).
+    const { nativeParentId: requestedNativeParentId, ...restInput } = input;
+    const nativeParentId = this.parentSessionId !== undefined ? undefined : await this.usableNativeParentId(requestedNativeParentId);
+    const body = buildCreateBody({ ...restInput, modelSelector, ...(nativeParentId !== undefined ? { nativeParentId } : {}) });
     // G1 correction 01 (accepted finding): caps apply only to spawns that
     // name --model-selector. Say so once per client when caps are configured
     // and this spawn carries no selector.
@@ -528,6 +617,8 @@ export class PiOrchClient {
           route: modelSelector,
           ownerId: input.retention?.ownerId,
           ...(retention?.leaseId !== undefined ? { leaseId: retention.leaseId } : {}),
+          // Step 1i.2 C: what was actually sent (criterion 3) — additive, old lines parse without it.
+          ...(nativeParentId !== undefined ? { nativeParentSessionId: nativeParentId } : {}),
           at: new Date().toISOString(),
         });
         if (recorded.note) this.warnOnce(`pi-orch: ${recorded.note}`);
@@ -1541,6 +1632,8 @@ export class PiOrchClient {
       lastRun?: { runId?: string; status?: string; endedAt?: string | number; errorCode?: string };
       readErrors?: string[];
       missing?: boolean;
+      /** Step 1i.2 C (criterion 3): the native parent recorded at spawn, when one was sent. */
+      nativeParentSessionId?: string;
     }>;
   }> {
     if (target.sessionId) {
@@ -1557,7 +1650,9 @@ export class PiOrchClient {
       // only a 404 on the per-session read prunes (R1 card test: an existing
       // idle child was dropped from the ledger and 0 children were listed).
       const entries = this.spawnLedger.entriesOf(target.owner);
-      const found: Array<Awaited<ReturnType<PiOrchClient['childStatus']>>> = [];
+      // Step 1i.2 C (criterion 3): what native parent each child was spawned with.
+      const nativeParentOf = new Map(entries.filter((entry) => entry.nativeParentSessionId !== undefined).map((entry) => [entry.sessionId, entry.nativeParentSessionId as string]));
+      const found: Array<Awaited<ReturnType<PiOrchClient['childStatus']>> & { nativeParentSessionId?: string }> = [];
       const queue = [...entries];
       let pruned = 0;
       const worker = async (): Promise<void> => {
@@ -1569,9 +1664,9 @@ export class PiOrchClient {
             this.spawnLedger.remove(entry.sessionId);
             pruned += 1;
           } else {
-            found.push(child);
-          }
-        }
+            const nativeParentSessionId = nativeParentOf.get(entry.sessionId);
+            found.push(nativeParentSessionId !== undefined ? { ...child, nativeParentSessionId } : child);
+          }        }
       };
       await Promise.all([worker(), worker(), worker(), worker()]);
       const order = new Map(entries.map((entry, index) => [entry.sessionId, index]));

@@ -40,6 +40,15 @@ export function validateGoalFields(goal: { objective: string; maxTurns?: number;
   }
 }
 
+/**
+ * Step 1i.2 C (contract 1.63.0): the shape the server enforces for a native
+ * parent id — an opaque bare token (a Claude Code session uuid, an opencode
+ * `ses_*` id), never a path. The client skips (with one warning) an
+ * environment-derived value that does not match; the builder throws for a
+ * directly-passed bad value.
+ */
+export const NATIVE_PARENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
 export interface CreateInput {
   runtime: Runtime;
   cwd: string;
@@ -50,6 +59,14 @@ export interface CreateInput {
   goal?: { objective: string; maxTurns?: number; verifyCommand?: string; /** J2 P1: token budget for the goal engine (server default 5,000,000 pauses long goals). */ budgetTokens?: number };
   preflight?: { paths?: string[]; tools?: string[] };
   parentSessionId?: string;
+  /**
+   * Step 1i.2 C: mark the parent as a NATIVE session id (contract 1.63.0):
+   * sent as `parentSessionId` + `parentKind: "native"` and persisted
+   * server-side as `parentSource: "declared"`. Ignored when an explicit
+   * managed `parentSessionId` is also given (managed wins, mirroring the
+   * header precedence). Capability gating lives in the client.
+   */
+  nativeParentId?: string;
   agentOsCapture?: 'enabled' | 'disabled';
   /** Default true: the goal objective carries the C3b completion-report template. */
   completionTemplate?: boolean;
@@ -110,7 +127,17 @@ export function buildCreateBody(input: CreateInput): Record<string, unknown> {
   if (input.preflight) {
     body.preflight = buildPreflightSpec(input.preflight);
   }
-  if (input.parentSessionId !== undefined) body.parentSessionId = input.parentSessionId;
+  if (input.parentSessionId !== undefined) {
+    body.parentSessionId = input.parentSessionId;
+  } else if (input.nativeParentId !== undefined) {
+    if (!NATIVE_PARENT_ID_PATTERN.test(input.nativeParentId)) {
+      throw new Error(`pi-orch: nativeParentId must be a bare native session id (${NATIVE_PARENT_ID_PATTERN.source}); got ${JSON.stringify(input.nativeParentId)}`);
+    }
+    // Contract 1.63.0: an explicitly native parent — body-scoped marker, no
+    // X-Parent-Session header, no registry resolution server-side.
+    body.parentSessionId = input.nativeParentId;
+    body.parentKind = 'native';
+  }
   if (input.agentOsCapture !== undefined) body.agentOsCapture = input.agentOsCapture;
   return body;
 }
