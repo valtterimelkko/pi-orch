@@ -16,6 +16,16 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 const GOALLESS_RUNTIMES: readonly Runtime[] = ['opencode', 'antigravity'];
 
+/**
+ * Step 1k (contract 1.65.0): the session CLASS, recorded once at creation.
+ * `validation` is the only storable value (the server 400s anything else, and
+ * 'child' is derived by readers from the parent link); an absent class means
+ * neither — a reader's "mine" candidate. Deliberately a closed list: a value
+ * the server would reject must never leave this client.
+ */
+const SESSION_CLASSES = ['validation'] as const;
+export type SessionClass = (typeof SESSION_CLASSES)[number];
+
 /** 02-correction 1: one validator for goal fields, shared by create-time goals and goalStart. */
 export class GoalFieldValidationError extends Error {}
 
@@ -70,6 +80,13 @@ export interface CreateInput {
   agentOsCapture?: 'enabled' | 'disabled';
   /** Default true: the goal objective carries the C3b completion-report template. */
   completionTemplate?: boolean;
+  /**
+   * Step 1k (contract 1.65.0): declare the session's class at creation
+   * (`sessionClass: "validation"`). Capability-gated in the client on
+   * `features.sessionClass` — an older server is refused, never sent a field
+   * its strict create schema would reject.
+   */
+  sessionClass?: SessionClass;
 }
 
 export function buildCreateBody(input: CreateInput): Record<string, unknown> {
@@ -139,6 +156,12 @@ export function buildCreateBody(input: CreateInput): Record<string, unknown> {
     body.parentKind = 'native';
   }
   if (input.agentOsCapture !== undefined) body.agentOsCapture = input.agentOsCapture;
+  if (input.sessionClass !== undefined) {
+    if (!SESSION_CLASSES.includes(input.sessionClass)) {
+      throw new Error(`pi-orch: sessionClass must be '${SESSION_CLASSES.join("', '")}' (the only storable class; a child is derived from its parent link, and 'mine' is the absence of both)`);
+    }
+    body.sessionClass = input.sessionClass;
+  }
   return body;
 }
 

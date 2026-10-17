@@ -48,6 +48,8 @@ export interface ClientLike {
   result(runId: string, options?: { includeTranscript?: boolean; final?: boolean }): Promise<Record<string, unknown>>;
   verify(input: { sessionId: string; runId?: string; gates?: Gate[]; gateTimeoutMs?: number; [key: string]: unknown }): Promise<{ implemented: false; plannedBy: string } | { sessionId: string; verdict: string; claims: Array<Record<string, unknown>>; summary: string }>;
   cleanup(sessionId: string, options?: { leaseId?: string; ownerId?: string; watchId?: string }): Promise<{ released: boolean; deleted: boolean; notes: string[] }>;
+  archive(sessionId: string, options?: { updatedAt?: number }): Promise<{ ok: boolean; sessionId: string; archived: boolean; archivedAt?: number }>;
+  unarchive(sessionId: string, options?: { updatedAt?: number }): Promise<{ ok: boolean; sessionId: string; archived: boolean }>;
   status(target: { parent?: string; sessionId?: string; owner?: string }): Promise<{ parent?: string; owner?: string; pruned?: number; children: Array<Record<string, unknown>> }>;
   models(runtime?: string): Promise<Array<Record<string, unknown>>>;
   capabilities(): Promise<Record<string, unknown>>;
@@ -248,6 +250,12 @@ Verbs:
   cleanup <sessionId> [--lease id --owner id] [--watch id]
                                        release the owned lease (the spawn ledger's lease
                                        when --lease is omitted), then delete
+  archive <sessionId> [--updated-at MS]   the Internal API archive route: the same
+  unarchive <sessionId> [--updated-at MS] archive state the web UI sidebar writes
+                                       (contract 1.65.0, gated on features.sessionArchive;
+                                       --updated-at is the last-writer-wins stamp and
+                                       defaults to now). A pinned session refuses with
+                                       exit 27; a live turn with exit 12
   cleanup --owner ID                   EVERY ledger child of that owner (only that owner):
                                        cancel its watch (generation-safe), release the
                                        stored lease, delete; one report line per child;
@@ -269,6 +277,12 @@ Common flags: --socket P --token-path P --api-base URL --parent-session ID --jso
   --snapshot P (compare the live /capabilities against this snapshot copy)
 
 Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
+  --class validation (contract 1.65.0, gated on features.sessionClass: the
+    session's class, recorded once at creation. 'validation' is the only
+    storable value — a child is derived from its parent link and 'mine' is the
+    absence of both; any other value is a usage error, and a server that does
+    not advertise the feature is refused with exit 26 before anything is
+    created),
   --owner ID [--ttl S] [--label L] (durable retention with your ownerId),
   --goal-objective OBJ [--goal-max-turns N] [--goal-verify CMD]
     [--goal-budget-tokens N] (token budget for the goal engine; the server
@@ -326,7 +340,11 @@ Exit codes: 0 ok · 1 error · 2 usage · 3 deadline · 4 run failed · 5 interr
   · 24 remote api base refused · 25 route limit (G1/W0d: spawn refused before any
   child was created; a Claude profile route defaults to the server-advertised
   cap, and the message names the cap and the owner-authorised PAYG overflow
-  route; --wait-for-slot waits instead). Full table: README.md
+  route; --wait-for-slot waits instead)
+  · 26 FEATURE_UNSUPPORTED (the server does not advertise the capability the
+  command needs, or /capabilities could not be read — nothing was created or
+  changed) · 27 SESSION_PINNED (archive refused: the session is pinned).
+  Full table: README.md
 
 Parent patterns (J2): a Claude Code parent is not a Pi Web UI session — its
   children carry only the --owner id (convention:
@@ -345,12 +363,14 @@ const VERB_FLAGS: Record<string, Set<string>> = {
   capabilities: new Set([]),
   capacity: new Set([]),
   models: new Set(['runtime', 'match']),
-  spawn: new Set(['runtime', 'cwd', 'owner', 'ttl', 'label', 'model-selector', 'model-match', 'thinking', 'goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'wait-for-slot', 'wait-admission', 'agent-os-capture', 'no-completion-template', 'template-follow-up', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
+  spawn: new Set(['runtime', 'cwd', 'owner', 'ttl', 'label', 'model-selector', 'model-match', 'thinking', 'goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'wait-for-slot', 'wait-admission', 'agent-os-capture', 'no-completion-template', 'template-follow-up', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit', 'class']),
   prompt: new Set(['message', 'mode', 'no-detach', 'idempotency-key', 'verbosity', 'require-active-turn', 'owner', 'no-completion-template', 'id-only', 'preflight-path', 'preflight-tool', 'route-limit']),
   wait: new Set(['deadline', 'objective', 'conditions', 'run-id', 'all', 'any', 'label', 'slice', 'goal-id']),
   result: new Set(['transcript', 'final']),
   verify: new Set(['run-id', 'since', 'rerun', 'rerun-timeout', 'cwd', 'repo', 'gates-file', 'gate-timeout']),
   cleanup: new Set(['lease', 'owner', 'watch']),
+  archive: new Set(['updated-at']),
+  unarchive: new Set(['updated-at']),
   status: new Set(['parent', 'owner']),
   goal: new Set(['goal-objective', 'goal-max-turns', 'goal-verify', 'goal-budget-tokens', 'no-completion-template', 'template-follow-up', 'reason', 'note']),
   template: new Set(['goal']),
@@ -388,7 +408,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<CliResult> 
 async function withSnapshotStaleness(argv: string[], deps: CliDeps, result: CliResult): Promise<CliResult> {
   if (result.exitCode !== 0 || result.stdout === undefined) return result;
   const args = parseArgs(argv);
-  const KNOWN_API_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'cleanup', 'status']);
+  const KNOWN_API_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'cleanup', 'status', 'archive', 'unarchive']);
   if (!KNOWN_API_VERBS.has(args.verb)) return result;
   let snapshot;
   try {
@@ -437,7 +457,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
 
   // Validate the verb BEFORE touching the client factory (a bad command must
   // be a usage error, not a transport error).
-  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template', 'lane']);
+  const KNOWN_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template', 'lane', 'archive', 'unarchive']);
   if (!KNOWN_VERBS.has(args.verb)) {
     throw new UsageError(`unknown verb '${args.verb}'`);
   }
@@ -542,6 +562,16 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const goalObjective = flagString(args, 'goal-objective');
       const goalBudget = flagNumber(args, 'goal-budget-tokens');
       const preflight = preflightFrom(args);
+      // Step 1k (contract 1.65.0): the session class. A bad value — or the flag
+      // with no value — is a USAGE error before the client factory runs; the
+      // capability gate (server advertises features.sessionClass) lives in the
+      // client, and refuses BEFORE anything is created.
+      const sessionClass = flagString(args, 'class');
+      if (args.flags.has('class') && sessionClass !== 'validation') {
+        throw new UsageError(sessionClass === undefined
+          ? "--class needs a value: --class validation (the only storable class)"
+          : `--class '${sessionClass}' is not a storable session class — 'validation' is the only accepted value (a child is derived from its parent link, and 'mine' is the absence of both; the server 400s any other value)`);
+      }
       // 02-correction 1: the shared goal-field validation as a usage error
       // BEFORE the client factory — the Luna probe (1e12 budget) never
       // reaches a request now.
@@ -575,6 +605,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         preflight,
         agentOsCapture: flagString(args, 'agent-os-capture'),
         completionTemplate: args.flags.has('no-completion-template') ? false : undefined,
+        ...(sessionClass !== undefined ? { sessionClass: sessionClass as 'validation' } : {}),
         ...(args.flags.has('template-follow-up') ? { templateFollowUp: true } : {}),
         ...(waitForSlotMs !== undefined ? { waitForSlotMs } : {}),
         ...(waitAdmissionMs !== undefined ? { waitAdmissionMs } : {}),
@@ -944,6 +975,32 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         return [`released ${cleanup.released}`, `deleted ${cleanup.deleted}`, ...cleanup.notes].join('\n');
       });
     }
+    case 'archive':
+    case 'unarchive': {
+      // Step 1k (contract 1.65.0): the archive verbs. The capability gate and
+      // the acknowledgement check live in the client; this only validates the
+      // command line (a bad --updated-at is a usage error before any request).
+      const sessionId = args.positional[0];
+      if (!sessionId) throw new UsageError(`${args.verb} needs <sessionId>`);
+      if (args.positional.length > 1) throw new UsageError(`${args.verb} takes one <sessionId>, got ${args.positional.length}`);
+      const updatedAt = flagNumber(args, 'updated-at');
+      if (args.flags.has('updated-at') && (updatedAt === undefined || !Number.isInteger(updatedAt) || updatedAt <= 0)) {
+        throw new UsageError('--updated-at must be a positive epoch-ms integer (the last-writer-wins stamp of the archive record)');
+      }
+      const options = updatedAt !== undefined ? { updatedAt } : undefined;
+      const archiving = args.verb === 'archive';
+      const body = archiving ? await getClient().archive(sessionId, options) : await getClient().unarchive(sessionId, options);
+      return output(json, body, (value) => {
+        const result = value as { sessionId: string; archived: boolean; archivedAt?: number };
+        if (archiving) {
+          return [
+            `archived ${result.sessionId}${result.archivedAt !== undefined ? ` (archivedAt ${result.archivedAt})` : ''}`,
+            'the archived flag on every list surface flips with it (one archive state, not two); the retention funnel keys on archivedAt',
+          ].join('\n');
+        }
+        return `unarchived ${result.sessionId} (the archived flag and its dwell stamp are cleared)`;
+      });
+    }
     case 'status': {
       const sessionId = args.positional[0];
       const parent = flagString(args, 'parent');
@@ -955,7 +1012,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
         const body = await getClient().status({ owner });
         return output(json, body, (value) => {
           const status = value as { owner?: string; pruned?: number; children: Array<Record<string, unknown>> };
-          const lines = status.children.map((child) => `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String((child.lastRun as { status?: string } | undefined)?.status)}${nativeParentSuffix(child)}${interruptionSuffix(child)}`);
+          const lines = status.children.map((child) => `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String((child.lastRun as { status?: string } | undefined)?.status)}${classSuffix(child)}${nativeParentSuffix(child)}${interruptionSuffix(child)}`);
           lines.push(`owner ${String(status.owner)}: ${status.children.length} child(ren), ${String(status.pruned ?? 0)} stale ledger entr(y/ies) pruned`);
           return lines.join('\n');
         });
@@ -965,7 +1022,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       return output(json, body, (value) => {
         const status = value as { children: Array<Record<string, unknown>> };
         return status.children
-          .map((child) => `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String((child.lastRun as { status?: string } | undefined)?.status)}${interruptionSuffix(child)}`)
+          .map((child) => `${String(child.sessionId)} busy=${String(child.busy)} goal=${String(child.goalStatus)} last=${String((child.lastRun as { status?: string } | undefined)?.status)}${classSuffix(child)}${interruptionSuffix(child)}`)
           .join('\n');
       });
     }
@@ -991,6 +1048,16 @@ function interruptionSuffix(child: Record<string, unknown>): string {
 function nativeParentSuffix(child: Record<string, unknown>): string {
   const nativeParent = child.nativeParentSessionId;
   return typeof nativeParent === 'string' && nativeParent !== '' ? ` nativeParent=${nativeParent}` : '';
+}
+
+/**
+ * Step 1k (contract 1.65.0): the class a child's line carries — only when the
+ * SERVER echoed one (a registry-known validation session). Nothing is shown
+ * for an absent class: the client never infers a class from the ledger.
+ */
+function classSuffix(child: Record<string, unknown>): string {
+  const sessionClass = child.sessionClass;
+  return typeof sessionClass === 'string' && sessionClass !== '' ? ` class=${sessionClass}` : '';
 }
 
 function goalLine(value: unknown): string {

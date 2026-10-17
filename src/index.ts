@@ -25,7 +25,9 @@ export {
   type Runtime,
   type ThinkingLevel,
   type GoalMatch,
+  type SessionClass,
 } from './builders.ts';
+export { FeatureUnsupportedError, ArchiveAcknowledgementError, type ArchiveOutcome } from './client.ts';
 export {
   parseReceipt,
   classifyReceipt,

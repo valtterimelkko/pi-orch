@@ -23,10 +23,10 @@ export interface AuditRecord {
   durationMs: number;
 }
 
-export const AUDITED_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'status', 'goal', 'watch', 'reroute', 'template', 'lane', 'help']);
+export const AUDITED_VERBS = new Set(['capabilities', 'capacity', 'models', 'spawn', 'prompt', 'wait', 'result', 'verify', 'cleanup', 'archive', 'unarchive', 'status', 'goal', 'watch', 'reroute', 'template', 'lane', 'help']);
 
 /** Verbs whose first positional argument is a session id. */
-const SESSION_POSITIONAL = new Set(['prompt', 'wait', 'result', 'verify', 'cleanup', 'goal', 'watch', 'reroute']);
+const SESSION_POSITIONAL = new Set(['prompt', 'wait', 'result', 'verify', 'cleanup', 'archive', 'unarchive', 'goal', 'watch', 'reroute']);
 /** Verbs with a second positional that names the action. */
 const SUBVERB_POSITIONAL = new Set(['goal', 'watch', 'lane']);
 

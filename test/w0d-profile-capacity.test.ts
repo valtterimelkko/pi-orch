@@ -502,14 +502,14 @@ test('W0d/17: a 429 that carries no profile fields still exits 25 and keeps the 
 
 // ── the bundled contract snapshot ────────────────────────────────────────────
 
-test('W0d/18 + W2h + 1i.2C + 1i.3: the bundled snapshot is the server\'s 1.64.0 (native session ids, native parent; still carrying claudeProfiles, the typed refusal, goalId/stalled)', () => {
+test('W0d/18 + W2h + 1i.2C + 1i.3 + 1k: the bundled snapshot is the server\'s 1.65.0 (session class, archive; still carrying native session ids, native parent, claudeProfiles, the typed refusal, goalId/stalled)', () => {
   const snapshot = JSON.parse(readFileSync(join(process.cwd(), 'contract', 'internal-api-client-snapshot.json'), 'utf8')) as {
     contractVersion: string;
     errorCodes: string[];
     types: Record<string, { fields?: Record<string, { type?: string; optional?: boolean }> }>;
     zodSchemas: Record<string, { fields?: Record<string, unknown> } | undefined>;
   };
-  assert.equal(snapshot.contractVersion, '1.64.0');
+  assert.equal(snapshot.contractVersion, '1.65.0');
   assert.ok(snapshot.errorCodes.includes('PROFILE_CAPACITY_EXHAUSTED'));
   const claudeProfiles = snapshot.types.CapacityResponse?.fields?.claudeProfiles;
   assert.ok(claudeProfiles, 'CapacityResponse advertises claudeProfiles');
@@ -524,6 +524,16 @@ test('W0d/18 + W2h + 1i.2C + 1i.3: the bundled snapshot is the server\'s 1.64.0 
   assert.match(snapshot.types.CapabilitiesResponse?.fields?.features?.type ?? '', /nativeParentLinkage/);
   assert.ok(snapshot.zodSchemas.createSessionBody?.fields && 'parentKind' in snapshot.zodSchemas.createSessionBody.fields, 'createSessionBody accepts parentKind');
   assert.ok(snapshot.zodSchemas.createSessionBody?.fields && 'parentSessionId' in snapshot.zodSchemas.createSessionBody.fields);
+  // Step 1k (contract 1.65.0): the session class this client can declare, the
+  // archive refusal codes, and the two advertising capabilities.
+  assert.ok(snapshot.zodSchemas.createSessionBody?.fields && 'sessionClass' in snapshot.zodSchemas.createSessionBody.fields, 'createSessionBody accepts sessionClass');
+  assert.equal(snapshot.types.SessionInfo?.fields?.sessionClass?.type, "'validation'");
+  assert.equal(snapshot.types.SessionInfo?.fields?.sessionClass?.optional, true, 'absent = not validation');
+  assert.equal(snapshot.types.CreateSessionResponse?.fields?.sessionClass?.type, "'validation'");
+  assert.ok(snapshot.errorCodes.includes('SESSION_PINNED'));
+  assert.ok(snapshot.errorCodes.includes('SESSION_BUSY'));
+  assert.match(snapshot.types.CapabilitiesResponse?.fields?.features?.type ?? '', /sessionClass/);
+  assert.match(snapshot.types.CapabilitiesResponse?.fields?.features?.type ?? '', /sessionArchive/);
 });
 
 // ─── W0d review fix 1: a profile-cap 429 surfaces at once (no silent Retry-After stall) ──────────

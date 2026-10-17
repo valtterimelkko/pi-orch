@@ -144,6 +144,46 @@ export class WatchDeleteAcknowledgementError extends Error {
 }
 
 /**
+ * Step 1k (contract 1.65.0): the server does not advertise a capability the
+ * caller explicitly asked for (`features.sessionClass` for `spawn --class`,
+ * `features.sessionArchive` for `archive`/`unarchive`) — or its `/capabilities`
+ * could not be read at all. Refused BEFORE anything is sent, so nothing was
+ * created or changed. Exit 26 (`FEATURE_UNSUPPORTED`).
+ *
+ * The native-parent link (step 1i.2 C) is the opposite case and stays a
+ * warning: it is an optional field, and a silent skip changes no explicit
+ * request. A class or an archive IS the request.
+ */
+export class FeatureUnsupportedError extends Error {
+  readonly feature: string;
+  code = 'FEATURE_UNSUPPORTED';
+
+  constructor(feature: string, detail: string) {
+    super(`pi-orch: FEATURE_UNSUPPORTED — ${detail}`);
+    this.name = 'FeatureUnsupportedError';
+    this.feature = feature;
+  }
+}
+
+/**
+ * Step 1k: the archive route answered, but the acknowledgement does not
+ * confirm THIS archive/unarchive (a missing or wrong `archived`, `ok: false`,
+ * or another session id). Nothing is reported as archived — the
+ * watch-delete precedent (04-correction A2). Exit 1: the response is malformed,
+ * not a refusal.
+ */
+export class ArchiveAcknowledgementError extends Error {
+  readonly ack: Record<string, unknown> | undefined;
+  code = 'ARCHIVE_ACK_FAILED';
+
+  constructor(sessionId: string, wanted: 'archived' | 'unarchived', ack?: Record<string, unknown>) {
+    super(`pi-orch: ARCHIVE_ACK_FAILED — the server answered ${sessionId} but the acknowledgement does not confirm it was ${wanted} (${JSON.stringify(ack ?? {})}); reporting NOTHING as ${wanted}`);
+    this.name = 'ArchiveAcknowledgementError';
+    this.ack = ack;
+  }
+}
+
+/**
  * W2h (W2-f, contract 1.62.0): is this refusal the quarantined-lease admission
  * debt the server names? Only that class is transient debt worth waiting out;
  * every other refusal is a decision (or a different pressure) to report at once.
@@ -209,6 +249,47 @@ export class PiOrchClient {
    * older server, and nothing is sent (the create schema is strict).
    */
   private nativeParentSupport?: Promise<boolean>;
+
+  /**
+   * Step 1k (contract 1.65.0): the server's advertised `features` object, read
+   * once per client. `undefined` means the read FAILED (an unknown or
+   * unreachable server), which is not the same as "advertises nothing" — a
+   * required-feature gate treats the two differently in its wording, but both
+   * refuse.
+   */
+  private capabilitiesFeatures?: Promise<Record<string, unknown> | undefined>;
+
+  private async advertisedFeatures(): Promise<Record<string, unknown> | undefined> {
+    this.capabilitiesFeatures ??= (async () => {
+      try {
+        const response = await this.transport.request('GET', '/api/v1/capabilities', { headers: this.headers() });
+        const features = (response.body as { features?: unknown } | undefined)?.features;
+        return typeof features === 'object' && features !== null ? (features as Record<string, unknown>) : {};
+      } catch {
+        return undefined;
+      }
+    })();
+    return this.capabilitiesFeatures;
+  }
+
+  /**
+   * Step 1k: the required-feature gate. A capability a caller EXPLICITLY asked
+   * for is refused when the server does not advertise it, and also when
+   * `/capabilities` could not be read (an unverified feature is not a granted
+   * one) — the native-parent link is the opposite case and stays a warning,
+   * because there the field is optional and no explicit request is skipped.
+   * Called BEFORE anything is built or sent, so `refusal` can promise that
+   * nothing happened.
+   */
+  private async requireFeature(name: string, refusal: string): Promise<void> {
+    const features = await this.advertisedFeatures();
+    if (features === undefined) {
+      throw new FeatureUnsupportedError(`features.${name}`, `the server's /capabilities could not be read, so support for features.${name} is unverified; ${refusal}`);
+    }
+    if (features[name] === undefined) {
+      throw new FeatureUnsupportedError(`features.${name}`, `the server does not advertise features.${name}; ${refusal}`);
+    }
+  }
 
   private usableNativeParentId(requested?: string): Promise<string | undefined> {
     const id = requested ?? this.nativeParentSessionId;
@@ -548,6 +629,12 @@ export class PiOrchClient {
     resolvedModel?: string;
     raw: unknown;
   }> {
+    // Step 1k (contract 1.65.0): a declared session CLASS is a required
+    // capability. Checked first, before any model resolution, body build or
+    // create POST, so a refusal leaves the world exactly as it was.
+    if (input.sessionClass !== undefined) {
+      await this.requireFeature('sessionClass', 'nothing was created — the class needs a server that advertises it');
+    }
     const modelSelector = input.modelSelector ?? (input.modelMatch ? await this.resolveModel(input.runtime, input.modelMatch) : undefined);
     // Step 1i.2 C + correction 1 item 2: the native parent rides in the BODY
     // (parentKind "native"), only when there is no managed identity (managed
@@ -619,6 +706,10 @@ export class PiOrchClient {
           ...(retention?.leaseId !== undefined ? { leaseId: retention.leaseId } : {}),
           // Step 1i.2 C: what was actually sent (criterion 3) — additive, old lines parse without it.
           ...(nativeParentId !== undefined ? { nativeParentSessionId: nativeParentId } : {}),
+          // Step 1k: the class that was declared (additive), so a reader of
+          // the ledger — a later reconciliation, or another tool — can see
+          // what the spawn asked for, exactly as the native parent is kept.
+          ...(input.sessionClass !== undefined ? { sessionClass: input.sessionClass } : {}),
           at: new Date().toISOString(),
         });
         if (recorded.note) this.warnOnce(`pi-orch: ${recorded.note}`);
@@ -1507,6 +1598,49 @@ export class PiOrchClient {
     return verifyChild(effective, deps, loadCompletion);
   }
 
+  /**
+   * Step 1k (contract 1.65.0): archive a session through the Internal API —
+   * the same preferences store the browser sidebar writes, so the `archived`
+   * flag on every list surface flips with it (one archive state, not two).
+   * Capability-gated on `features.sessionArchive` (a refusal sends nothing),
+   * and the acknowledgement is checked before anything is reported as
+   * archived: a mutation is never announced from an unconfirmed response.
+   */
+  async archive(sessionId: string, options: { updatedAt?: number } = {}): Promise<ArchiveOutcome> {
+    return this.setArchived(sessionId, true, options);
+  }
+
+  /** Step 1k (contract 1.65.0): clear the archived flag (and its dwell stamp). Idempotent server-side. */
+  async unarchive(sessionId: string, options: { updatedAt?: number } = {}): Promise<ArchiveOutcome> {
+    return this.setArchived(sessionId, false, options);
+  }
+
+  private async setArchived(sessionId: string, archived: boolean, options: { updatedAt?: number }): Promise<ArchiveOutcome> {
+    const wanted = archived ? 'archived' as const : 'unarchived' as const;
+    if (options.updatedAt !== undefined && (!Number.isInteger(options.updatedAt) || options.updatedAt <= 0)) {
+      throw new Error('pi-orch: updatedAt must be a positive epoch-ms integer (the last-writer-wins stamp of the archive record)');
+    }
+    await this.requireFeature('sessionArchive', `nothing was ${wanted} — the server is unchanged`);
+    const response = await this.transport.request('POST', `/api/v1/sessions/${encodeURIComponent(sessionId)}/${archived ? 'archive' : 'unarchive'}`, {
+      ...(options.updatedAt !== undefined ? { body: { updatedAt: options.updatedAt } } : {}),
+      headers: this.headers(),
+    });
+    const ack = (response.body ?? {}) as { ok?: unknown; sessionId?: unknown; archived?: unknown; archivedAt?: unknown };
+    // 04-correction A2 precedent: the acknowledgement must confirm THIS change
+    // (the flag, and that it names the session we asked about) before it is
+    // reported; anything else means nothing was done, as far as we can prove.
+    const confirmed = ack.ok !== false
+      && ack.archived === archived
+      && (ack.sessionId === undefined || ack.sessionId === sessionId);
+    if (!confirmed) throw new ArchiveAcknowledgementError(sessionId, wanted, ack as Record<string, unknown>);
+    return {
+      ok: true,
+      sessionId,
+      archived,
+      ...(typeof ack.archivedAt === 'number' ? { archivedAt: ack.archivedAt } : {}),
+    };
+  }
+
   async cleanup(sessionId: string, options: { leaseId?: string; ownerId?: string; watchId?: string } = {}): Promise<{
     released: boolean;
     deleted: boolean;
@@ -1626,6 +1760,8 @@ export class PiOrchClient {
       runtime?: string;
       busy?: boolean;
       status?: string;
+      /** Step 1k (contract 1.65.0): the class the server echoes on a registry-known child. */
+      sessionClass?: string;
       goalStatus?: string;
       goalObjective?: string;
       goalInterruption?: GoalInterruptionFacts;
@@ -1676,7 +1812,7 @@ export class PiOrchClient {
     if (!target.parent) throw new Error('pi-orch: status needs --parent <id>, --owner <id> or a sessionId');
     const query = new URLSearchParams({ parent: target.parent });
     const response = await this.transport.request('GET', `/api/v1/sessions?${query.toString()}`, { headers: this.headers() });
-    const body = response.body as { sessions?: Array<{ sessionId: string; runtime?: string; busy?: boolean; status?: string }> };
+    const body = response.body as { sessions?: Array<{ sessionId: string; runtime?: string; busy?: boolean; status?: string; sessionClass?: string }> };
     const sessions = body.sessions ?? [];
     // Correction 04 item 6: every child is enriched with busy, goal state and
     // its last receipt; bounded parallelism keeps large fan-outs polite.
@@ -1695,12 +1831,14 @@ export class PiOrchClient {
 
   private async childStatus(
     sessionId: string,
-    known?: { runtime?: string; busy?: boolean; status?: string },
+    known?: { runtime?: string; busy?: boolean; status?: string; sessionClass?: string },
   ): Promise<{
     sessionId: string;
     runtime?: string;
     busy?: boolean;
     status?: string;
+    /** Step 1k (contract 1.65.0): the class the server echoes; absent = not validation. */
+    sessionClass?: string;
     goalStatus?: string;
     goalObjective?: string;
     goalInterruption?: GoalInterruptionFacts;
@@ -1717,11 +1855,11 @@ export class PiOrchClient {
     // W2c: GET /sessions rows carry busy/status only optionally (SessionInfo),
     // so a row that has neither is not enough — read the detail. A failed read
     // is surfaced in readErrors; it used to vanish into silent nulls.
-    let detail: { runtime?: string; busy?: boolean; status?: string } | undefined = known;
+    let detail: { runtime?: string; busy?: boolean; status?: string; sessionClass?: string } | undefined = known;
     if (detail === undefined || (detail.busy === undefined && detail.status === undefined)) {
       try {
         const response = await this.transport.request('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}`, { headers: this.headers() });
-        detail = { ...detail, ...((response.body ?? {}) as { runtime?: string; busy?: boolean; status?: string }) };
+        detail = { ...detail, ...((response.body ?? {}) as { runtime?: string; busy?: boolean; status?: string; sessionClass?: string }) };
       } catch (error) {
         if ((error as { status?: number }).status === 404) missing = true;
         readErrors.push(`detail: ${describe(error)}`);
@@ -1752,6 +1890,9 @@ export class PiOrchClient {
       runtime: detail.runtime,
       busy,
       status,
+      // Step 1k (contract 1.65.0): the class the server echoes on a
+      // registry-known session. Absent = not validation (never inferred here).
+      ...(typeof detail.sessionClass === 'string' && detail.sessionClass !== '' ? { sessionClass: detail.sessionClass } : {}),
       goalStatus: goal?.status,
       goalObjective: goal?.objective,
       // Wave K (additive): present only when the server holds interruption facts.
@@ -1801,6 +1942,19 @@ function newestRun(runs: RunChronologyEntry[]): RunChronologyEntry | undefined {
     if (time !== undefined && time > bestTime) { best = run; bestTime = time; }
   }
   return best ?? runs[0];
+}
+
+/**
+ * Step 1k (contract 1.65.0): the confirmed outcome of `archive`/`unarchive`.
+ * Only ever returned when the server's acknowledgement confirmed the change
+ * (the flag, and that it named this session).
+ */
+export interface ArchiveOutcome {
+  ok: true;
+  sessionId: string;
+  archived: boolean;
+  /** The epoch-ms dwell stamp the retention funnel keys on (archive only). */
+  archivedAt?: number;
 }
 
 export interface CleanupOwnerChild {

@@ -14,6 +14,7 @@
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import type { SessionClass } from './builders.ts';
 
 export interface LedgerEntry {
   sessionId: string;
@@ -26,6 +27,8 @@ export interface LedgerEntry {
   parentSessionId?: string;
   /** Step 1i.2 C (contract 1.63.0): the NATIVE parent id sent in the create body (parentKind "native"), when one was. Additive; old lines parse without it. */
   nativeParentSessionId?: string;
+  /** Step 1k (contract 1.65.0): the class declared at spawn (`"validation"`), when one was. Additive; old lines parse without it. */
+  sessionClass?: SessionClass;
   at: string;
 }
 

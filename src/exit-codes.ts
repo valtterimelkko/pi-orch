@@ -42,6 +42,8 @@ export const EXIT_CODES: readonly ExitCodeEntry[] = [
   { code: 23, name: 'CREDENTIAL_IN_REPO', meaning: 'A credential path (the Internal API token) resolves inside this repository; the token must come from outside the repo — point PI_WEB_UI_TOKEN_PATH at a path outside the package root' },
   { code: 24, name: 'REMOTE_API_BASE_REFUSED', meaning: 'PI_WEB_UI_API_BASE points at a non-loopback host (or a remote host over http); only a loopback API base or the Unix socket is allowed unless PI_ORCH_ALLOW_REMOTE_API_BASE=1 is set, and even then a remote base must be https:' },
   { code: 25, name: 'ROUTE_LIMIT', meaning: 'G1/W0d: refused BEFORE any child was created — the caller already has the limit’s worth of live children on that model route (busy, nonterminal run, or goal running/wrapping_up). On a Claude `profile:<id>` route the decision is the server’s own advertised profile capacity (`/capacity` `claudeProfiles`: full when `active >= maxConcurrent`), and the message names the cap and the owner-authorised PAYG overflow route. Use --wait-for-slot (explicit local limits), wait manually, or spread across another route' },
+  { code: 26, name: 'FEATURE_UNSUPPORTED', meaning: 'Step 1k: refused BEFORE anything was created or changed — the server does not advertise the capability the command needs (`features.sessionClass` for `spawn --class validation`, `features.sessionArchive` for `archive`/`unarchive`), or its `/capabilities` could not be read so the support is unverified. Nothing was sent; upgrade the server or drop the flag' },
+  { code: 27, name: 'SESSION_PINNED', meaning: 'Step 1k: `archive` was refused because the session is PINNED (a web-UI pin or a live Internal API pin/retention lease) — a deliberate protection an archive never consumes. The session is unchanged; unpin it first if the archive is intended (a live turn refuses with 12 instead)' },
   { code: 40, name: 'QUESTION', meaning: 'lane run: a child parked with a question (an NN-question.md file in the lane directory, or the question sentinel) — read it, answer the child, re-run the lane to resume the wait' },
   { code: 41, name: 'GATES_RED', meaning: 'lane run: the brief\'s GATES are still red after the correction cap (one bounded correction, or none when maxCorrections is 0) — the parent adjudicates; the runner sends nothing more' },
   { code: 42, name: 'VERDICT', meaning: 'lane run: the reviewer returned ACCEPT WITH FIXES or REJECT (or the closure review did) — the parent adjudicates; `--continue correction` sends the findings as ONE correction plus a closure review' },
@@ -89,6 +91,8 @@ export const ERROR_CODE_EXIT_CODES: Record<string, number> = {
   PROFILE_CAPACITY_EXHAUSTED: 25,
   ROUTE_LIMIT_EXCEEDED: 25,
   ROUTE_LIMIT_WAIT_DEADLINE: 3,
+  FEATURE_UNSUPPORTED: 26,
+  SESSION_PINNED: 27,
 };
 
 export function nameFor(code: number): string | undefined {
