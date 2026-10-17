@@ -117,11 +117,11 @@ function nativeClient(transport: never, warnings: string[], config: Record<strin
 
 // ── snapshot + builder ───────────────────────────────────────────────────────
 
-test('the bundled contract snapshot is 1.63.0 and its create body accepts parentKind', () => {
+test('the bundled contract snapshot is 1.63.0 or later and its create body accepts parentKind', () => {
   const empty = mkdtempSync(join(tmpdir(), 'piorch-np-home-'));
   try {
     const { snapshot } = loadSnapshot({ env: {}, home: empty });
-    assert.equal(snapshot.contractVersion, '1.63.0');
+    assert.equal(snapshot.contractVersion, '1.64.0');
     const fields = snapshot.zodSchemas.createSessionBody?.fields ?? {};
     assert.ok('parentKind' in fields, 'createSessionBody must accept parentKind (1.63.0)');
     assert.ok('parentSessionId' in fields);
