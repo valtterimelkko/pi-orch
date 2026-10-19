@@ -283,12 +283,21 @@ interface LaneState {
   questionsReported: string[];
   /** Steps whose NEXT wait must not use the run-receipt shortcut (a question parked them). */
   omitRunIdFor: string[];
+  /**
+   * D18: wait steps whose server-side watch ledger must NOT be reused by the
+   * next attempt. The ledger is cumulative and a cursor-less wait is served
+   * every firing already recorded, so a parked attempt (a fired `deadline`, a
+   * reported question) would be replayed at once on the re-run. A key is added
+   * before the wait call and removed when the wait records a receipt, so a
+   * parked or killed attempt always resumes on a fresh registration.
+   */
+  staleWatches: string[];
   final?: Record<string, unknown>;
   updatedAt: string;
 }
 
 function freshState(lane: string, at: string): LaneState {
-  return { schema: LANE_STATE_SCHEMA, lane, step: 'new', steps: {}, watches: {}, runs: {}, counters: { corrections: 0, reviewRounds: 0 }, baselines: {}, questionsReported: [], omitRunIdFor: [], updatedAt: at };
+  return { schema: LANE_STATE_SCHEMA, lane, step: 'new', steps: {}, watches: {}, runs: {}, counters: { corrections: 0, reviewRounds: 0 }, baselines: {}, questionsReported: [], omitRunIdFor: [], staleWatches: [], updatedAt: at };
 }
 
 function readState(path: string, lane: string, at: string): LaneState {
@@ -301,7 +310,15 @@ function readState(path: string, lane: string, at: string): LaneState {
   }
   if (parsed.schema !== LANE_STATE_SCHEMA) throw new LaneRunnerError(`runner-state.json has schema ${String(parsed.schema)}, expected ${LANE_STATE_SCHEMA}`);
   if (parsed.lane !== lane) throw new LaneRunnerError(`runner-state.json belongs to lane '${parsed.lane}', not '${lane}'`);
-  return { ...freshState(lane, at), ...parsed };
+  const merged: LaneState = { ...freshState(lane, at), ...parsed };
+  // D18 migration: a state file written before the runner tracked stale watches
+  // may sit after a PARKED wait whose watch ledger already holds the fired
+  // condition (the live ch-inbox lane did: three exit-40 runs with no wait
+  // receipt). Every wait step is therefore treated as stale until its next
+  // attempt records a receipt, so the resumed attempt registers a fresh watch
+  // instead of reading the park back.
+  if (parsed.staleWatches === undefined) merged.staleWatches = [...WAIT_STEPS];
+  return merged;
 }
 
 function writeAtomic(path: string, text: string): void {
@@ -311,6 +328,12 @@ function writeAtomic(path: string, text: string): void {
 }
 
 const JOURNAL_KEYS = ['sessionId', 'leaseId', 'runId', 'watchId', 'outcome', 'verdict', 'green', 'duplicate', 'reused'];
+
+/**
+ * D18: every wait step `drive` can park on. Used only to migrate a state file
+ * written before the runner tracked stale watches (see {@link readState}).
+ */
+const WAIT_STEPS = ['wait', 'wait_correction', 'wait_review', 'wait_fix', 'wait_closure'];
 
 // ─── exits ───────────────────────────────────────────────────────────────────
 
@@ -692,8 +715,38 @@ async function drive(ctx: Ctx): Promise<LaneExit> {
     return result;
   };
 
+  /**
+   * D18: a wait attempt that resumes a parked or interrupted one starts on a
+   * FRESH registration — an empty ledger and a deadline clock that begins now.
+   * The server's watch ledger is cumulative: a long poll with no cursor is
+   * served every firing the watch has already recorded (docs/INTERNAL-API.md),
+   * and the runner registers its watch once and reuses it by label, so replaying
+   * a parked attempt served the already-fired `deadline` condition straight back
+   * (exit 3 at once, every re-run — twelve exit-3 runs in one second in the live
+   * runner log) and the question the parent had already answered (exit 40 at
+   * once, every re-run, after the child had resumed and finished).
+   *
+   * `fireIfSettled` stays OFF here: after a question the runner wants the child's
+   * NEXT turn end, and a reconciled firing from the turn it has just been
+   * re-prompted about would run the gates against a working child. A child that
+   * settled while no runner was watching is still recognised — the run-receipt
+   * preflight when a runId is known, and the run-less receipt check inside the
+   * wait, which needs no firing at all.
+   */
   const waitRole = async (role: Role, key: string, runKey: string | undefined): Promise<void> => {
     await ctx.step(key, {}, async () => {
+      const resuming = state.staleWatches.includes(key);
+      if (resuming) {
+        const conditionSet = conditionsFor(role);
+        const fresh = await client.registerWatch(sessionOf(role), { conditions: conditionSet, label: label(role) });
+        state.watches[role] = fresh.watchId;
+        ctx.persist();
+      } else {
+        // Written BEFORE the wait: an attempt killed mid-wait resumes on a
+        // fresh registration too (its deadline condition's clock has moved on).
+        state.staleWatches.push(key);
+        ctx.persist();
+      }
       const runId = runKey !== undefined && !state.omitRunIdFor.includes(key) ? state.runs[runKey] : undefined;
       const outcome = await client.wait({
         sessionId: sessionOf(role),
@@ -708,11 +761,11 @@ async function drive(ctx: Ctx): Promise<LaneExit> {
         // Record the files now, so a later completed turn never re-reports an answered question.
         const asked = questionFilesIn(lane.dir).filter((name) => !state.questionsReported.includes(name));
         state.questionsReported.push(...asked);
-        state.omitRunIdFor.push(key);
+        if (!state.omitRunIdFor.includes(key)) state.omitRunIdFor.push(key);
         throw new LaneExit(40, 'the child asked a question (sentinel)', { questionFiles: asked, role }, `pi-orch lane: the ${role} parked with a question — read the NN-question.md file(s) in ${lane.dir}, answer the child (pi-orch prompt ${sessionOf(role)} --message ...), then re-run the lane to resume the wait.`);
       }
       if (kind === 'deadline') {
-        throw new LaneExit(3, `wait deadline elapsed while the ${role} was still working`, { role, ...(outcome.note ? { note: outcome.note } : {}) }, `pi-orch lane: DEADLINE — the ${role} is still working${outcome.note ? ` (${outcome.note})` : ''}; re-run the lane to keep waiting (the dispatch is never re-sent).`);
+        throw new LaneExit(3, `wait deadline elapsed while the ${role} was still working`, { role, ...(outcome.note ? { note: outcome.note } : {}) }, `pi-orch lane: DEADLINE — the ${role} is still working${outcome.note ? ` (${outcome.note})` : ''}; re-run the lane to keep waiting — the re-run waits in a FRESH window (new watch, new deadline) and the dispatch is never re-sent.`);
       }
       if (kind !== 'completed' && kind !== 'goal_achieved') {
         throw new LaneExit(43, `the ${role} wait ended '${kind}'${outcome.note ? `: ${outcome.note}` : ''}`, { role, waitOutcome: kind, ...(outcome.note ? { note: outcome.note } : {}) }, `pi-orch lane: RUNNER_ERROR — the ${role} wait ended '${kind}'${outcome.note ? ` (${outcome.note})` : ''}; inspect session ${sessionOf(role)} and re-run to re-wait.`);
@@ -720,10 +773,12 @@ async function drive(ctx: Ctx): Promise<LaneExit> {
       const fresh = questionFilesIn(lane.dir).filter((name) => !state.questionsReported.includes(name));
       if (fresh.length > 0) {
         state.questionsReported.push(...fresh);
-        state.omitRunIdFor.push(key);
+        if (!state.omitRunIdFor.includes(key)) state.omitRunIdFor.push(key);
         throw new LaneExit(40, `the ${role} left a question: ${fresh.join(', ')}`, { questionFiles: fresh, role }, `pi-orch lane: the ${role} left ${fresh.join(', ')} in ${lane.dir} — read it, answer the child (pi-orch prompt ${sessionOf(role)} --message ...), then re-run the lane to resume the wait.`);
       }
-      return { outcome: kind };
+      // A recorded wait needs no ledger: a re-run replays this receipt.
+      state.staleWatches = state.staleWatches.filter((entry) => entry !== key);
+      return { outcome: kind, ...(state.watches[role] !== undefined ? { watchId: state.watches[role] } : {}), ...(resuming ? { freshWatch: true } : {}) };
     });
   };
 
@@ -830,7 +885,7 @@ const PLAN_STEPS = (lane: LoadedLane): Array<{ step: string; detail: string }> =
     { step: 'spawn_implementer', detail: `${config.implementer.runtime} ${config.implementer.selector} (thinking ${config.implementer.thinking ?? 'in selector'}) in ${config.cwd}, owner ${config.owner}, ttl ${config.ttlSeconds}s — a route-cap refusal exits 25 with the overflow hint` },
     { step: 'watch_implementer', detail: `register the watch (${config.mode === 'goal' ? 'goal_end/paused/stalled' : 'agent_end'} + question sentinel + deadline)` },
     { step: 'dispatch', detail: config.mode === 'goal' ? `goal start (one-line objective pointing at brief.md${config.budgetTokens ? `, budget ${config.budgetTokens} tokens` : ''})` : 'prompt: child directive + brief.md' },
-    { step: 'wait', detail: 'long-poll wait (this process is the waiter); a child question (NN-question.md or the sentinel) → exit 40; a deadline → exit 3' },
+    { step: 'wait', detail: 'long-poll wait (this process is the waiter); a child question (NN-question.md or the sentinel) → exit 40; a deadline → exit 3; an attempt that parks (or is killed) resumes on a fresh watch — fresh deadline — so no fired condition is replayed' },
     { step: 'gates', detail: `re-run the ${lane.gates.length} GATES from brief.md in ${config.cwd} (verify --gates-file logic)` },
     { step: 'correction', detail: config.maxCorrections > 0 ? 'only if a gate is red: ONE bounded correction to the SAME implementer → wait_correction → gates_correction; still red → exit 41' : 'maxCorrections is 0: a red gate exits 41 at once' },
     { step: 'spawn_reviewer', detail: `${config.reviewer.runtime} ${config.reviewer.selector} (thinking ${config.reviewer.thinking ?? 'in selector'}), fresh session` },
