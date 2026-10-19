@@ -502,14 +502,14 @@ test('W0d/17: a 429 that carries no profile fields still exits 25 and keeps the 
 
 // ── the bundled contract snapshot ────────────────────────────────────────────
 
-test('W0d/18 + W2h + 1i.2C + 1i.3 + 1k: the bundled snapshot is the server\'s 1.65.0 (session class, archive; still carrying native session ids, native parent, claudeProfiles, the typed refusal, goalId/stalled)', () => {
+test('W0d/18 + W2h + 1i.2C + 1i.3 + 1k: the bundled snapshot is the server\'s 1.66.0 (notification actions; session class, archive; still carrying native session ids, native parent, claudeProfiles, the typed refusal, goalId/stalled)', () => {
   const snapshot = JSON.parse(readFileSync(join(process.cwd(), 'contract', 'internal-api-client-snapshot.json'), 'utf8')) as {
     contractVersion: string;
     errorCodes: string[];
     types: Record<string, { fields?: Record<string, { type?: string; optional?: boolean }> }>;
     zodSchemas: Record<string, { fields?: Record<string, unknown> } | undefined>;
   };
-  assert.equal(snapshot.contractVersion, '1.65.0');
+  assert.equal(snapshot.contractVersion, '1.66.0');
   assert.ok(snapshot.errorCodes.includes('PROFILE_CAPACITY_EXHAUSTED'));
   const claudeProfiles = snapshot.types.CapacityResponse?.fields?.claudeProfiles;
   assert.ok(claudeProfiles, 'CapacityResponse advertises claudeProfiles');
