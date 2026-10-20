@@ -53,6 +53,8 @@ pi-orch result "$run" --json
 
 ## Verbs
 
+> **Consumed by the command centre (Wheelhouse).** On the maintainer's host the centre uses exactly two verbs: `prompt --mode deliver` to deliver an owner message into a managed Pi Web UI session, and `cleanup` to remove a child (its reader treats the deleted registry entry and transcript as `session-gone`). Those flags, the `--json` shapes and the exit codes are a cross-repo contract — changing one is a change to the centre's dependency map (`docs/DEPENDENCIES.md` in the command-centre repository) in the same commit.
+
 ```
 pi-orch capabilities                     # contract version, runtime features
 pi-orch lane run <lane-dir> [--dry-run] [--continue correction]  # the lane runner (see "Lane runner")
