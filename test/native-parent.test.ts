@@ -187,7 +187,12 @@ test('spawn on an older server (no nativeParentLinkage) sends nothing new', asyn
   const create = calls.find((call) => call.method === 'POST' && call.path === '/api/v1/sessions');
   assert.equal(create?.options.body?.parentSessionId, undefined);
   assert.equal(create?.options.body?.parentKind, undefined);
-  assert.deepEqual(warnings, [], 'an older server is normal operation, not a warning');
+  // w11-orch: nothing NEW is sent to an older server (strict schema), but a
+  // requested native parent that could not be persisted is no longer a silent
+  // orphan — it is reported once via PARENT_NOT_LINKED. The env-configured
+  // native id is not an explicit request, so NATIVE_PARENT_SKIPPED stays off.
+  assert.ok(warnings.some((line) => line.includes('PARENT_NOT_LINKED')), `expected PARENT_NOT_LINKED: ${JSON.stringify(warnings)}`);
+  assert.ok(!warnings.some((line) => line.includes('NATIVE_PARENT_SKIPPED')), `env-native must not raise NATIVE_PARENT_SKIPPED: ${JSON.stringify(warnings)}`);
 });
 
 test('an unreadable /capabilities sends nothing new (strict schema, fail safe)', async () => {
@@ -305,6 +310,59 @@ test('CLI: a managed parent identity wins over CLAUDE_CODE_SESSION_ID', async ()
   }, { PI_SESSION_ID: 'pi-managed', CLAUDE_CODE_SESSION_ID: SYNTHETIC_NATIVE_UUID }));
   assert.equal(seen[0]?.parentSessionId, 'pi-managed');
   assert.equal(seen[0]?.nativeParentSessionId, undefined, 'the managed chain stays X-Parent-Session');
+});
+
+test('CLI: a --parent-session equal to CLAUDE_CODE_SESSION_ID is a native parent, not X-Parent-Session (w11-orch)', async () => {
+  // The owner's orphan bug: a Claude Code parent passes --parent-session its
+  // own native session id. That id is NOT an Internal API session, so sending
+  // it as X-Parent-Session records NO parent and the child lands in "mine".
+  // It must ride in the create body as the declared native parent instead.
+  const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w', '--parent-session', SYNTHETIC_NATIVE_UUID], fakeDeps((config) => {
+    seen.push(config);
+    return { spawn: async () => ({ sessionId: 's1', raw: {} }) } as never;
+  }, { CLAUDE_CODE_SESSION_ID: SYNTHETIC_NATIVE_UUID }));
+  assert.equal(seen[0]?.parentSessionId, undefined, 'a native parent must NOT become the managed X-Parent-Session id');
+  assert.equal(seen[0]?.nativeParentSessionId, SYNTHETIC_NATIVE_UUID, 'it rides as the declared native parent');
+});
+
+test('CLI: --no-native-parent keeps a CLAUDE_CODE_SESSION_ID-valued --parent-session as the managed id (w11-orch)', async () => {
+  // Opting out of the native link leaves the explicit --parent-session on the
+  // managed channel (the caller asked for no native parent).
+  const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w', '--parent-session', SYNTHETIC_NATIVE_UUID, '--no-native-parent'], fakeDeps((config) => {
+    seen.push(config);
+    return { spawn: async () => ({ sessionId: 's1', raw: {} }) } as never;
+  }, { CLAUDE_CODE_SESSION_ID: SYNTHETIC_NATIVE_UUID }));
+  assert.equal(seen[0]?.parentSessionId, SYNTHETIC_NATIVE_UUID);
+  assert.equal(seen[0]?.nativeParentSessionId, undefined, '--no-native-parent stays off the native channel');
+});
+
+test('CLI: a --parent-session that is NOT CLAUDE_CODE_SESSION_ID stays managed (w11-orch)', async () => {
+  // A real Internal API parent id (or any non-native value) keeps the header.
+  const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w', '--parent-session', 'api-session-xyz'], fakeDeps((config) => {
+    seen.push(config);
+    return { spawn: async () => ({ sessionId: 's1', raw: {} }) } as never;
+  }, { CLAUDE_CODE_SESSION_ID: SYNTHETIC_NATIVE_UUID }));
+  assert.equal(seen[0]?.parentSessionId, 'api-session-xyz');
+  assert.equal(seen[0]?.nativeParentSessionId, undefined, 'a non-native --parent-session is managed');
+});
+
+test('spawn warns PARENT_NOT_LINKED when a native parent was requested but the server reports none (w11-orch)', async () => {
+  // Safety net: a parent was requested and the created session reports none —
+  // never fail the spawn, but warn loudly so the orphan is not silent.
+  const { transport, warnings } = fakeTransport({ nativeCapability: false });
+  const client = nativeClient(transport, warnings, { nativeParentSessionId: SYNTHETIC_NATIVE_UUID });
+  await client.spawn({ runtime: 'pi', cwd: '/tmp/w' });
+  assert.ok(warnings.some((line) => line.includes('PARENT_NOT_LINKED')), `expected PARENT_NOT_LINKED: ${JSON.stringify(warnings)}`);
+});
+
+test('spawn does NOT warn PARENT_NOT_LINKED when the native parent linked (w11-orch)', async () => {
+  const { transport, warnings } = fakeTransport({ nativeCapability: true, declaredChildren: 'unset' });
+  const client = nativeClient(transport, warnings, { nativeParentSessionId: SYNTHETIC_NATIVE_UUID });
+  await client.spawn({ runtime: 'pi', cwd: '/tmp/w' });
+  assert.ok(!warnings.some((line) => line.includes('PARENT_NOT_LINKED')), `unexpected warning: ${JSON.stringify(warnings)}`);
 });
 
 test('CLI: --no-native-parent opts out even with CLAUDE_CODE_SESSION_ID set', async () => {

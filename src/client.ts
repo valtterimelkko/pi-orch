@@ -731,6 +731,18 @@ export class PiOrchClient {
       ? await this.withAdmissionWait(createOnce, input.waitAdmissionMs)
       : await createOnce();
     const { raw, retention, sessionId } = created;
+    // w11-orch: a NATIVE parent was requested but the created session reports
+    // none — the link did not take (an older server without
+    // features.nativeParentLinkage, a malformed id, or a server that dropped
+    // it). Warn loudly ONCE so the caller knows the child may appear in the
+    // owner's "mine" list; never fail the spawn for this. A managed
+    // X-Parent-Session parent is not checked here: the server resolves that
+    // header, and the client cannot tell a resolved parent from an
+    // unresolvable one in the create echo.
+    const nativeParentRequested = this.nativeParentSessionId !== undefined || requestedNativeParentId !== undefined;
+    if (nativeParentRequested && typeof raw.parentSessionId !== 'string') {
+      this.warnOnce(`pi-orch: PARENT_NOT_LINKED — a native parent was requested but the created session ${sessionId} reports no parent; the child may appear in the owner's "mine" list (this server needs features.nativeParentLinkage to persist a native parent)`);
+    }
     // C3b: an OPT-IN (templateFollowUp, W2-g) templated GOAL child gets the verbatim instruction paragraph as a
     // queued follow_up (the server keeps objectives single-line, so the
     // objective carries only the flattened pointer). follow_up queues on the

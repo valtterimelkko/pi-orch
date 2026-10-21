@@ -274,6 +274,10 @@ Common flags: --socket P --token-path P --api-base URL --parent-session ID --jso
   parent; on a 1.63.0+ server a spawn with no managed parent identity sends
   the body fields parentSessionId + parentKind "native" so the child is
   linked in every lineage surface)
+  --parent-session ID: a managed parent id (sent as X-Parent-Session). An id
+  equal to this process's own CLAUDE_CODE_SESSION_ID is a Claude Code session,
+  not a managed Internal API session, so it is sent as the declared native
+  parent instead (the header would orphan the child into "mine").
   --snapshot P (compare the live /capabilities against this snapshot copy)
 
 Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
@@ -476,20 +480,34 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
     routeLimitOverrides(args.repeatable.get('route-limit') ?? []);
   }
 
+  const declaredParent = flagString(args, 'parent-session') ?? deps.env.PI_ORCH_PARENT_SESSION;
+  const noNative = args.flags.has('no-native-parent');
+  // w11-orch: a --parent-session / PI_ORCH_PARENT_SESSION id equal to the
+  // caller's own native CLAUDE_CODE_SESSION_ID is a Claude Code session, NOT a
+  // managed Internal API session. The server cannot resolve it via
+  // X-Parent-Session (it records NO parent, so the child is orphaned into the
+  // owner's "mine" list), so it must ride in the create body as the declared
+  // native parent instead. Any other value — a real Internal API id, or a
+  // --parent-session that is not this process's native id — stays managed.
+  const nativeDeclared =
+    declaredParent !== undefined && !noNative && declaredParent === deps.env.CLAUDE_CODE_SESSION_ID
+      ? declaredParent
+      : undefined;
   const parentSessionId =
-    flagString(args, 'parent-session') ??
-    deps.env.PI_ORCH_PARENT_SESSION ??
-    deps.env.PI_WEB_UI_SESSION_ID ??
-    deps.env.PI_SESSION_ID;
+    nativeDeclared !== undefined
+      ? undefined
+      : (declaredParent ?? deps.env.PI_WEB_UI_SESSION_ID ?? deps.env.PI_SESSION_ID);
   // Step 1i.2 C (contract 1.63.0): with NO managed identity, the caller's
   // native session id rides in the create body as a declared parent (shown in
   // every lineage surface on a 1.63.0 server; nothing is sent to an older
   // one). --no-native-parent opts out. Validation lives in the client
   // (bad value → one warning, spawn proceeds).
   const nativeParentSessionId =
-    parentSessionId === undefined && !args.flags.has('no-native-parent')
-      ? deps.env.CLAUDE_CODE_SESSION_ID
-      : undefined;
+    nativeDeclared ?? (
+      parentSessionId === undefined && !noNative
+        ? deps.env.CLAUDE_CODE_SESSION_ID
+        : undefined
+    );
 
   // Lazy: flags must be validated (cheap usage errors) before the client
   // factory runs (which reads tokens and can fail with transport errors).
@@ -528,11 +546,22 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       };
       if (laneOptions.dryRun) return runLane(laneOptions, { client: {} as LaneClient });
       const laneManaged = flagString(args, 'parent-session') ?? lane.config.parentSessionId;
+      // w11-orch: a lane parent equal to this process's native CLAUDE_CODE_SESSION_ID
+      // is a Claude Code session, not a managed Internal API session — route it
+      // to the declared native parent (see the spawn verb above) so the lane's
+      // children are not orphaned into the owner's "mine" list.
+      const laneNoNative = args.flags.has('no-native-parent');
+      const laneNativeDeclared =
+        laneManaged !== undefined && !laneNoNative && laneManaged === deps.env.CLAUDE_CODE_SESSION_ID
+          ? laneManaged
+          : undefined;
       const laneClient = deps.client({
-        parentSessionId: laneManaged,
-        ...(laneManaged === undefined && !args.flags.has('no-native-parent') && deps.env.CLAUDE_CODE_SESSION_ID !== undefined
-          ? { nativeParentSessionId: deps.env.CLAUDE_CODE_SESSION_ID }
-          : {}),
+        ...(laneNativeDeclared === undefined ? { parentSessionId: laneManaged } : {}),
+        ...(laneNativeDeclared !== undefined
+          ? { nativeParentSessionId: laneNativeDeclared }
+          : (laneManaged === undefined && !laneNoNative && deps.env.CLAUDE_CODE_SESSION_ID !== undefined
+            ? { nativeParentSessionId: deps.env.CLAUDE_CODE_SESSION_ID }
+            : {})),
       });
       return runLane(laneOptions, { client: laneClient as unknown as LaneClient });
     }
