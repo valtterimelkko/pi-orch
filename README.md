@@ -4,6 +4,19 @@
 
 [![Pi Web UI Internal API](https://img.shields.io/badge/Pi_Web_UI-Internal_API-blue)](https://github.com/valtterimelkko/pi-web-ui) ![Node >= 22.18](https://img.shields.io/badge/node-%3E%3D22.18-brightgreen) ![runtime dependencies: zero](https://img.shields.io/badge/runtime_dependencies-zero-brightgreen) ![licence: MIT](https://img.shields.io/badge/licence-MIT-blue)
 
+## Part of the Pi Web UI orchestration set
+
+`pi-orch` is one piece of a set that works as a whole. On its own it is a convenient client; the orchestration is reliable and cheap to supervise because of all the pieces together:
+
+| Piece | What it does | Where |
+|---|---|---|
+| **Pi Web UI** | The server: one session model and the local Internal API across Pi Coding Agent, Claude Code, OpenCode, Antigravity and Command Code | [valtterimelkko/pi-web-ui](https://github.com/valtterimelkko/pi-web-ui) · [orchestration overview](https://github.com/valtterimelkko/pi-web-ui/blob/master/docs/ORCHESTRATION-OVERVIEW.md) |
+| **pi-orch** (this repo) | The thin parent client: spawn, prompt, watch-based wait, result, verify, cleanup | here |
+| **Skills** | The discipline around the API: the parent's loop (`pi-web-ui-internal-api-orchestration`), going idle safely (`long-horizon-waiting-strategies`), the child's protocol (`orchestrated-child-worker`), secret scanning | [orchestration pack](https://github.com/valtterimelkko/agent-workflow-skills/blob/main/packs/pi-web-ui-orchestration-pack/README.md) |
+| **watch-wake companions** | A Pi extension and a Claude Code mod that wake an idle parent when a child finishes, plus model-free wake deadlines: the reason a parent can go idle at zero token cost | [`companions/watch-wake`](https://github.com/valtterimelkko/agent-workflow-skills/tree/main/companions/watch-wake) |
+
+Start with the [orchestration fixture set guide](https://github.com/valtterimelkko/pi-web-ui/blob/master/docs/ORCHESTRATION-FIXTURE-SET.md) in Pi Web UI, which shows how the four fit together and how to give them to an agent.
+
 ## What it is and why
 
 Pi Web UI runs autonomous agent sessions and exposes them through a same-host Internal API: create a session, prompt it, watch it, read its receipt, attach a goal. `pi-orch` is the thin parent client for that API. Verbs: `spawn`, `prompt`, `wait` (watch-based — never a poll loop), `result`, `verify`, `cleanup`, `archive`/`unarchive`, `status`, `capabilities`, `capacity`, `models`.
@@ -293,7 +306,7 @@ Every prompt starts with the `agent-os-child` directive (`CHILD_DIRECTIVE` in `s
 
 ## Skill pack
 
-The agent skills that use this client (parent orchestration, long-horizon waiting, the orchestrated child worker protocol and secret scanning) live in the public **[Pi Web UI orchestration pack](https://github.com/valtterimelkko/agent-workflow-skills/tree/main/packs/pi-web-ui-orchestration-pack)**.
+The agent skills that use this client live in the public **[Pi Web UI orchestration pack](https://github.com/valtterimelkko/agent-workflow-skills/blob/main/packs/pi-web-ui-orchestration-pack/README.md)**: parent orchestration (`pi-web-ui-internal-api-orchestration`, whose `references/pi-orch.md` documents these verbs from the agent's side), long-horizon waiting (`long-horizon-waiting-strategies`), the orchestrated child worker protocol and secret scanning. The wake mechanism they rely on is published as the [watch-wake companions](https://github.com/valtterimelkko/agent-workflow-skills/tree/main/companions/watch-wake).
 
 ## Development
 
@@ -312,4 +325,5 @@ MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Valtteri Melkko.
 ## See also
 
 - **[Pi Web UI](https://github.com/valtterimelkko/pi-web-ui)** — the server this client talks to (MIT).
-- Public skill pack: [Pi Web UI orchestration pack](https://github.com/valtterimelkko/agent-workflow-skills/tree/main/packs/pi-web-ui-orchestration-pack).
+- Public skill pack: [Pi Web UI orchestration pack](https://github.com/valtterimelkko/agent-workflow-skills/blob/main/packs/pi-web-ui-orchestration-pack/README.md) and the [watch-wake companions](https://github.com/valtterimelkko/agent-workflow-skills/tree/main/companions/watch-wake).
+- [Orchestration fixture set guide](https://github.com/valtterimelkko/pi-web-ui/blob/master/docs/ORCHESTRATION-FIXTURE-SET.md) in Pi Web UI.
