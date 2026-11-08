@@ -1,6 +1,6 @@
 {
   "$schema": "pi-orch-contract-snapshot/v1",
-  "contractVersion": "1.66.0",
+  "contractVersion": "1.67.0",
   "source": {
     "typeFiles": [
       "server/src/internal-api/types.ts",
@@ -166,7 +166,8 @@
             "claude",
             "opencode",
             "antigravity",
-            "commandcode"
+            "commandcode",
+            "devin"
           ]
         },
         "scenarioId": {
@@ -638,7 +639,7 @@
           "type": "{ retentionLeases: true; durableRetention: true; residentRetention: true; executionAdmission: true; runLivenessEvidence: true; sessionRecoveryEvidence: true; supportsEventPayloadBudget: true; capacityEndpoint: '/api/v1/capacity'; /** Contract 1.34.0: child-orchestration surfacing (cards + events) is available. */ childSurfacing: true; /** Contract 1.34.0: the normalized event types the surfacing emits. */ childSurfacingEvents: readonly string[]; /** Contract 1.34.0: request header that links an Internal-API call to the calling parent session. */ childParentHeader: 'X-Parent-Session'; /** Additive opaque-generation CAS fields for watch register/delete. */ watchGenerationPreconditions: { generationField: 'generation'; registerField: 'expectedGeneration'; deleteBodyField: 'expectedGeneration'; }; piProviderPolicy: { blockedProviders: string[]; }; /** Contract 1.46.0: Claude backends allowed for Internal API agent execution (SDK only). */ claudeBackendPolicy: { allowedBackends: ['sdk-subscription']; }; /** Contract 1.47.0 (C1): session identity exported to per-session runtime subprocess environments. */ sessionEnvIdentity: { variables: { sessionId: 'PI_WEB_UI_SESSION_ID'; origin: 'PI_WEB_UI_SESSION_ORIGIN'; parentSessionId: 'PI_WEB_UI_PARENT_SESSION_ID'; }; /** Runtimes whose subprocesses receive the variables (Pi keeps PI_SESSION_ID in-process). */ runtimes: Array<'claude' | 'antigravity' | 'commandcode'>; }; /** Contract 1.47.0 (C2): bounded final assistant text on run receipts. */ runReceiptFinalText: { field: 'finalText'; truncatedField: 'finalTextTruncated'; maxChars: number }; /** Contract 1.58.0 (C3a): child completion block schema, capture fields and per-session surface. */ runCompletionBlock: { schema: typeof COMPLETION_SCHEMA_NAME; fenceInfo: typeof COMPLETION_FENCE_INFO; receiptFields: { block: 'completion'; error: 'completionError' }; sessionSurfaceField: 'latestCompletion'; maxBlockChars: number; parseWindowChars: number; }; /** Contract 1.47.0 (C3): server-side `deadline` watch condition. */ watchDeadlineCondition: { conditionType: 'deadline'; field: 'afterSeconds'; minSeconds: number; maxSeconds: number }; /** Contract 1.47.0 (C4): `fireIfSettled` watch registration option. */ watchFireIfSettled: { registerField: 'fireIfSettled'; eventTypes: string[] }; /** Contract 1.47.0 (Amendment 1): per-session Agent OS capture opt-in on create. */ sessionAgentOsCapture: { createField: 'agentOsCapture'; values: Array<'enabled' | 'disabled'>; env: 'PI_WEB_UI_AGENT_OS_CAPTURE'; }; /** Contract 1.63.0 (step 1i.2 B): an explicitly native parent may be named on * create/batch/adopt — body `parentSessionId` + `parentKind: \"native\"` links * the child to an opaque native session id, persisted and surfaced as * parentSource \"declared\" (no registry resolution, no fan-out). */ nativeParentLinkage: { parentKind: 'native'; parentSource: 'declared'; surfaces: string[]; }; /** Contract 1.64.0 (census Q1): the runtime-native session id (the id the * runtime's own process/transcript runs under) is surfaced additively as * `nativeSessionId` on the sessions list and session detail, recorded the * moment the runtime reports it (Claude: CLI session id mid-turn; * Antigravity: conversation id at init). Absent before the first * confirmed turn. */ nativeSessionIds: { field: 'nativeSessionId'; surfaces: string[]; runtimes: string[]; registryFields: string[]; }; /** Contract 1.65.0 (command-centre step 1k): the session class, recorded * once at creation. Only \"validation\" is storable; \"child\" is derived * from parentSessionId by readers; absent = not validation. */ sessionClass: { field: 'sessionClass'; values: string[]; createSurfaces: string[]; echoSurfaces: string[]; derivation: string; immutable: boolean; }; /** Contract 1.65.0 (command-centre step 1k): archive lifecycle over the * shared web-UI preferences store (prefs-lock + LWW); pinned and * live-turn sessions refuse archive with documented 409 codes. */ sessionArchive: { endpoints: string[]; guards: { pinned: string; liveTurn: string }; idempotent: boolean; body: { updatedAt: string }; }; /** Contract 1.66.0 (CHANNEL.md §7): tappable notification actions with a * server-registered handler — 1–3 buttons, owner-only taps, first tap * wins. The names of the registered handlers are advertised so callers * can send a valid `actionHandler`. */ notificationActions: { maxActions: number; actionIdMaxLength: number; actionLabelMaxLength: number; actionRefMaxLength: number; handlerTimeoutMs: number; handlers: string[]; }; }"
         },
         "runtimes": {
-          "type": "{ pi: RuntimeCapabilities; claude: RuntimeCapabilities; opencode: RuntimeCapabilities; antigravity: RuntimeCapabilities; /** Internal-API-only runtime; older clients may ignore the additive key. */ commandcode: RuntimeCapabilities; }"
+          "type": "{ pi: RuntimeCapabilities; claude: RuntimeCapabilities; opencode: RuntimeCapabilities; antigravity: RuntimeCapabilities; /** Internal-API-only runtime; older clients may ignore the additive key. */ commandcode: RuntimeCapabilities; /** Devin over ACP (DEVIN_ENABLED); always emitted (available:false when gated). */ devin: RuntimeCapabilities; }"
         },
         "claudeProfiles": {
           "type": "Array<{ id: string; label: string; backend?: 'sdk-subscription' | 'cli-direct' | 'channel'; launcherType?: string; /** Underlying model alias (sonnet/opus/haiku); same value as `claudeModel`. */ model?: string; claudeModel?: string; provider?: string; enabled?: boolean; }>",
@@ -656,7 +657,7 @@
           "type": "string"
         },
         "runtime": {
-          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'"
+          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode' | 'devin'"
         },
         "model": {
           "type": "string",
@@ -878,6 +879,18 @@
         "claudeModel": {
           "type": "string",
           "optional": true
+        },
+        "pricing": {
+          "type": "{ free: boolean; raw: string; costTier?: string }",
+          "optional": true
+        },
+        "isNew": {
+          "type": "boolean",
+          "optional": true
+        },
+        "isBeta": {
+          "type": "boolean",
+          "optional": true
         }
       }
     },
@@ -885,7 +898,7 @@
       "kind": "interface",
       "fields": {
         "models": {
-          "type": "{ pi: ModelInfo[]; claude: ModelInfo[]; opencode: ModelInfo[]; /** Optional Internal-API-only runtime; absent from older servers/clients. */ commandcode?: ModelInfo[]; }"
+          "type": "{ pi: ModelInfo[]; claude: ModelInfo[]; opencode: ModelInfo[]; /** Optional Internal-API-only runtime; absent from older servers/clients. */ commandcode?: ModelInfo[]; /** Devin over ACP (DEVIN_ENABLED); absent from older servers/clients. */ devin?: ModelInfo[]; }"
         },
         "catalogueMetadata": {
           "type": "Partial<Record<SessionRuntime, CommandCodeCatalogueMetadata>>",
@@ -1091,7 +1104,7 @@
           "type": "string"
         },
         "runtime": {
-          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'"
+          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode' | 'devin'"
         },
         "executionInstanceId": {
           "type": "string"
@@ -1336,7 +1349,7 @@
           "optional": true
         },
         "runtime": {
-          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'",
+          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode' | 'devin'",
           "optional": true
         },
         "nativeId": {
@@ -1436,7 +1449,7 @@
       "kind": "interface",
       "fields": {
         "backendMode": {
-          "type": "'native' | 'direct' | 'channel' | 'server' | 'subprocess' | 'sdk' | 'stream-json'",
+          "type": "'native' | 'direct' | 'channel' | 'server' | 'subprocess' | 'sdk' | 'stream-json' | 'acp'",
           "optional": true
         },
         "agentOsCapture": {
@@ -1570,7 +1583,7 @@
           "type": "string"
         },
         "runtime": {
-          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'"
+          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode' | 'devin'"
         },
         "executionInstanceId": {
           "type": "string"
@@ -1662,7 +1675,7 @@
           "type": "string"
         },
         "runtime": {
-          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'"
+          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode' | 'devin'"
         },
         "scope": {
           "type": "'visible_recent' | 'visible_full'"
@@ -1885,7 +1898,7 @@
           "type": "string"
         },
         "runtime": {
-          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'"
+          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode' | 'devin'"
         },
         "label": {
           "type": "string",
@@ -2032,7 +2045,7 @@
           "type": "string"
         },
         "runtime": {
-          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'"
+          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode' | 'devin'"
         },
         "firings": {
           "type": "WatchFiring[]"
@@ -2090,7 +2103,7 @@
           "optional": true
         },
         "backendMode": {
-          "type": "'native' | 'direct' | 'channel' | 'server' | 'subprocess' | 'sdk' | 'stream-json'"
+          "type": "'native' | 'direct' | 'channel' | 'server' | 'subprocess' | 'sdk' | 'stream-json' | 'acp'"
         },
         "supportsFollowUp": {
           "type": "boolean"
@@ -2170,7 +2183,7 @@
     },
     "SessionRuntime": {
       "kind": "type",
-      "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'"
+      "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode' | 'devin'"
     },
     "CompletionBlock": {
       "kind": "interface",
@@ -2266,7 +2279,7 @@
           "type": "string"
         },
         "runtime": {
-          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode'",
+          "type": "'pi' | 'claude' | 'opencode' | 'antigravity' | 'commandcode' | 'devin'",
           "optional": true
         },
         "completion": {
