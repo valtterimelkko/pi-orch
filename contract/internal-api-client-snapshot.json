@@ -1,6 +1,6 @@
 {
   "$schema": "pi-orch-contract-snapshot/v1",
-  "contractVersion": "1.68.0",
+  "contractVersion": "1.69.0",
   "source": {
     "typeFiles": [
       "server/src/internal-api/types.ts",
@@ -890,6 +890,14 @@
         },
         "isBeta": {
           "type": "boolean",
+          "optional": true
+        },
+        "family": {
+          "type": "string",
+          "optional": true
+        },
+        "familyName": {
+          "type": "string",
           "optional": true
         }
       }

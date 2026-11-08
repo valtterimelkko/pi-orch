@@ -258,7 +258,7 @@ test('J2 P1: without budgetTokens the key stays absent (server default applies u
   assert.equal('budgetTokens' in goal, false);
 });
 
-test('create body: runtime devin conforms to the 1.68.0 snapshot and carries a goal (server goal support since 1.68.0)', () => {
+test('create body: runtime devin conforms to the 1.69.0 snapshot and carries a goal (server goal support since 1.68.0)', () => {
   const body = buildCreateBody({
     runtime: 'devin',
     cwd: '/tmp/work/devin-1',

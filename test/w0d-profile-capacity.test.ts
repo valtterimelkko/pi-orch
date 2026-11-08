@@ -509,7 +509,7 @@ test('W0d/18 + W2h + 1i.2C + 1i.3 + 1k: the bundled snapshot is the server\'s 1.
     types: Record<string, { fields?: Record<string, { type?: string; optional?: boolean }> }>;
     zodSchemas: Record<string, { fields?: Record<string, unknown> } | undefined>;
   };
-  assert.equal(snapshot.contractVersion, '1.68.0');
+  assert.equal(snapshot.contractVersion, '1.69.0');
   assert.ok(snapshot.errorCodes.includes('PROFILE_CAPACITY_EXHAUSTED'));
   const claudeProfiles = snapshot.types.CapacityResponse?.fields?.claudeProfiles;
   assert.ok(claudeProfiles, 'CapacityResponse advertises claudeProfiles');
