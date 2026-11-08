@@ -257,3 +257,15 @@ test('J2 P1: without budgetTokens the key stays absent (server default applies u
   const goal = body.goal as Record<string, unknown>;
   assert.equal('budgetTokens' in goal, false);
 });
+
+test('create body: runtime devin conforms to the 1.67.0 snapshot and refuses a goal (no server goal support)', () => {
+  const body = buildCreateBody({
+    runtime: 'devin',
+    cwd: '/tmp/work/devin-1',
+    modelSelector: 'swe-2-flash-medium',
+    thinkingLevel: 'medium',
+    retention: { mode: 'durable', ttlSeconds: 3600, ownerId: 'parent-x' },
+  });
+  assert.deepEqual(spec.check(body), []);
+  assert.throws(() => buildCreateBody({ runtime: 'devin', cwd: '/tmp/w', goal: { objective: 'x' } }), /goal is not supported for runtime 'devin'/);
+});

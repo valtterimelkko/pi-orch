@@ -8,13 +8,13 @@
 import type { WatchConditionSpec } from './parsers.ts';
 import { applyCompletionTemplate, applyGoalObjectiveTemplate, COMPLETION_REPORT_INSTRUCTION } from './completion-template.ts';
 
-const RUNTIMES = ['pi', 'claude', 'opencode', 'antigravity', 'commandcode'] as const;
+const RUNTIMES = ['pi', 'claude', 'opencode', 'antigravity', 'commandcode', 'devin'] as const;
 export type Runtime = (typeof RUNTIMES)[number];
 
 const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-const GOALLESS_RUNTIMES: readonly Runtime[] = ['opencode', 'antigravity'];
+const GOALLESS_RUNTIMES: readonly Runtime[] = ['opencode', 'antigravity', 'devin'];
 
 /**
  * Step 1k (contract 1.65.0): the session CLASS, recorded once at creation.
