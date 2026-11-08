@@ -258,7 +258,7 @@ test('J2 P1: without budgetTokens the key stays absent (server default applies u
   assert.equal('budgetTokens' in goal, false);
 });
 
-test('create body: runtime devin conforms to the 1.67.0 snapshot and refuses a goal (no server goal support)', () => {
+test('create body: runtime devin conforms to the 1.68.0 snapshot and carries a goal (server goal support since 1.68.0)', () => {
   const body = buildCreateBody({
     runtime: 'devin',
     cwd: '/tmp/work/devin-1',
@@ -267,5 +267,7 @@ test('create body: runtime devin conforms to the 1.67.0 snapshot and refuses a g
     retention: { mode: 'durable', ttlSeconds: 3600, ownerId: 'parent-x' },
   });
   assert.deepEqual(spec.check(body), []);
-  assert.throws(() => buildCreateBody({ runtime: 'devin', cwd: '/tmp/w', goal: { objective: 'x' } }), /goal is not supported for runtime 'devin'/);
+  const withGoal = buildCreateBody({ runtime: 'devin', cwd: '/tmp/w', goal: { objective: 'x' } });
+  assert.deepEqual(spec.check(withGoal), []);
+  assert.ok(withGoal.goal);
 });

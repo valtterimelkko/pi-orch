@@ -14,7 +14,7 @@ export type Runtime = (typeof RUNTIMES)[number];
 const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-const GOALLESS_RUNTIMES: readonly Runtime[] = ['opencode', 'antigravity', 'devin'];
+const GOALLESS_RUNTIMES: readonly Runtime[] = ['opencode', 'antigravity'];
 
 /**
  * Step 1k (contract 1.65.0): the session CLASS, recorded once at creation.
