@@ -240,8 +240,32 @@
       }
     },
     "retention": {
-      "type": "unknown",
-      "opaque": true
+      "type": "object",
+      "strict": true,
+      "fields": {
+        "label": {
+          "type": "ZodOptional",
+          "opaque": true,
+          "optional": true
+        },
+        "mode": {
+          "type": "enum",
+          "values": [
+            "durable",
+            "resident"
+          ]
+        },
+        "ownerId": {
+          "type": "string",
+          "min": 1,
+          "max": 200
+        },
+        "ttlSeconds": {
+          "type": "ZodOptional",
+          "opaque": true,
+          "optional": true
+        }
+      }
     },
     "preflightSpec": {
       "type": "object",
