@@ -1,6 +1,6 @@
 {
   "$schema": "pi-orch-contract-snapshot/v1",
-  "contractVersion": "1.69.0",
+  "contractVersion": "1.69.1",
   "source": {
     "typeFiles": [
       "server/src/internal-api/types.ts",
