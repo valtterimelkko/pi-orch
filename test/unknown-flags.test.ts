@@ -288,7 +288,15 @@ test('02-correction 6: canonical skills scan (read-only, report-only, skips when
 
 test('04-correction C: alias invocations ($PO, ${PO}) in the canonical skills parse with 0 unknown flags', () => {
   const skillsRoot = '/root/.skills-global/skills-global';
-  const files = ['pi-web-ui-internal-api-orchestration/SKILL.md'];
+  // The skill is a short router (SKILL.md) plus focused references/*.md; its
+  // $PO examples live in the references (moved there in the 2026-11-12
+  // simplification, a3cfcfd), so scan the whole skill directory rather than
+  // pinning one file. Absent files/dirs still skip (CI portability).
+  const skillDir = 'pi-web-ui-internal-api-orchestration';
+  const files = [`${skillDir}/SKILL.md`];
+  try {
+    for (const name of (readdirSync(join(skillsRoot, skillDir, 'references')) as string[]).filter((f) => f.endsWith('.md')).sort()) files.push(`${skillDir}/references/${name}`);
+  } catch { /* absent */ }
   const aliasCommands: Array<{ verb: string; flags: string[] }> = [];
   let scanned = 0;
   for (const rel of files) {
