@@ -1,6 +1,6 @@
 {
   "$schema": "pi-orch-contract-snapshot/v1",
-  "contractVersion": "1.69.1",
+  "contractVersion": "1.70.0",
   "source": {
     "typeFiles": [
       "server/src/internal-api/types.ts",
@@ -55,6 +55,8 @@
     "PROMPT_INJECTION",
     "PROMPT_NOT_EXECUTED",
     "PROVIDER_NOT_ALLOWED",
+    "PROVIDER_QUOTA_EXHAUSTED",
+    "PROVIDER_TRANSIENT",
     "RETENTION_CLAIM_NOT_FOUND",
     "RETENTION_CLAIM_OWNER_MISMATCH",
     "RETENTION_RESIDENT_CAPACITY_EXHAUSTED",
