@@ -12,6 +12,7 @@ import { ZodSpec } from '../src/zod-spec.ts';
 import { SpawnLedger } from '../src/spawn-ledger.ts';
 import type { TransportResponse } from '../src/transport.ts';
 import { tempLedgerPath } from './isolated-ledger.ts';
+import { makeLaneDir, FakeWorld } from './lane-runner-helpers.ts';
 
 /**
  * Step 1i.2 part C (plan 1i, SESSION-RELATIONSHIPS §4.1 C): a native parent
@@ -224,6 +225,24 @@ test('a managed parent identity suppresses the native parent entirely', async ()
   assert.equal(create?.options.headers?.['X-Parent-Session'], 'reg-managed', 'the managed header is sent as today');
 });
 
+// ── J3: a PI_SESSION_ID parent rides BOTH channels (dual send) ──────────────
+
+test('a managed parent also declared natively with the SAME id is sent on both channels', async () => {
+  // A bare Pi CLI parent's PI_SESSION_ID is not resolvable by the server as a
+  // managed session, so the same id also rides in the create body as the
+  // declared native parent. When the header DOES resolve, the server keeps its
+  // precedence (Pi Web UI linkChildFromRequest), so a managed Pi parent is
+  // unchanged.
+  const { transport, calls, warnings } = fakeTransport({ nativeCapability: true, declaredChildren: 'unset' });
+  const client = nativeClient(transport, warnings, { parentSessionId: 'pi-session-abc', nativeParentSessionId: 'pi-session-abc' });
+  await client.spawn({ runtime: 'pi', cwd: '/tmp/w' });
+  const create = calls.find((call) => call.method === 'POST' && call.path === '/api/v1/sessions');
+  assert.equal(create?.options.headers?.['X-Parent-Session'], 'pi-session-abc', 'the managed header is still sent');
+  assert.equal(create?.options.body?.parentSessionId, 'pi-session-abc');
+  assert.equal(create?.options.body?.parentKind, 'native');
+  assert.deepEqual(warnings, [], 'a linked child raises no warning');
+});
+
 // ── criterion 4: the route cap may count declared children by the native parent ──
 
 test('the route gate counts declared children by the native parent (no identity, no owner)', async () => {
@@ -303,13 +322,19 @@ test('CLI: spawn passes CLAUDE_CODE_SESSION_ID as the native parent when no mana
 });
 
 test('CLI: a managed parent identity wins over CLAUDE_CODE_SESSION_ID', async () => {
+  // The managed chain (PI_SESSION_ID here) names the parent; the caller's
+  // CLAUDE_CODE_SESSION_ID is not used at all. J3 adds one thing: the
+  // PI_SESSION_ID id ALSO rides as the declared native parent (dual send), so
+  // an id the server cannot resolve as a managed session (a bare Pi CLI parent)
+  // still links. The managed header is unchanged.
   const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
   await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'], fakeDeps((config) => {
     seen.push(config);
     return { spawn: async () => ({ sessionId: 's1', raw: {} }) } as never;
   }, { PI_SESSION_ID: 'pi-managed', CLAUDE_CODE_SESSION_ID: SYNTHETIC_NATIVE_UUID }));
   assert.equal(seen[0]?.parentSessionId, 'pi-managed');
-  assert.equal(seen[0]?.nativeParentSessionId, undefined, 'the managed chain stays X-Parent-Session');
+  assert.notEqual(seen[0]?.nativeParentSessionId, SYNTHETIC_NATIVE_UUID, 'the Claude id is not the parent');
+  assert.equal(seen[0]?.nativeParentSessionId, 'pi-managed', 'J3: the PI_SESSION_ID parent also rides natively');
 });
 
 test('CLI: a --parent-session equal to CLAUDE_CODE_SESSION_ID is a native parent, not X-Parent-Session (w11-orch)', async () => {
@@ -427,4 +452,207 @@ test('a malformed library nativeParentId is skipped with one warning (builder ne
   const create = calls.find((call) => call.method === 'POST' && call.path === '/api/v1/sessions');
   assert.equal(create?.options.body?.parentKind, undefined);
   assert.equal(warnings.filter((line) => line.includes('NATIVE_PARENT_SKIPPED')).length, 1);
+});
+
+// ── J3 (native-parent-linkage): the self-session resolver fallback ───────────
+//
+// Devin, the Antigravity CLI, the Command Code CLI and a bare `pi` CLI name
+// their session in no environment variable pi-orch knows, so a child of one was
+// linked to nobody. With no identity at all, pi-orch now asks the Agent OS board
+// who its own session is (`agent-os board self --json`) and declares that
+// session's bare ref as the native parent. The resolver is a deps seam, so no
+// test spawns a process and none reads the live board.
+
+// An invented board ref (never a real one from this host).
+const SYNTHETIC_SELF_REF = 'example-board-ref';
+
+type SelfSeam = NonNullable<CliDeps['selfSession']>;
+
+/** A resolver seam that records its calls and answers with a fixed outcome. */
+function selfSeam(outcome: { sessionRef?: string; note?: string } = { sessionRef: SYNTHETIC_SELF_REF }): { calls: number; selfSession: SelfSeam } {
+  const state = { calls: 0 };
+  return {
+    get calls() {
+      return state.calls;
+    },
+    selfSession: () => {
+      state.calls += 1;
+      return outcome;
+    },
+  };
+}
+
+function depsWith(
+  client: NonNullable<CliDeps['client']>,
+  env: Record<string, string>,
+  selfSession: SelfSeam | undefined,
+  stderr?: (line: string) => void,
+): CliDeps {
+  return {
+    env,
+    stdout: () => undefined,
+    stderr: stderr ?? (() => undefined),
+    randomId: () => 'test-key-123',
+    client,
+    ...(selfSession !== undefined ? { selfSession } : {}),
+  };
+}
+
+function spawnOnly(seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }>): NonNullable<CliDeps['client']> {
+  return (config) => {
+    seen.push(config);
+    return { spawn: async () => ({ sessionId: 's1', raw: {} }) } as never;
+  };
+}
+
+test('J3 CLI: with no identity at all the resolver names the declared native parent', async () => {
+  const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  const seam = selfSeam();
+  const result = await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'], depsWith(spawnOnly(seen), {}, seam.selfSession));
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(seen[0]?.nativeParentSessionId, SYNTHETIC_SELF_REF);
+  assert.equal(seen[0]?.parentSessionId, undefined, 'the resolver result is native, never the managed header');
+  assert.equal(seam.calls, 1);
+});
+
+test('J3 CLI: the resolved native parent reaches the create BODY as parentSessionId + parentKind native', async () => {
+  // Not just the config: run the CLI through the REAL client against a fake
+  // transport and inspect the create body the server would receive.
+  const { transport, calls, warnings } = fakeTransport({ nativeCapability: true, declaredChildren: 'unset' });
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'],
+    depsWith((config) => nativeClient(transport, warnings, config) as never, {}, selfSeam().selfSession),
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  const create = calls.find((call) => call.method === 'POST' && call.path === '/api/v1/sessions');
+  assert.ok(create, 'one create POST');
+  assert.equal(create?.options.body?.parentSessionId, SYNTHETIC_SELF_REF);
+  assert.equal(create?.options.body?.parentKind, 'native');
+  assert.equal(create?.options.headers?.['X-Parent-Session'], undefined, 'a resolved native parent never becomes the header');
+});
+
+test('J3 CLI: the resolver never runs when any identity is already known', async () => {
+  const cases: Array<{ name: string; argv: string[]; env: Record<string, string> }> = [
+    { name: '--parent-session', argv: ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w', '--parent-session', 'api-managed-1'], env: {} },
+    { name: 'PI_ORCH_PARENT_SESSION', argv: ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'], env: { PI_ORCH_PARENT_SESSION: 'api-managed-2' } },
+    { name: 'PI_WEB_UI_SESSION_ID', argv: ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'], env: { PI_WEB_UI_SESSION_ID: 'pi-web-1' } },
+    { name: 'PI_SESSION_ID', argv: ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'], env: { PI_SESSION_ID: 'pi-bare-1' } },
+    { name: 'CLAUDE_CODE_SESSION_ID', argv: ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'], env: { CLAUDE_CODE_SESSION_ID: SYNTHETIC_NATIVE_UUID } },
+  ];
+  for (const { name, argv, env } of cases) {
+    const seam = selfSeam();
+    const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+    await runCli(argv, depsWith(spawnOnly(seen), env, seam.selfSession));
+    assert.equal(seam.calls, 0, `the resolver must not run: ${name}`);
+    assert.notEqual(seen[0]?.nativeParentSessionId, SYNTHETIC_SELF_REF, name);
+  }
+});
+
+test('J3 CLI: --no-native-parent disables the resolver too', async () => {
+  const seam = selfSeam();
+  const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w', '--no-native-parent'], depsWith(spawnOnly(seen), { PI_SESSION_ID: 'pi-bare-1' }, seam.selfSession));
+  assert.equal(seam.calls, 0);
+  assert.equal(seen[0]?.nativeParentSessionId, undefined, 'no native id, even though PI_SESSION_ID is set');
+  assert.equal(seen[0]?.parentSessionId, 'pi-bare-1', 'the managed header stays');
+});
+
+test('J3 CLI: an unresolved resolver is one short stderr note and the spawn still proceeds', async () => {
+  const notes: string[] = [];
+  const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'],
+    depsWith(spawnOnly(seen), {}, selfSeam({ note: 'pi-orch: SELF_RESOLVER_UNRESOLVED — synthetic note' }).selfSession, (line) => notes.push(line)),
+  );
+  assert.equal(result.exitCode, 0, 'an unresolved resolver never fails the spawn');
+  assert.equal(seen[0]?.nativeParentSessionId, undefined);
+  assert.deepEqual(notes, ['pi-orch: SELF_RESOLVER_UNRESOLVED — synthetic note'], 'exactly one note, once');
+});
+
+test('J3 CLI: a PI_SESSION_ID parent also rides as the declared native parent (dual send)', async () => {
+  const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  const seam = selfSeam();
+  await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'], depsWith(spawnOnly(seen), { PI_SESSION_ID: 'pi-bare-1' }, seam.selfSession));
+  assert.equal(seen[0]?.parentSessionId, 'pi-bare-1', 'the managed header is unchanged');
+  assert.equal(seen[0]?.nativeParentSessionId, 'pi-bare-1', 'and the same id is declared natively, so an unresolvable id still links');
+  assert.equal(seam.calls, 0);
+});
+
+test('J3 CLI: the dual send reaches the create body AND the header (server keeps header precedence)', async () => {
+  const { transport, calls, warnings } = fakeTransport({ nativeCapability: true, declaredChildren: 'unset' });
+  const result = await runCli(
+    ['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'],
+    depsWith((config) => nativeClient(transport, warnings, config) as never, { PI_SESSION_ID: 'pi-bare-1' }, undefined),
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  const create = calls.find((call) => call.method === 'POST' && call.path === '/api/v1/sessions');
+  assert.equal(create?.options.headers?.['X-Parent-Session'], 'pi-bare-1');
+  assert.equal(create?.options.body?.parentSessionId, 'pi-bare-1');
+  assert.equal(create?.options.body?.parentKind, 'native');
+});
+
+test('J3 CLI: an explicit sibling of PI_SESSION_ID does not dual-send (PI_WEB_UI_SESSION_ID stays header-only)', async () => {
+  const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w'], depsWith(spawnOnly(seen), { PI_WEB_UI_SESSION_ID: 'pi-web-1', PI_SESSION_ID: 'pi-bare-1' }, undefined));
+  assert.equal(seen[0]?.parentSessionId, 'pi-web-1');
+  assert.equal(seen[0]?.nativeParentSessionId, undefined, 'only a PI_SESSION_ID parent rides both channels');
+});
+
+test('J3 CLI: spawn and `lane run` share ONE parent resolution (there is no batch verb)', async () => {
+  // pi-orch has no `batch` verb — `lane run` is the batch path (it spawns an
+  // implementer and a reviewer per lane). Both paths must resolve the parent
+  // through the same function, so a lane child is linked exactly like a spawn.
+  assert.equal(allowedFlagsFor('batch'), undefined, 'documented: pi-orch has no batch verb');
+  const batchLike = await runCli(['batch', 'x'], depsWith(spawnOnly([]), {}, undefined));
+  assert.equal(batchLike.exitCode, 2, 'an unknown verb is a usage error, never a silent no-op');
+
+  const spawnSeen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w', '--parent-session', 'parent-session-1'], depsWith(spawnOnly(spawnSeen), {}, undefined));
+
+  const { dir } = makeLaneDir();
+  const world = new FakeWorld(dir);
+  const laneSeen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  const lane = await runCli(['lane', 'run', dir, '--json'], depsWith((config) => {
+    laneSeen.push(config);
+    return world.client() as never;
+  }, {}, undefined));
+  assert.equal(lane.exitCode, 0, lane.stderr);
+  assert.deepEqual(laneSeen[0], spawnSeen[0], 'the lane factory config is the same resolution as the spawn factory config');
+});
+
+test('J3 CLI: a declared parent id that IS this process\'s PI_SESSION_ID also rides natively', async () => {
+  // The lane path can only ever carry an EXPLICIT parent (lane.json's
+  // parentSessionId is required), so on `lane run` behaviour 3 would otherwise
+  // never apply: a bare Pi CLI parent's lane children would orphan even though
+  // its own PI_SESSION_ID is known. The same id, same rule.
+  const seen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  await runCli(['spawn', '--runtime', 'pi', '--cwd', '/tmp/w', '--parent-session', 'pi-bare-1'], depsWith(spawnOnly(seen), { PI_SESSION_ID: 'pi-bare-1' }, undefined));
+  assert.equal(seen[0]?.parentSessionId, 'pi-bare-1');
+  assert.equal(seen[0]?.nativeParentSessionId, 'pi-bare-1');
+});
+
+test('J3 CLI: `lane run` declares a Claude Code lane parent natively (the one resolution, shared)', async () => {
+  const { dir } = makeLaneDir({ laneOverrides: { parentSessionId: SYNTHETIC_NATIVE_UUID } });
+  const world = new FakeWorld(dir);
+  const laneSeen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  const result = await runCli(['lane', 'run', dir, '--json'], depsWith((config) => {
+    laneSeen.push(config);
+    return world.client() as never;
+  }, { CLAUDE_CODE_SESSION_ID: SYNTHETIC_NATIVE_UUID }, undefined));
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(laneSeen[0]?.parentSessionId, undefined, 'a native lane parent is not a header');
+  assert.equal(laneSeen[0]?.nativeParentSessionId, SYNTHETIC_NATIVE_UUID);
+});
+
+test('J3 CLI: `lane run` dual-sends a lane parent that is the caller\'s PI_SESSION_ID', async () => {
+  const { dir } = makeLaneDir({ laneOverrides: { parentSessionId: 'pi-bare-1' } });
+  const world = new FakeWorld(dir);
+  const laneSeen: Array<{ parentSessionId?: string; nativeParentSessionId?: string }> = [];
+  const result = await runCli(['lane', 'run', dir, '--json'], depsWith((config) => {
+    laneSeen.push(config);
+    return world.client() as never;
+  }, { PI_SESSION_ID: 'pi-bare-1' }, undefined));
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(laneSeen[0]?.parentSessionId, 'pi-bare-1');
+  assert.equal(laneSeen[0]?.nativeParentSessionId, 'pi-bare-1');
 });

@@ -26,6 +26,7 @@ src/credentials.ts          credential-path guard (never read a token from this 
 src/wait.ts                 watch-based wait, multi-child wait, settlement
 src/verify.ts               read-only re-check of a child's completion claims
 src/lane-runner.ts          `lane run`: replayable per-lane loop (spawn → watch → dispatch → wait → gates → review), exits at judgement events
+src/self-session.ts         self-session resolver: which board session is this process? (native parent)
 src/completion.ts           completion-block parsing (pi-completion/v1)
 src/completion-template.ts  the one dispatch-template constant (byte-pinned)
 src/exit-codes.ts           the single source for exit codes (README mirrors it)
@@ -86,6 +87,30 @@ then `$PI_WEB_UI_REPO/docs/contract/...` (loud error when set without a
 snapshot), then `~/pi-web-ui/docs/contract/...`, then the bundled `contract/`
 copy. At runtime a `contractVersion` mismatch against live `/capabilities`
 surfaces `SNAPSHOT_STALE` on stderr and in `--json`; it never blocks a command.
+
+## Parent linkage (managed, native, self-session)
+
+`src/cli.ts` decides a child's parent in ONE place — `parentLink` — used by the
+spawn path and `lane run` (there is no `batch` verb; the lane runner is the
+batch path). Order: `--parent-session` / `PI_ORCH_PARENT_SESSION` →
+`PI_WEB_UI_SESSION_ID` → `PI_SESSION_ID` → `CLAUDE_CODE_SESSION_ID` (declared
+native: create-body `parentSessionId` + `parentKind: "native"`, contract 1.63.0,
+w11-orch) → `resolveUnlinkedParent`. A `PI_SESSION_ID` parent — or a declared
+id equal to it, the shape a bare-CLI `lane run` always has — rides BOTH
+channels: its `X-Parent-Session` header plus the same id declared natively.
+`src/client.ts` sends the body native id when the managed and native ids agree
+(still capability-gated), so a bare Pi CLI parent links while a managed Pi
+parent keeps header precedence server-side. `--no-native-parent` disables every
+native declaration.
+
+`src/self-session.ts` asks `agent-os board self --json` (argv, no shell, 3000 ms
+hard timeout; program replaceable with `PI_ORCH_SELF_RESOLVER`, `off` disables)
+which board session is this process, and accepts the bare `sessionRef` only when
+it matches Pi Web UI's native-id pattern. Any failure is at most one short
+stderr note and no native parent — never a failed spawn — and the resolver is
+never consulted once an identity is known. It is injected as
+`CliDeps.selfSession` and wired in `makeCliDeps`, so no test spawns a process:
+prove the wiring by asking it with `PI_ORCH_SELF_RESOLVER=off`.
 
 ## Exit-code rules
 

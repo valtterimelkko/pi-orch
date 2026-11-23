@@ -31,6 +31,7 @@ import { resolveRouteLimits, profileCapacityRefusalLine, type RouteLimitProfile 
 import { defaultSocketPath, defaultTokenPath, loadSnapshot, liveContractVersion } from './snapshot.ts';
 import { readToken } from './transport.ts';
 import { loadLane, runLane, LaneConfigError, type LaneClient } from './lane-runner.ts';
+import { resolveSelfSession, runSelfResolverProcess } from './self-session.ts';
 
 export interface ClientLike {
   goalPause(sessionId: string, input: { reason?: string }): Promise<Record<string, unknown>>;
@@ -63,6 +64,14 @@ export interface CliDeps {
   stderr(line: string): void;
   randomId(): string;
   client(config: { parentSessionId?: string; nativeParentSessionId?: string }): ClientLike;
+  /**
+   * J3 (native-parent-linkage): the self-session resolver seam — who is THIS
+   * process's own agent session? Production injects
+   * `resolveSelfSession({ env, run: runSelfResolverProcess })` (see
+   * `makeCliDeps`). When it is absent the resolver is simply not consulted, so
+   * a test or an embedder can never spawn a process by accident.
+   */
+  selfSession?(options: { env: Record<string, string | undefined> }): { sessionRef?: string; note?: string };
 }
 
 export interface CliResult {
@@ -270,14 +279,27 @@ sessionId; prompt: prints the runId; watch register/list: prints the watchId)
 for $(...) capture. never parse the human-readable output (its wording can change at any time).
 
 Common flags: --socket P --token-path P --api-base URL --parent-session ID --json
-  --no-native-parent (never send CLAUDE_CODE_SESSION_ID as a declared native
-  parent; on a 1.63.0+ server a spawn with no managed parent identity sends
-  the body fields parentSessionId + parentKind "native" so the child is
-  linked in every lineage surface)
+  --no-native-parent (never send a declared native parent: not
+  CLAUDE_CODE_SESSION_ID, not the PI_SESSION_ID dual send, and not the
+  self-session resolver; on a 1.63.0+ server a spawn with no managed parent
+  identity sends the body fields parentSessionId + parentKind "native" so the
+  child is linked in every lineage surface)
   --parent-session ID: a managed parent id (sent as X-Parent-Session). An id
   equal to this process's own CLAUDE_CODE_SESSION_ID is a Claude Code session,
   not a managed Internal API session, so it is sent as the declared native
   parent instead (the header would orphan the child into "mine").
+  Parenting order: --parent-session / PI_ORCH_PARENT_SESSION →
+  PI_WEB_UI_SESSION_ID → PI_SESSION_ID (managed, AND declared native, so a bare
+  Pi CLI parent still links when the server cannot resolve the id) →
+  CLAUDE_CODE_SESSION_ID (declared native) → the self-session resolver (below).
+  Self-session resolver: with no identity at all, pi-orch runs
+  'agent-os board self --json' (argv, no shell, 3000 ms hard timeout) to learn
+  this process's own board session and declares that ref as the native parent,
+  so children of Devin, the Antigravity CLI, the Command Code CLI and a bare
+  'pi' CLI are linked too. PI_ORCH_SELF_RESOLVER names another program to run
+  instead, or 'off' disables it. Any failure (missing binary, non-zero exit,
+  timeout, junk output, no session, an unusable ref) means no native parent,
+  with at most one short stderr note — never a failed spawn.
   --snapshot P (compare the live /capabilities against this snapshot copy)
 
 Spawn flags: --model-selector SEL | --model-match SUB, --thinking LEVEL,
@@ -390,6 +412,99 @@ export function allowedFlagsFor(verb: string): Set<string> | undefined {
   return new Set([...COMMON_FLAGS, ...verbFlags]);
 }
 
+// ─── J3 native-parent-linkage: one parent resolution ─────────────────────────
+
+/** How a child's parent will be named, before any request is made. */
+export interface ParentLink {
+  /** The managed parent id, sent as X-Parent-Session (the server resolves it). */
+  parentSessionId?: string;
+  /** The declared native parent id, sent as create-body parentSessionId + parentKind "native". */
+  nativeParentSessionId?: string;
+  /** No identity is known and native declaration is allowed: the self-session resolver may name one. */
+  mayResolveSelf: boolean;
+}
+
+/**
+ * The ONE parent resolution, shared by the spawn path and `lane run` (and so by
+ * every batch-shaped flow pi-orch has). Precedence:
+ * `declared` (a --parent-session / PI_ORCH_PARENT_SESSION value, or the lane's
+ * own parentSessionId) → PI_WEB_UI_SESSION_ID → PI_SESSION_ID (managed) →
+ * CLAUDE_CODE_SESSION_ID (declared native) → the self-session resolver.
+ */
+export function parentLink(options: { env: Record<string, string | undefined>; declared?: string; noNative: boolean }): ParentLink {
+  const { env, declared, noNative } = options;
+  const claudeNativeId = env.CLAUDE_CODE_SESSION_ID;
+  /** Is `id` this process's own PI_SESSION_ID, so it should ride both channels? */
+  const piSessionDualSend = (id: string | undefined): boolean =>
+    !noNative && id !== undefined && env.PI_WEB_UI_SESSION_ID === undefined && env.PI_SESSION_ID !== undefined && id === env.PI_SESSION_ID;
+  // w11-orch: an explicit parent equal to the caller's own native
+  // CLAUDE_CODE_SESSION_ID is a Claude Code session, NOT a managed Internal API
+  // session. The server cannot resolve it via X-Parent-Session (the child would
+  // be orphaned into the owner's "mine" list), so it rides as the declared
+  // native parent instead.
+  if (declared !== undefined) {
+    if (!noNative && claudeNativeId !== undefined && declared === claudeNativeId) {
+      return { nativeParentSessionId: declared, mayResolveSelf: false };
+    }
+    // The same rule for the OTHER identity source: a declared id that IS this
+    // process's own PI_SESSION_ID rides both channels. `lane run` can only ever
+    // carry an explicit parent (lane.json requires one), so without this a bare
+    // Pi CLI parent's lane children would orphan even though its id is known.
+    return {
+      parentSessionId: declared,
+      ...(piSessionDualSend(declared) ? { nativeParentSessionId: declared } : {}),
+      mayResolveSelf: false,
+    };
+  }
+  const managed = env.PI_WEB_UI_SESSION_ID ?? env.PI_SESSION_ID;
+  if (managed !== undefined) {
+    // Behaviour 3 (J3): a PI_SESSION_ID parent also rides as the declared native
+    // parent, so a child still links when the server cannot resolve that id as a
+    // managed session (a bare Pi CLI parent). The server keeps header precedence
+    // when the header DOES resolve (Pi Web UI linkChildFromRequest), so a managed
+    // Pi parent is unchanged.
+    return {
+      parentSessionId: managed,
+      ...(piSessionDualSend(managed) ? { nativeParentSessionId: managed } : {}),
+      mayResolveSelf: false,
+    };
+  }
+  // Step 1i.2 C (contract 1.63.0): with NO managed identity, the caller's
+  // native session id rides as the declared parent; --no-native-parent opts out.
+  if (!noNative && claudeNativeId !== undefined) {
+    return { nativeParentSessionId: claudeNativeId, mayResolveSelf: false };
+  }
+  return { mayResolveSelf: !noNative };
+}
+
+/**
+ * Behaviour 2 (J3): with nothing known, ask the self-session resolver once.
+ * A resolution only ever ADDS a declared native parent; an unresolved one is at
+ * most one short note and never a failed spawn.
+ */
+export function resolveUnlinkedParent(
+  link: ParentLink,
+  options: {
+    env: Record<string, string | undefined>;
+    selfSession?: (input: { env: Record<string, string | undefined> }) => { sessionRef?: string; note?: string };
+    stderr(line: string): void;
+  },
+): ParentLink {
+  if (!link.mayResolveSelf || options.selfSession === undefined) return { ...link, mayResolveSelf: false };
+  const resolution = options.selfSession({ env: options.env });
+  if (resolution.note !== undefined && resolution.note !== '') options.stderr(resolution.note);
+  if (resolution.sessionRef === undefined || resolution.sessionRef === '') return { ...link, mayResolveSelf: false };
+  return { nativeParentSessionId: resolution.sessionRef, mayResolveSelf: false };
+}
+
+/** The client factory config for one resolution (only the fields that exist). */
+function clientConfig(link: ParentLink): { parentSessionId?: string; nativeParentSessionId?: string } {
+  return {
+    ...(link.parentSessionId !== undefined ? { parentSessionId: link.parentSessionId } : {}),
+    ...(link.nativeParentSessionId !== undefined ? { nativeParentSessionId: link.nativeParentSessionId } : {}),
+  };
+}
+
 export async function runCli(argv: string[], deps: CliDeps): Promise<CliResult> {
   try {
     const result = await dispatch(argv, deps);
@@ -480,39 +595,37 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
     routeLimitOverrides(args.repeatable.get('route-limit') ?? []);
   }
 
-  const declaredParent = flagString(args, 'parent-session') ?? deps.env.PI_ORCH_PARENT_SESSION;
+  // ── J3 (native-parent-linkage): ONE parent resolution ─────────────────────
+  // The spawn path and `lane run` both resolve through `parentLink`, so a lane
+  // child is linked exactly like a spawned child. Order (unchanged where it
+  // existed): --parent-session / PI_ORCH_PARENT_SESSION → PI_WEB_UI_SESSION_ID
+  // → PI_SESSION_ID (managed) → CLAUDE_CODE_SESSION_ID (declared native) → NEW
+  // the self-session resolver (declared native). --no-native-parent disables
+  // every native declaration, including the resolver.
   const noNative = args.flags.has('no-native-parent');
-  // w11-orch: a --parent-session / PI_ORCH_PARENT_SESSION id equal to the
-  // caller's own native CLAUDE_CODE_SESSION_ID is a Claude Code session, NOT a
-  // managed Internal API session. The server cannot resolve it via
-  // X-Parent-Session (it records NO parent, so the child is orphaned into the
-  // owner's "mine" list), so it must ride in the create body as the declared
-  // native parent instead. Any other value — a real Internal API id, or a
-  // --parent-session that is not this process's native id — stays managed.
-  const nativeDeclared =
-    declaredParent !== undefined && !noNative && declaredParent === deps.env.CLAUDE_CODE_SESSION_ID
-      ? declaredParent
-      : undefined;
-  const parentSessionId =
-    nativeDeclared !== undefined
-      ? undefined
-      : (declaredParent ?? deps.env.PI_WEB_UI_SESSION_ID ?? deps.env.PI_SESSION_ID);
-  // Step 1i.2 C (contract 1.63.0): with NO managed identity, the caller's
-  // native session id rides in the create body as a declared parent (shown in
-  // every lineage surface on a 1.63.0 server; nothing is sent to an older
-  // one). --no-native-parent opts out. Validation lives in the client
-  // (bad value → one warning, spawn proceeds).
-  const nativeParentSessionId =
-    nativeDeclared ?? (
-      parentSessionId === undefined && !noNative
-        ? deps.env.CLAUDE_CODE_SESSION_ID
-        : undefined
-    );
+  const declaredParent = flagString(args, 'parent-session') ?? deps.env.PI_ORCH_PARENT_SESSION;
+  const link = parentLink({
+    env: deps.env,
+    ...(declaredParent !== undefined ? { declared: declaredParent } : {}),
+    noNative,
+  });
+  // The resolver runs at most once per invocation, only on a create path, and
+  // only when nothing above named a parent.
+  let resolvedLink: ParentLink | undefined;
+  const createLink = (): ParentLink => (resolvedLink ??= resolveUnlinkedParent(link, {
+    env: deps.env,
+    ...(deps.selfSession !== undefined ? { selfSession: deps.selfSession } : {}),
+    stderr: deps.stderr,
+  }));
 
   // Lazy: flags must be validated (cheap usage errors) before the client
   // factory runs (which reads tokens and can fail with transport errors).
   let cachedClient: ClientLike | undefined;
-  const getClient = (): ClientLike => (cachedClient ??= deps.client({ parentSessionId, nativeParentSessionId }));
+  const getClient = (): ClientLike => (cachedClient ??= deps.client(clientConfig(link)));
+  // The create path resolves the self-session fallback before building the
+  // client, so its one resolution is the one that reaches the create body.
+  let cachedCreateClient: ClientLike | undefined;
+  const getCreateClient = (): ClientLike => (cachedCreateClient ??= deps.client(clientConfig(createLink())));
 
   switch (args.verb) {
     case 'template': {
@@ -546,23 +659,16 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       };
       if (laneOptions.dryRun) return runLane(laneOptions, { client: {} as LaneClient });
       const laneManaged = flagString(args, 'parent-session') ?? lane.config.parentSessionId;
-      // w11-orch: a lane parent equal to this process's native CLAUDE_CODE_SESSION_ID
-      // is a Claude Code session, not a managed Internal API session — route it
-      // to the declared native parent (see the spawn verb above) so the lane's
-      // children are not orphaned into the owner's "mine" list.
-      const laneNoNative = args.flags.has('no-native-parent');
-      const laneNativeDeclared =
-        laneManaged !== undefined && !laneNoNative && laneManaged === deps.env.CLAUDE_CODE_SESSION_ID
-          ? laneManaged
-          : undefined;
-      const laneClient = deps.client({
-        ...(laneNativeDeclared === undefined ? { parentSessionId: laneManaged } : {}),
-        ...(laneNativeDeclared !== undefined
-          ? { nativeParentSessionId: laneNativeDeclared }
-          : (laneManaged === undefined && !laneNoNative && deps.env.CLAUDE_CODE_SESSION_ID !== undefined
-            ? { nativeParentSessionId: deps.env.CLAUDE_CODE_SESSION_ID }
-            : {})),
+      // J3: the lane path resolves through the same function as spawn. A lane
+      // parent equal to this process's native CLAUDE_CODE_SESSION_ID is a Claude
+      // Code session, not a managed Internal API session (w11-orch), so it is
+      // declared natively so the lane's children are not orphaned into "mine".
+      const laneLink = resolveUnlinkedParent(parentLink({ env: deps.env, declared: laneManaged, noNative }), {
+        env: deps.env,
+        ...(deps.selfSession !== undefined ? { selfSession: deps.selfSession } : {}),
+        stderr: deps.stderr,
       });
+      const laneClient = deps.client(clientConfig(laneLink));
       return runLane(laneOptions, { client: laneClient as unknown as LaneClient });
     }
     case 'capabilities': {
@@ -616,7 +722,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<CliResult> {
       const waitForSlotMs = args.flags.has('wait-for-slot') ? waitForSlotSeconds(args) : undefined;
       // W2h (W2-f): the quarantined-admission wait budget, validated before any request.
       const waitAdmissionMs = args.flags.has('wait-admission') ? waitAdmissionSeconds(args) : undefined;
-      const body = await getClient().spawn({
+      const body = await getCreateClient().spawn({
         runtime,
         cwd,
         modelSelector: flagString(args, 'model-selector'),
@@ -1246,15 +1352,28 @@ export function makeClientFactory(argv: string[]): (config: { parentSessionId?: 
   };
 }
 
-export async function main(processObject: NodeJS.Process): Promise<void> {
-  const argv = processObject.argv.slice(2);
-  const deps: CliDeps = {
+/**
+ * The production deps for one invocation. Exported so a test can inspect the
+ * wiring without running it (the resolver is only enterable through
+ * `deps.selfSession`, so a fake there means no test ever spawns a process).
+ */
+export function makeCliDeps(processObject: NodeJS.Process): CliDeps {
+  return {
     env: processObject.env,
     stdout: (line) => processObject.stdout.write(`${line}\n`),
     stderr: (line) => processObject.stderr.write(`${line}\n`),
     randomId: () => `piorch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
-    client: makeClientFactory(argv),
+    client: makeClientFactory(processObject.argv.slice(2)),
+    // J3: the real self-session resolver (`agent-os board self --json`, argv, no
+    // shell, 3000 ms hard timeout). Its runner is a pure seam, so the parsing
+    // and failure rules are tested without spawning anything.
+    selfSession: (options) => resolveSelfSession({ env: options.env, run: runSelfResolverProcess }),
   };
+}
+
+export async function main(processObject: NodeJS.Process): Promise<void> {
+  const argv = processObject.argv.slice(2);
+  const deps: CliDeps = makeCliDeps(processObject);
   const startedAt = Date.now();
   const result = await runCli(argv, deps);
   // W2-e: one audit record per invocation; best-effort, never fails the command.

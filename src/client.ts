@@ -56,10 +56,13 @@ export interface ClientConfig {
    * Step 1i.2 C (contract 1.63.0): the caller's NATIVE session id (e.g. a
    * Claude Code session uuid), sent as create-body `parentSessionId` +
    * `parentKind: "native"` on every spawn WHEN the server advertises
-   * `features.nativeParentLinkage`. Never sent as X-Parent-Session, never
-   * sent when a managed `parentSessionId` exists, and skipped (one warning)
-   * when the value is not a bare native id. On an older server nothing
-   * changes: the create schema is strict, so no new field is sent.
+   * `features.nativeParentLinkage`. Never sent as X-Parent-Session, and
+   * skipped (one warning) when the value is not a bare native id. With a
+   * DIFFERENT managed `parentSessionId` the managed parent wins and nothing is
+   * sent; when the two ids are the same (J3: a PI_SESSION_ID parent riding both
+   * channels) both are sent and the server keeps header precedence. On an
+   * older server nothing changes: the create schema is strict, so no new field
+   * is sent.
    */
   nativeParentSessionId?: string;
   /** Default idempotency-key factory; injectable for tests. */
@@ -641,8 +644,18 @@ export class PiOrchClient {
     // wins, mirroring the server's header precedence) and the server
     // advertises the capability — a CALLER-PASSED nativeParentId goes through
     // the same gate (and never reaches the builder ungated).
+    //
+    // J3 (native-parent-linkage): one exception — when the native id IS the
+    // managed id (a PI_SESSION_ID parent riding both channels), both are sent:
+    // body `parentSessionId` + `parentKind: "native"` alongside the
+    // `X-Parent-Session` header. The server resolves the header first and keeps
+    // it when it resolves (Pi Web UI `linkChildFromRequest`), so a managed Pi
+    // parent is unchanged, while an id the server cannot resolve as a managed
+    // session (a bare Pi CLI parent) is still persisted as `declared`.
     const { nativeParentId: requestedNativeParentId, ...restInput } = input;
-    const nativeParentId = this.parentSessionId !== undefined ? undefined : await this.usableNativeParentId(requestedNativeParentId);
+    const managedAndNativeAgree =
+      this.parentSessionId === undefined || this.nativeParentSessionId === this.parentSessionId;
+    const nativeParentId = managedAndNativeAgree ? await this.usableNativeParentId(requestedNativeParentId) : undefined;
     const body = buildCreateBody({ ...restInput, modelSelector, ...(nativeParentId !== undefined ? { nativeParentId } : {}) });
     // G1 correction 01 (accepted finding): caps apply only to spawns that
     // name --model-selector. Say so once per client when caps are configured
