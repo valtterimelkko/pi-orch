@@ -112,6 +112,17 @@ const RECOVERY_ATTEMPTS = 10;
 const RECOVERY_BACKOFF_MS = 1_000;
 
 /**
+ * The run-less re-check bound: `agent_end` can arrive BEFORE the run receipt
+ * becomes terminal (Pi Web UI's Devin service emits the closing event, then
+ * persists the turn, then finishes the receipt; the contract promises no
+ * ordering between them). The receipt is the truth, so a run-less wait whose
+ * latest run still reads non-terminal re-reads the evidence at this short
+ * interval — as a bounded long-poll slice, never a sleep loop — because the
+ * once-only agent_end condition will never fire again.
+ */
+const RUNLESS_RECHECK_MS = 3_000;
+
+/**
  * Correction 01 item 2: before any watch is registered, wait knows whether its
  * target exists and whether the run already ended. An unknown/malformed run id
  * or a nonexistent session returns IMMEDIATELY with a distinct outcome (exit
@@ -242,6 +253,11 @@ async function waitLoop(options: WaitOptions, seenAutoContinues?: Set<string | n
   let cursor: string | undefined = undefined; // fresh ledger view on first registration
   let recoveryAttempts = 0;
   let receiptChecks = 0;
+  // Set when a run-less agent_end found a latest run that is not terminal yet:
+  // each subsequent long poll is bounded to the short re-check interval so the
+  // receipt's terminal classification is read promptly (never only at the
+  // deadline, because the once-only agent_end condition will not fire again).
+  const runlessPending: { shortenPollMs?: number } = {};
 
   while (true) {
     const elapsed = deps.now() - start;
@@ -252,7 +268,8 @@ async function waitLoop(options: WaitOptions, seenAutoContinues?: Set<string | n
 
     let result: { kind: 'fired'; body: unknown } | { kind: 'timeout' };
     try {
-      result = await deps.longPoll({ ids: [watchId], cursor, timeoutMs: Math.min(sliceMs, remaining) });
+      const slice = Math.min(sliceMs, remaining);
+      result = await deps.longPoll({ ids: [watchId], cursor, timeoutMs: Math.max(1, Math.min(slice, runlessPending.shortenPollMs ?? slice)) });
     } catch {
       // Transport break or watch loss. Reconnect with bounded retries; on a
       // 404-shaped loss, re-register with fireIfSettled and reset the cursor.
@@ -278,7 +295,7 @@ async function waitLoop(options: WaitOptions, seenAutoContinues?: Set<string | n
       const outcome = await outcomeFromFirings(parsed.watches.flatMap((watch_) => watch_.firings), options, deps, conditionsById, () => {
         receiptChecks += 1;
         return receiptChecks;
-      }, seenAutoContinues, progress);
+      }, seenAutoContinues, progress, runlessPending);
       if (outcome) return outcome;
       continue;
     }
@@ -509,6 +526,7 @@ async function outcomeFromFirings(
   countReceiptCheck: () => void,
   seenAutoContinues?: Set<string | number>,
   progress?: { stalled: boolean },
+  runlessPending?: { shortenPollMs?: number },
 ): Promise<WaitOutcome | null> {
   for (const firing of firings) {
     // Correction 04 item 2: classify by the condition ID we registered —
@@ -527,7 +545,8 @@ async function outcomeFromFirings(
       return goalEndOutcome(options.sessionId, firing.evidence ?? '', deps, seenAutoContinues);
     }
     if (firing.eventType === 'agent_end' || firing.eventType === 'deadline') {
-      const outcome = await reconcileReceipt(options, deps, countReceiptCheck, seenAutoContinues);
+      const evidenceState: LatestRunState = {};
+      const outcome = await reconcileReceipt(options, deps, countReceiptCheck, seenAutoContinues, evidenceState);
       if (outcome) return outcome;
       if (firing.eventType === 'deadline') return { kind: 'deadline', note: 'server-side deadline condition fired; child still not terminal' };
       // agent_end without a readable receipt (e.g. no runId and no evidence
@@ -540,6 +559,15 @@ async function outcomeFromFirings(
           const guard = await runlessGoalGuard(options.sessionId, deps, seenAutoContinues);
           if (guard === 'keep-waiting') continue;
           if (guard) return withAutoGoalNote(guard);
+          // Run-less wait defect (25 Nov 2026): agent_end is NOT success. The
+          // session has a latest run that is not terminal yet (the server emits
+          // the closing event before it persists the turn and finishes the
+          // receipt), so the wait keeps going and re-reads the evidence at a
+          // short bound until the receipt classifies it or the deadline passes.
+          if (evidenceState.hasRuns && !isTerminalRunStatus(evidenceState.latestStatus)) {
+            if (runlessPending) runlessPending.shortenPollMs = RUNLESS_RECHECK_MS;
+            continue;
+          }
         }
         return { kind: 'completed', note: 'agent_end observed; no runId provided for receipt read-back' };
       }
@@ -548,11 +576,47 @@ async function outcomeFromFirings(
   return null;
 }
 
+/**
+ * What one run-less evidence read learned about the session's latest run.
+ */
+interface LatestRunState {
+  /** True when the session's evidence held at least one run. */
+  hasRuns?: boolean;
+  /** The latest run's status, when the evidence carried one. */
+  latestStatus?: string;
+}
+
+/** The receipt's terminal statuses (the same set `isTerminalReceipt` decides). */
+function isTerminalRunStatus(status: string | undefined): boolean {
+  return status !== undefined && status !== ''
+    && isTerminalReceipt({ runId: 'evidence', sessionId: 'evidence', status });
+}
+
+/** Read the session's latest run once; a failed read teaches nothing and never throws. */
+async function readLatestRun(
+  sessionId: string,
+  deps: WaitDeps,
+  state?: LatestRunState,
+): Promise<{ runId?: string; status?: string; errorCode?: string } | undefined> {
+  try {
+    const evidence = await deps.getSessionEvidence(sessionId);
+    const last = evidence.runs[0];
+    if (state) {
+      state.hasRuns = last !== undefined;
+      state.latestStatus = last?.status;
+    }
+    return last;
+  } catch {
+    return undefined;
+  }
+}
+
 async function reconcileReceipt(
   options: WaitOptions,
   deps: WaitDeps,
   countReceiptCheck: () => void = () => undefined,
   seenAutoContinues?: Set<string | number>,
+  evidenceState?: LatestRunState,
 ): Promise<WaitOutcome | null> {
   countReceiptCheck();
   try {
@@ -568,10 +632,9 @@ async function reconcileReceipt(
       }
       return classified;
     }
-    const evidence = await deps.getSessionEvidence(options.sessionId);
-    const last = evidence.runs[0];
+    const last = await readLatestRun(options.sessionId, deps, evidenceState);
     if (!last || !last.status) return null;
-    if (['completed', 'failed', 'cancelled', 'interrupted'].includes(last.status)) {
+    if (isTerminalRunStatus(last.status)) {
       const classified = fromClassification(
         classifyReceipt({ runId: last.runId ?? 'unknown', sessionId: options.sessionId, status: last.status, errorCode: last.errorCode }),
         last.runId ? ({ runId: last.runId, sessionId: options.sessionId, status: last.status, errorCode: last.errorCode } as Receipt) : undefined,
@@ -774,6 +837,11 @@ export async function waitOnChildren(options: {
   const start = deps.now();
   let cursor: string | undefined = undefined;
   let recoveryAttempts = 0;
+  // Same run-less re-check as the single-child path, tracked per child: while
+  // any unsettled child's latest run is still non-terminal, every shared long
+  // poll is bounded to the short interval (its slice timeout then reconciles
+  // each unsettled child's evidence).
+  const runlessPendingChildren = new Set<number>();
 
   while (unsettled.size > 0) {
     const remaining = options.deadlineMs - (deps.now() - start);
@@ -784,7 +852,9 @@ export async function waitOnChildren(options: {
     const ids = [...unsettled.values()].map((entry) => entry.watchId);
     let result: { kind: 'fired'; body: unknown } | { kind: 'timeout' };
     try {
-      result = await deps.longPoll({ ids, cursor, timeoutMs: Math.min(sliceMs, remaining) });
+      const slice = Math.min(sliceMs, remaining);
+      const bound = runlessPendingChildren.size > 0 ? RUNLESS_RECHECK_MS : slice;
+      result = await deps.longPoll({ ids, cursor, timeoutMs: Math.max(1, Math.min(slice, bound)) });
     } catch {
       recoveryAttempts += 1;
       if (recoveryAttempts > RECOVERY_ATTEMPTS) {
@@ -821,10 +891,11 @@ export async function waitOnChildren(options: {
         if (index === undefined || !child) continue;
         const conditionsById = new Map(childConditions(options, child, detectedByChild.get(index)).flatMap((condition) => (condition.id ? [[condition.id, condition] as const] : [])));
         for (const firing of watch.firings) {
-          const outcome = await firingOutcome(firing, child, deps, conditionsById, objectiveFor(index), seenFor(index));
+          const outcome = await firingOutcome(firing, child, deps, conditionsById, objectiveFor(index), seenFor(index), () => runlessPendingChildren.add(index));
           if (outcome) {
             results.set(index, outcome);
             unsettled.delete(index);
+            runlessPendingChildren.delete(index);
             break;
           }
         }
@@ -838,6 +909,7 @@ export async function waitOnChildren(options: {
         if (outcome) {
           results.set(index, outcome);
           unsettled.delete(index);
+          runlessPendingChildren.delete(index);
         }
       }
     }
@@ -884,6 +956,7 @@ async function firingOutcome(
   conditionsById: Map<string, WatchConditionSpec> = new Map(),
   objective?: string,
   seenAutoContinues?: Set<string | number>,
+  noteRunlessPending?: () => void,
 ): Promise<WaitOutcome | null> {
   const condition = conditionsById.get(firing.conditionId);
   if (condition?.type === 'text') {
@@ -898,7 +971,8 @@ async function firingOutcome(
     return goalEndOutcome(child.sessionId, firing.evidence ?? '', deps, seenAutoContinues);
   }
   if (firing.eventType === 'agent_end' || firing.eventType === 'deadline') {
-    const outcome = await reconcileChildReceipt(child, deps, objective, seenAutoContinues);
+    const evidenceState: LatestRunState = {};
+    const outcome = await reconcileChildReceipt(child, deps, objective, seenAutoContinues, evidenceState);
     if (outcome) return outcome;
     if (firing.eventType === 'deadline') return { kind: 'deadline', note: 'server-side deadline condition fired; child still not terminal' };
     if (!child.runId) {
@@ -906,6 +980,13 @@ async function firingOutcome(
         const guard = await runlessGoalGuard(child.sessionId, deps, seenAutoContinues);
         if (guard === 'keep-waiting') return null; // keep the child unsettled; the goal settles it
         if (guard) return withAutoGoalNote(guard);
+        // Run-less defect: the child's latest run is not terminal yet, so its
+        // agent_end settles nothing — keep the child unsettled and let the
+        // shortened shared long poll re-read the evidence.
+        if (evidenceState.hasRuns && !isTerminalRunStatus(evidenceState.latestStatus)) {
+          noteRunlessPending?.();
+          return null;
+        }
       }
       return { kind: 'completed', note: 'agent_end observed; no runId provided for receipt read-back' };
     }
@@ -913,7 +994,13 @@ async function firingOutcome(
   return null;
 }
 
-async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps, objective?: string, seenAutoContinues?: Set<string | number>): Promise<WaitOutcome | null> {
+async function reconcileChildReceipt(
+  child: WaitChild,
+  deps: WaitDeps,
+  objective?: string,
+  seenAutoContinues?: Set<string | number>,
+  evidenceState?: LatestRunState,
+): Promise<WaitOutcome | null> {
   try {
     if (child.runId) {
       const receipt = await deps.getReceipt(child.runId);
@@ -923,10 +1010,9 @@ async function reconcileChildReceipt(child: WaitChild, deps: WaitDeps, objective
       }
       return classified;
     }
-    const evidence = await deps.getSessionEvidence(child.sessionId);
-    const last = evidence.runs[0];
+    const last = await readLatestRun(child.sessionId, deps, evidenceState);
     if (!last || !last.status) return null;
-    if (['completed', 'failed', 'cancelled', 'interrupted'].includes(last.status)) {
+    if (isTerminalRunStatus(last.status)) {
       const classified = fromClassification(
         classifyReceipt({ runId: last.runId ?? 'unknown', sessionId: child.sessionId, status: last.status, errorCode: last.errorCode }),
         last.runId ? ({ runId: last.runId, sessionId: child.sessionId, status: last.status, errorCode: last.errorCode } as Receipt) : undefined,
